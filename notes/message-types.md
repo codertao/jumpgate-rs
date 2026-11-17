@@ -22,7 +22,7 @@ Common sub-fields seen across many messages:
 
 | Type | Len | Name / meaning | Layout (offsets in bytes) |
 |---|---|---|---|
-| 0x05 | 33 | **Login** | `[05]` + callsign`\0` + password`\0` + version ("2.0127") at +0x16. **Cleartext password.** |
+| 0x05 | 33 | **Login** | `[05]` + callsign`\0` @1 + password`\0` (ends before +0x16) + version ("2.0127") at +0x16. **Cleartext password.** [capture, 2026-11-17] |
 | 0x05 | 176 | Ship / loadout state (periodic, ~13 s) | `[05][u16?]` + callsign + slot list + floats; also contains some uninitialized client memory (minor info leak) |
 | 0x07 | 12 | **Launch / Dock / Jump** | `[07][action][u16 from_loc][u32 to_loc][u32 player_id]`; action 1=launch, 2=dock, 3=jump |
 | 0x09 | 16 | **Command / listing request** | `[09][cmd][u16 loc][u32 0][u32 player_id][u32]`; ~25 cmd values. Replies come back as the 896-byte listing tables (see below). |
@@ -52,19 +52,21 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 
 | Type | Len | Name / meaning | Layout |
 |---|---|---|---|
-| 0x06 | 544 | Character / ship record | `[06][01][len]` + callsign`\0` ... credits-like u32 ... "My Ship" + 8-byte cargo/equip slots (`fe fe` = empty slot) |
+| 0x06 | 544 | Character / ship record (handler `0x9d205f`) | `[06][03][1e]` + callsign`\0` @3 … **space-server address @0x22** (UTF-16, same rule as 0x08, acted on only if **mode @0x45 == 1**) … **u16 loc @0x50**, **u32 player id @0x54** (→ `0xbe5da0`) … "My Ship" + 8-byte cargo/equip slots (`fe fe` = empty slot). [static + capture, 2026-11-17] |
 | 0x81 | ~850 | Message of the day | `[81]` + ASCII ("Welcome back! ...") |
 | 0xFE | 321 | **Memory patch** | `[FE]` then records `[01][u32 addr][u16 len][bytes]`. In capture: only award/medal name strings. See network-protocol.md §3. |
 | 0x0A/0x0B/0x0D, 0x50–0x56 | 896 | **Station listing tables** (one per category) | `[type][3 pad][N × (u32,u32)]` + `N` bytes at +0x31C. Each answers one 0x09 Command request, in request order (cmd 0x03 "commodity"→0x0D, 0x01 "missile"→0x0B, 0x5A–0x60→0x50–0x56). Pairs look like price/quantity [inferred]. |
-| 0x08 | 63 | Location change / server redirect | on launch: space-server IP as UTF-16 + dest loc; on dock: "none" + loc. |
+| 0x08 | 64 | **Location change / space-server redirect** (handler `0x9d30c6`) | `[08][sub]` … space-server address @0x0c (UTF-16LE, ≤16 units incl. NUL, field ends at 0x2c) … **u16 dest loc @0x2c** (checked 1..1005) … @0x34. If the address differs from the current one (`0xba79a0`), the client drops space and connects to `<addr>:5151` (`0x9c7190`). Dock sends **"none" as narrow ASCII bytes**: the compare is `wcscmp` (0xaabf39) against a narrow literal at `0xb05afc`, which only works because both are the same raw bytes. sub: launch 6, jumps 1–3 [inferred: arrival gate], dock 0xcc. [static + capture, 2026-11-17] |
 | 0x04 | 20 / 69 | Chat line (e.g. "KTRI" news bot) | `[04][sub][u16 loc][u32 player_id][callsign\0]...` |
 | 0x65 | 35 | Channel-join ack | `[65][...][u32 handle]` |
 | 0xC2 | 750 | Table of 41 × 18-byte entries, mostly empty | `[C2]` + entries padded with `cc`/`ff ff ff` |
 | 0x78 | 150 | Empty object list at launch (sim) [inferred] | all zero |
 | 0x18 | 8 | Small status (medal?) | `[18][u32][ff 00 ff 01]` |
 | 0x8C | 7 | Small status | `[8C][cc cc cc][u16?]` |
+| 0x05 | 176 | **Other ship create/update** (handler `0x9cf7c8`): same layout as the C→S location report. Matched by player id @0x5c against slot `+0x15b4`; a new id takes the first free ship slot 10–199. Ship type u16 @0x46 (0xf9/0xfa = remove [inferred]), loc @0x44. This is what the fan server relays. | [static, 2026-11-17] |
 | 0x33 | var | smallloc relay: another ship's 0x33, same layout as C→S | handler `0x9d573c`. Matched by player id @0x18; dropped unless clock @0x34 is newer. Position @0x1c, velocity i16×0.1 @0x12. Error < 200 u is blended into velocity, otherwise snapped (physics.md §8) [static 2026-11-11] |
 | 0x34 | var | miniloc relay: another ship's 0x34, same layout as C→S | handler `0x9d5a9d`. id @0x14, position @0x18, clock @0x30. No velocity; same blend/snap rule [static 2026-11-11] |
+| 0x61 | 4 | **Beacon update** (handler `0x9d67d5`) | `[61][state][u16 loc]`. Valid only for loc 201..=999 and only when contact slot 5 is active with model 2 (the sector beacon); otherwise prints "Received invalid beacon packet". `state` → location table +0x3c [inferred: tuned/owner; capture sent 0]. Station sectors 101–118 have no beacon. [static + live, 2026-11-17] |
 | 0x45 | — | rank | handler `0x9d662a` |
 | 0x8F | 896 | welcome / initial world state | `[8F]...` |
 

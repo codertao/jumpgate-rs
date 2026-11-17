@@ -527,7 +527,7 @@ enter_space_handler · `0x4bbfb0` freecam_tick · `0x9dc570` space_dust_fx ·
 - ~~Ship-type table loader~~: done. Hard-coded in `0xa08440`; engines in
   `0x414460` (`ship_types.csv`, `engines.csv`). Still open: ship `+0x34`, the
   `+0x59..` slot lists, and engine bytes `+0`/`+1`.
-- Contact slot 5: what object it holds (it gets the gate-style elastic test).
+- ~~Contact slot 5: what object it holds~~ — the sector **beacon** (model 2); the 0x61 beacon handler `0x9d67d5` requires it. [static, 2026-11-17]
 - Runtime check of the 200-unit snap / 0.1·Δ velocity blend: compare a remote
   ship's slot position with relayed 0x33 positions in a two-client capture.
 - Bot steering/integration (`0x4338c0`, `0x42f360`), missile flight

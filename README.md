@@ -32,6 +32,11 @@ traffic.
   | `session` (`mitm`) | full RakNet peer (client+server roles) | verified: real client connects to the mock server |
   | `capture` | `jgcap.bin` reader | parsed; payloads never printed |
 
+- **`server`** (`jumpgate-server`) — the reactive fan server: answers each client
+  request (login, listings, launch/jump/dock, chat) and relays players' positions
+  within a sector. Responses not yet built from scratch come from a local capture
+  (`--templates jgcap.bin`). See [`notes/server.md`](notes/server.md).
+
 - **`proxy`** (`jumpgate-proxy`) — the UDP relay / MitM. Default build is the
   transparent relay (no crypto, no external deps).
 

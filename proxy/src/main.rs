@@ -168,7 +168,7 @@ fn main() {
     let _ = space.join();
 }
 
-/// `replay <capture.bin> [--listen ip] [--state-port n] [--space-port n] [--speed f]`
+/// `replay <capture.bin> [--listen ip] [--advertise ip] [--state-port n] [--space-port n] [--speed f]`
 fn run_replay() {
     #[cfg(not(feature = "mitm"))]
     {
@@ -180,17 +180,19 @@ fn run_replay() {
         let mut args = std::env::args().skip(2);
         let capture = args.next().unwrap_or_else(|| {
             eprintln!("usage: jumpgate-proxy replay <capture.bin> [--listen ip] \
-                       [--state-port 5150] [--space-port 5151] [--speed 1.0]");
+                       [--advertise ip] [--state-port 5150] [--space-port 5151] [--speed 1.0]");
             std::process::exit(2);
         });
         let mut listen: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let mut state_port = 5150u16;
         let mut space_port = 5151u16;
         let mut speed = 1.0f32;
+        let mut advertise: Option<Ipv4Addr> = None;
         while let Some(a) = args.next() {
             let mut val = || args.next().unwrap_or_else(|| usage());
             match a.as_str() {
                 "--listen" => listen = val().parse().unwrap_or_else(|_| usage()),
+                "--advertise" => advertise = Some(val().parse().unwrap_or_else(|_| usage())),
                 "--state-port" => state_port = val().parse().unwrap_or_else(|_| usage()),
                 "--space-port" => space_port = val().parse().unwrap_or_else(|_| usage()),
                 "--speed" => speed = val().parse().unwrap_or_else(|_| usage()),
@@ -202,7 +204,13 @@ fn run_replay() {
              Replay is open-loop: captured messages play on the capture's clock, \
              regardless of what the client requests."
         );
-        if let Err(e) = replay::run(&capture, listen, state_port, space_port, speed) {
+        // The address written into captured 0x06/0x08 space-server fields, so the
+        // client's space connection comes here and not to the captured server.
+        let advertise = advertise.unwrap_or(match listen {
+            IpAddr::V4(v4) if !v4.is_unspecified() => v4,
+            _ => Ipv4Addr::LOCALHOST,
+        });
+        if let Err(e) = replay::run(&capture, listen, advertise, state_port, space_port, speed) {
             eprintln!("[replay] error: {e}");
             std::process::exit(1);
         }

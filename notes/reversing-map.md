@@ -180,6 +180,24 @@ confirmed. Counts are `new` calls in each fn, so approximate.
 | `0x1042118 + i*0x160c` | contact/ship table (i 10..199; +0 active, +1 dead, +0x94 distance) |
 | `0xff2a50..0xff2af0` | own-ship snapshot shared by all location packets |
 
+## Ship slot allocation — client capacity  [static, 2026-11-17]
+Contact/ship table `0x1042118 + slot*0x160c`. Slot 0 is own ship, 1–5 are gates
+plus slot 5 (the sector beacon, model 2; see message-types 0x61), 201+i mirrors own missiles, and 300–349 are special objects.
+**Every remote entity gets a slot from 10–199, which is 190 total.** All
+allocators do a first-free linear scan with no eviction, so when the table is
+full the new entity is silently dropped.
+
+| Addr | Allocates a 10–199 slot for |
+|---|---|
+| `0x9cf81e` loop → `0x9cff0f` | remote **player** ship (dispatcher). First it looks up an existing slot by player id `pkt+0x5c` vs slot `+0x15b4`, and only if that finds nothing does it allocate the first slot with `+0 == 0`. |
+| `0x9cbc0e` | **bot** spawn (writes `pbotloc` `0xb341f4`, so the stock bot path, which is also capped at 50) |
+| `0x9d46ce` | **other players' missiles** (table `0x14fd998`, 100 entries). They take ship slots too. |
+
+Many per-frame loops (render, radar, push collision, AI) are bounded at
+`cmp …,0xc8`, so 200 is a compile-time constant. A server should therefore keep
+each client's visible set **well under 190**: players + bots + their missiles +
+dead slots not yet freed (`+1` dead).
+
 ## Conflux / bot AI — runs on the client  [static, 2026-11-11]
 The server assigns each bot (conflux) an **owning player**. That player's client
 runs the bot's AI and physics and reports its state back with `0x71` "botloc".

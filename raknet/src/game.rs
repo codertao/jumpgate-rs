@@ -84,6 +84,114 @@ pub fn decode_payload(payload: &[u8]) -> Option<GameMessage> {
     })
 }
 
+
+// ---- Space-server address fields (S→C 0x06 and 0x08) ----
+//
+// Two server→client messages carry the address of the space server as a
+// UTF-16LE, NUL-terminated string. When it differs from the current one the
+// client drops its space connection and opens a new one to `<ip>:5151`
+// (`0x9c7190`). The "none" sentinel means stay disconnected (used on dock).
+// Quirk: the compare is wide (`wcscmp` 0xaabf39) but the constant at `0xb05afc`
+// is the *narrow* bytes "none\0", and the server sends the same narrow bytes.
+// They match byte-for-byte, so "none" must be written as ASCII, not UTF-16.
+//   0x08 location change: string @0x0c (handler 0x9d30c6; next field read is the loc @0x2c)
+//   0x06 character record: string @0x22, acted on only when mode @0x45 == 1 (handler 0x9d2e53)
+// A captured message holds the *capture's* server address, so replaying one
+// unmodified would send the client's space connection to that server.
+// Anything that sends these must go through [`rewrite_space_ip`].
+
+/// Room for each address field: 16 UTF-16 code units, including the NUL.
+pub const SPACE_IP_FIELD_BYTES: usize = 32;
+/// The "no space server" sentinel exactly as the client compares it
+/// (`0xb05afc`): narrow ASCII bytes plus a 16-bit NUL.
+pub const SPACE_IP_NONE: &[u8] = b"none\0\0";
+
+/// True if the field at `off` holds the narrow "none" sentinel.
+pub fn is_space_ip_none(msg: &[u8], off: usize) -> bool {
+    msg.get(off..off + SPACE_IP_NONE.len()) == Some(SPACE_IP_NONE)
+}
+
+/// Write the "none" sentinel into the field at `off`, zero-filling the rest.
+pub fn write_space_ip_none(msg: &mut [u8], off: usize) -> bool {
+    if off + SPACE_IP_FIELD_BYTES > msg.len() {
+        return false;
+    }
+    msg[off..off + SPACE_IP_FIELD_BYTES].fill(0);
+    msg[off..off + SPACE_IP_NONE.len()].copy_from_slice(SPACE_IP_NONE);
+    true
+}
+
+/// Offset of the space-server address string, for message types that carry one.
+pub fn space_ip_offset(msg_type: u8) -> Option<usize> {
+    match msg_type {
+        0x08 => Some(0x0c),
+        0x06 => Some(0x22),
+        _ => None,
+    }
+}
+
+/// Read a NUL-terminated UTF-16LE string of at most `cap` bytes at `off`.
+pub fn read_wstr(msg: &[u8], off: usize, cap: usize) -> Option<String> {
+    let end = off.checked_add(cap)?.min(msg.len());
+    if off >= end {
+        return None;
+    }
+    let units: Vec<u16> = msg[off..end]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// Write `s` as NUL-terminated UTF-16LE into `cap` bytes at `off`, zero-filling
+/// the rest. Fails (writes nothing) if it doesn't fit.
+pub fn write_wstr(msg: &mut [u8], off: usize, cap: usize, s: &str) -> bool {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if (units.len() + 1) * 2 > cap || off + cap > msg.len() {
+        return false;
+    }
+    msg[off..off + cap].fill(0);
+    for (i, u) in units.iter().enumerate() {
+        msg[off + 2 * i..off + 2 * i + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    true
+}
+
+/// Outcome of [`rewrite_space_ip`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceIpRewrite {
+    /// Not a 0x06/0x08, or the field is past the end of the message.
+    NotApplicable,
+    /// Empty or "none": left alone, since neither triggers a connection.
+    Kept,
+    /// Replaced with the given address.
+    Rewritten,
+    /// The address doesn't fit; the field was set to "none" instead so the
+    /// client can't connect anywhere unintended.
+    Neutralized,
+}
+
+/// Point any space-server address in a 0x06/0x08 at `ip` (our own server).
+/// Empty and "none" are kept as-is. Every other value is replaced.
+pub fn rewrite_space_ip(msg: &mut [u8], ip: &str) -> SpaceIpRewrite {
+    let Some(off) = msg.first().copied().and_then(space_ip_offset) else {
+        return SpaceIpRewrite::NotApplicable;
+    };
+    if off + SPACE_IP_FIELD_BYTES > msg.len() {
+        return SpaceIpRewrite::NotApplicable;
+    }
+    if is_space_ip_none(msg, off) || msg[off..off + 2] == [0, 0] {
+        return SpaceIpRewrite::Kept;
+    }
+    if write_wstr(msg, off, SPACE_IP_FIELD_BYTES, ip) {
+        SpaceIpRewrite::Rewritten
+    } else {
+        write_space_ip_none(msg, off);
+        SpaceIpRewrite::Neutralized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +227,45 @@ mod tests {
         assert_eq!(g.timestamp, Some(0x1122_3344));
         assert_eq!(g.body, body);
         assert_eq!(g.message_type(), Some(0x09));
+    }
+
+    fn redirect_msg(ip: &str) -> Vec<u8> {
+        let mut m = vec![0xCC; 0x36];
+        m[0] = 0x08;
+        if ip == "none" {
+            assert!(write_space_ip_none(&mut m, 0x0c));
+        } else {
+            assert!(write_wstr(&mut m, 0x0c, SPACE_IP_FIELD_BYTES, ip));
+        }
+        m[0x2c] = 0xe9;
+        m[0x2d] = 0x03;
+        m
+    }
+
+    #[test]
+    fn space_ip_is_rewritten_to_ours() {
+        let mut m = redirect_msg("203.0.113.77");
+        assert_eq!(rewrite_space_ip(&mut m, "127.0.0.1"), SpaceIpRewrite::Rewritten);
+        assert_eq!(read_wstr(&m, 0x0c, SPACE_IP_FIELD_BYTES).unwrap(), "127.0.0.1");
+        assert_eq!(&m[0x2c..0x2e], &[0xe9, 0x03], "loc after the field untouched");
+    }
+
+    #[test]
+    fn space_ip_none_and_empty_are_kept() {
+        let mut m = redirect_msg("none");
+        assert_eq!(&m[0x0c..0x12], b"none\0\0", "narrow bytes, as captured on dock");
+        assert_eq!(rewrite_space_ip(&mut m, "127.0.0.1"), SpaceIpRewrite::Kept);
+        let mut m = redirect_msg("");
+        assert_eq!(rewrite_space_ip(&mut m, "127.0.0.1"), SpaceIpRewrite::Kept);
+        let mut other = vec![0x81, 1, 2, 3];
+        assert_eq!(rewrite_space_ip(&mut other, "127.0.0.1"), SpaceIpRewrite::NotApplicable);
+    }
+
+    #[test]
+    fn space_ip_too_long_is_neutralized() {
+        let mut m = redirect_msg("203.0.113.77");
+        let long = "a-very-long-hostname.example";
+        assert_eq!(rewrite_space_ip(&mut m, long), SpaceIpRewrite::Neutralized);
+        assert!(is_space_ip_none(&m, 0x0c));
     }
 }

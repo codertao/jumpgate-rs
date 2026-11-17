@@ -12,11 +12,19 @@
 //! retransmission, lenient ordering. The replay is open-loop: messages are
 //! paced by the capture's clock, not by client requests (so a captured launch
 //! happens whether or not the player pressed launch).
+//!
+//! Captured 0x06/0x08 messages carry the *captured* server's space address,
+//! and the client opens its space connection to whatever address they name.
+//! Every replayed message therefore goes through
+//! [`raknet::game::rewrite_space_ip`], which points them at `--advertise`
+//! (fixed 2026-11-17; before that, a replayed launch redirected the client's
+//! space connection to the server in the capture).
 
 use raknet::capture;
+use raknet::game::{self, SpaceIpRewrite};
 use raknet::session::{Endpoint, Event};
 use std::io;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(20);
@@ -151,6 +159,7 @@ fn is_timeout(e: &io::Error) -> bool {
 pub fn run(
     capture_path: &str,
     listen_ip: IpAddr,
+    advertise: Ipv4Addr,
     state_port: u16,
     space_port: u16,
     speed: f32,
@@ -160,9 +169,19 @@ pub fn run(
     if dropped > 0 {
         eprintln!("[replay] ignoring {dropped} trailing byte(s): cut-off final record");
     }
+    let advertise = advertise.to_string();
+    let mut rewritten = 0usize;
     let script: Script = capture::server_messages(&records)
-        .map(|r| (r.ms, r.data.clone()))
+        .map(|r| {
+            let mut data = r.data.clone();
+            match game::rewrite_space_ip(&mut data, &advertise) {
+                SpaceIpRewrite::Rewritten | SpaceIpRewrite::Neutralized => rewritten += 1,
+                SpaceIpRewrite::Kept | SpaceIpRewrite::NotApplicable => {}
+            }
+            (r.ms, data)
+        })
         .collect();
+    eprintln!("[replay] space-server address → {advertise} in {rewritten} message(s)");
     eprintln!(
         "[replay] loaded {} records ({} server→client) from {}",
         records.len(),

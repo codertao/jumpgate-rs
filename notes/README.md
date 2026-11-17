@@ -15,6 +15,8 @@ client (`Jumpgate.exe`, SHA-256 `fef6e50f...`, "2.0127" build, server
   (crypto/reliability/handshake, all tested) and a `jumpgate-proxy` relay/MitM
   for observing your own client. Default build is a transparent relay.
   handshake), aimed at building/verifying a MitM proxy; marks each fact bin-verified vs. reference.
+- **server.md** — `jumpgate-server`, the reactive fan server: layout, templates,
+  the request → response table, what's left.
 - **reversing-map.md** — address/function map for this binary.
 - **physics.md** — client-side flight model: thrust/drag/rotation equations,
   collisions, docking, gates, remote-ship dead reckoning and network correction,
