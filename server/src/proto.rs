@@ -128,8 +128,9 @@ pub fn patch_char_record(rec: &mut [u8], callsign: &str, pid: u32, loc: u16) {
     put_u32(rec, CHAR_PID_OFF, pid);
 }
 
-/// 0x08 location change (64 B; handler `0x9d30c6`). `sub` @1 differs per case
-/// (launch 6, jumps 1–3 = arrival gate? [inferred]); dest loc @0x2c.
+/// 0x08 location change (64 B; handler `0x9d30c6`). `sub` @1 is the contact
+/// slot the ship appears at: the arrival gate number (1–4) for a jump, 6 for a
+/// launch (verified against the capture and the extract's gate links); dest loc @0x2c.
 pub const LOCCHG_LEN: usize = 64;
 pub const LOCCHG_LOC_OFF: usize = 0x2c;
 
@@ -145,9 +146,12 @@ pub fn location_change(template: Option<&[u8]>, sub: u8, loc: u16, target: Space
     let mut m = match template {
         Some(t) if t.len() >= LOCCHG_LEN => t.to_vec(),
         _ => {
+            // Same shape as captured jumps: 0xCC fill, zeros @3..0x0b and @0x30.
             let mut m = vec![0xcc; LOCCHG_LEN];
             m[0] = 0x08;
             m[1] = sub;
+            m[3..0x0b].fill(0);
+            m[0x30..0x34].fill(0);
             m
         }
     };

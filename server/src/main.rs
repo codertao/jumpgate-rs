@@ -8,10 +8,12 @@
 //! to its own.
 //!
 //! Usage:
-//!   jumpgate-server [--templates <jgcap.bin>] [--listen ip] [--advertise ip]
+//!   jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip]
 //!                   [--state-port 5150] [--space-port 5151] [--home-station 18]
 //!                   [--verbose]
 //!
+//! `--data` is the extracts directory (default: the workspace's `notes/extracts`):
+//! locations and the gate graph.
 //! `--templates` points at a local capture whose server→client messages are
 //! used for responses not yet built from scratch (see templates.rs). Without
 //! one, those responses are skipped and the client will likely stall at login.
@@ -20,16 +22,18 @@ mod game;
 mod net;
 mod proto;
 mod templates;
+mod world;
 
 use game::{Config, Conn, Server};
 use net::{Listener, NetEvent};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use templates::Templates;
+use world::World;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: jumpgate-server [--templates <jgcap.bin>] [--listen ip] [--advertise ip] \
+        "usage: jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip] \
          [--state-port 5150] [--space-port 5151] [--home-station 18] [--verbose]"
     );
     std::process::exit(2);
@@ -38,6 +42,7 @@ fn usage() -> ! {
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut templates_path: Option<String> = None;
+    let mut data_dir: Option<String> = None;
     let mut listen: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let mut advertise: Option<Ipv4Addr> = None;
     let mut state_port = 5150u16;
@@ -48,6 +53,7 @@ fn main() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
             "--templates" => templates_path = Some(val()),
+            "--data" => data_dir = Some(val()),
             "--listen" => listen = val().parse().unwrap_or_else(|_| usage()),
             "--advertise" => advertise = Some(val().parse().unwrap_or_else(|_| usage())),
             "--state-port" => state_port = val().parse().unwrap_or_else(|_| usage()),
@@ -70,11 +76,7 @@ fn main() {
         Some(p) => match std::fs::read(p) {
             Ok(b) => {
                 let t = Templates::from_capture_bytes(&b);
-                eprintln!(
-                    "[server] {} template types, {} gate(s) learned from {p}",
-                    t.len(),
-                    t.gates.len()
-                );
+                eprintln!("[server] {} template types from {p}", t.len());
                 t
             }
             Err(e) => {
@@ -88,7 +90,14 @@ fn main() {
         }
     };
 
-    let mut server = Server::new(cfg, tpl);
+    let data_dir = data_dir.unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts").into());
+    let world = World::load(std::path::Path::new(&data_dir)).unwrap_or_else(|e| {
+        eprintln!("[server] can't load world data from {data_dir}: {e} (use --data <notes/extracts>)");
+        std::process::exit(1)
+    });
+    eprintln!("[server] world: {} locations, {} gate links from {data_dir}", world.names.len(), world.gates.len());
+
+    let mut server = Server::new(cfg, tpl, world);
     let mut state = Listener::bind("state", SocketAddr::new(listen, state_port)).unwrap_or_else(|e| {
         eprintln!("bind state: {e}");
         std::process::exit(1)

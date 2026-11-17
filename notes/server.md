@@ -24,7 +24,8 @@ is never printed).
 | `net.rs` | One UDP socket per port, one RakNet `Endpoint::server()` per peer address, 60 s idle timeout |
 | `game.rs` | Session state and handlers. Pure: `(conn, peer, msg) → Vec<Out>`, so it's unit-tested without sockets |
 | `proto.rs` | Layouts the server reads/writes: login, 0x07, 0x05 report, 0x06 patcher, 0x08/0x81/0x04/0x61 builders |
-| `templates.rs` | Captured S→C messages used as response bodies until each has a builder; also learns the gate graph |
+| `templates.rs` | Captured S→C messages used as response bodies until each has a builder |
+| `world.rs` | Static world from `notes/extracts/` (`--data`, default the workspace copy): location names, gate graph |
 
 ## Templates (temporary)
 
@@ -36,13 +37,26 @@ Never taken from the capture: **0xFE** (client memory write; never sent at
 all), **0x81** MOTD and **0x04** chat (other people's words; we build our own).
 Every captured 0x06/0x08 has its space address rewritten.
 
-**Gate graph.** Each captured C→S `0x07` jump `(from_loc, gate)` followed by an
-S→C `0x08` gives the destination (0x08 @0x2c). The current capture yields 3
-gates (118 gate 1 → 241, then 241 → 249 → 108), along with 33 template types. Unmapped gates get a
-system chat line, not a jump.
-
 Goal: replace templates one type at a time with builders driven by
 `notes/extracts/*.csv` (locations, items, prices once designed).
+
+## Gate travel (from the extract)
+
+`sector_objects_all.csv` jumpgate rows (both models, `jump_ends.x` and
+`x_ai_gate.x`) give `(loc, gate_number) → (dest_loc, dest_gate)`. That's **417
+links** from the client's own table (`0x146d7a0`, filled by `0x4a7460`).
+- C→S 0x07 jump carries gate number − 1.
+- The S→C 0x08 sub byte is the arrival gate: the client spawns the ship at that
+  contact slot (handler reads `slot = msg[1]`, position = slot pos + random
+  offset).
+- Verified: all 3 captured jumps resolve to the captured destination, and the
+  built 0x08 equals the captured one byte for byte outside the address field
+  (`built_jump_redirect_matches_capture`).
+- Quirks in the game data, followed as-is: 3 one-way links (268/3 → 309,
+  309/1 → 268 whose return goes to 266, 348/1 → 349). 8 gates have no link
+  (loc 0, 1000–1005); jumping through one gets a system chat line instead.
+- Not yet checked: that the client's `from_loc` agrees with the server's (it's
+  logged if not).
 
 ## Request → response table (as implemented)
 
@@ -62,7 +76,7 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 | 0x91 / 0x4b | state | 0x91+2×0x76 / 0x4b | capture |
 | 0x17 | state | 0x42 + 0xb3 | capture |
 | 0x07 launch | state | loc = station+100; 0x06, 0x78, **0x08 → our IP**, dest sector | capture |
-| 0x07 jump | state | learned gate → 0x78, 0x08 (our IP, learned dest + sub) | capture |
+| 0x07 jump | state | gate = arg + 1 → extract link → 0x78, 0x08 (our IP, dest loc, sub = arrival gate). Built, no template | extract; byte-identical to captured jumps |
 | 0x07 dock | state | loc = sector−100; 0x45, 0x92, 0xba (pid patched), 0x4b, 0x06, 0x8c, **0x08 "none"** | capture |
 | 0xc8 | state | logout | — |
 | 0x8f | both | 0x8f on the same connection (the client's dispatcher ignores it, `0x9d3006`) | capture |

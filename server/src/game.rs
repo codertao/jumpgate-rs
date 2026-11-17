@@ -9,6 +9,7 @@
 
 use crate::proto::{self, SpaceTarget, ACT_DOCK, ACT_JUMP, ACT_LAUNCH};
 use crate::templates::Templates;
+use crate::world::World;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
@@ -63,6 +64,7 @@ pub struct Player {
 pub struct Server {
     pub cfg: Config,
     pub tpl: Templates,
+    pub world: World,
     pub players: BTreeMap<PlayerId, Player>,
     by_state: HashMap<SocketAddr, PlayerId>,
     by_space: HashMap<SocketAddr, PlayerId>,
@@ -91,10 +93,11 @@ pub fn station_of_sector(sector: u16) -> Option<u16> {
 }
 
 impl Server {
-    pub fn new(cfg: Config, tpl: Templates) -> Self {
+    pub fn new(cfg: Config, tpl: Templates, world: World) -> Self {
         Server {
             cfg,
             tpl,
+            world,
             players: BTreeMap::new(),
             by_state: HashMap::new(),
             by_space: HashMap::new(),
@@ -361,18 +364,30 @@ impl Server {
                 out
             }
             ACT_JUMP => {
-                let gate = tr.arg;
-                let Some(tpl) = self.tpl.gates.get(&(cur, gate)).cloned() else {
-                    self.note(format!("player {pid}: gate {gate} in {cur} is not mapped"));
-                    let text = format!("Gate {gate} in sector {cur} isn't mapped on this server yet.");
+                // 0x07 carries gate number − 1 (reversing-map "Gate links").
+                let Some(gate_number) = u8::try_from(tr.arg).ok().and_then(|a| a.checked_add(1)) else {
+                    return Vec::new();
+                };
+                if tr.from_loc != cur {
+                    self.note(format!("player {pid}: jump from {} but server has them in {cur}", tr.from_loc));
+                }
+                let Some(link) = self.world.gate(cur, gate_number) else {
+                    self.note(format!("player {pid}: gate {gate_number} in {cur} has no link"));
+                    let text = format!("Gate {gate_number} in {} doesn't lead anywhere.", self.world.name(cur));
                     return vec![Out { to: pid, conn: Conn::State, msg: proto::system_chat(cur, "Server", &text) }];
                 };
-                let dest = proto::u16_at(&tpl, proto::LOCCHG_LOC_OFF);
                 let mut out = self.despawn(pid);
-                self.players.get_mut(&pid).unwrap().loc = dest;
-                self.note(format!("player {pid} jump {cur} gate {gate} → {dest}"));
+                self.players.get_mut(&pid).unwrap().loc = link.dest_loc;
+                self.note(format!(
+                    "player {pid} jump {} ({cur}) gate {gate_number} → {} ({}) gate {}",
+                    self.world.name(cur),
+                    self.world.name(link.dest_loc),
+                    link.dest_loc,
+                    link.dest_gate
+                ));
                 out.extend(self.reply_tpl(pid, &[0x78]));
-                let m = proto::location_change(Some(&tpl), tpl[1], dest, SpaceTarget::Ip(&advertise));
+                // sub = arrival gate: the client spawns the ship at that contact slot.
+                let m = proto::location_change(None, link.dest_gate, link.dest_loc, SpaceTarget::Ip(&advertise));
                 out.push(Out { to: pid, conn: Conn::State, msg: m });
                 out
             }
@@ -543,8 +558,14 @@ mod tests {
         m
     }
 
+    fn test_world() -> World {
+        let mut w = World::default();
+        w.gates.insert((118, 2), crate::world::GateLink { dest_loc: 241, dest_gate: 2 });
+        w
+    }
+
     fn server() -> Server {
-        Server::new(Config::default(), Templates::default())
+        Server::new(Config::default(), Templates::default(), test_world())
     }
 
     /// Log in and launch; returns the player id.
@@ -628,10 +649,23 @@ mod tests {
     }
 
     #[test]
-    fn unmapped_gate_gets_a_message_not_a_jump() {
+    fn jump_uses_gate_links() {
         let mut s = server();
         let a = into_space(&mut s, "10.0.0.5:4000", "10.0.0.5:4001");
-        let out = s.handle(Conn::State, addr("10.0.0.5:4000"), &travel(proto::ACT_JUMP, 118, 7, a));
+        // 0x07 arg 1 = gate 2 → 241, arriving at gate 2.
+        let out = s.handle(Conn::State, addr("10.0.0.5:4000"), &travel(proto::ACT_JUMP, 118, 1, a));
+        let m = &out.iter().find(|o| o.msg[0] == 0x08).unwrap().msg;
+        assert_eq!(proto::u16_at(m, proto::LOCCHG_LOC_OFF), 241);
+        assert_eq!(m[1], 2, "sub = arrival gate");
+        assert_eq!(g::read_wstr(m, 0x0c, 32).unwrap(), "127.0.0.1");
+        assert_eq!(s.players[&a].loc, 241);
+    }
+
+    #[test]
+    fn unlinked_gate_gets_a_message_not_a_jump() {
+        let mut s = server();
+        let a = into_space(&mut s, "10.0.0.5:4000", "10.0.0.5:4001");
+        let out = s.handle(Conn::State, addr("10.0.0.5:4000"), &travel(proto::ACT_JUMP, 118, 3, a));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].msg[0], 0x04);
         assert_eq!(s.players[&a].loc, 118);
@@ -646,7 +680,8 @@ mod tests {
             eprintln!("no local capture at {path}; skipping");
             return;
         };
-        let mut s = Server::new(Config::default(), Templates::from_capture_bytes(&bytes));
+        let world = World::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"))).unwrap();
+        let mut s = Server::new(Config::default(), Templates::from_capture_bytes(&bytes), world);
         let st = addr("10.0.0.5:4000");
         let mut all = s.handle(Conn::State, st, &login_msg("pilot"));
         let pid = all[0].to;
@@ -657,7 +692,7 @@ mod tests {
             all.extend(out);
         }
         all.extend(s.handle(Conn::State, st, &travel(proto::ACT_LAUNCH, 18, 0, pid)));
-        // The capture's first jump was 118 gate 1 → 241.
+        // The capture's first jump: 118, 0x07 arg 1 (gate 2) → 241.
         let out = s.handle(Conn::State, st, &travel(proto::ACT_JUMP, 118, 1, pid));
         assert_eq!(s.players[&pid].loc, 241);
         all.extend(out);
@@ -671,5 +706,38 @@ mod tests {
                 assert!(ok, "0x{:02x} names a space server other than us", o.msg[0]);
             }
         }
+    }
+
+    /// For every jump in the local capture, the 0x08 built from the extract
+    /// equals the captured one except for the space-address field.
+    #[test]
+    fn built_jump_redirect_matches_capture() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../jgcap.bin");
+        let Ok(bytes) = std::fs::read(path) else { return };
+        let world = World::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"))).unwrap();
+        let (records, _) = raknet::capture::parse_lenient(&bytes);
+        let mut pending = None;
+        let mut checked = 0;
+        for r in &records {
+            match r.dir {
+                raknet::capture::Dir::ClientToServer => {
+                    pending = proto::parse_travel(&r.data).filter(|t| t.action == proto::ACT_JUMP);
+                }
+                raknet::capture::Dir::ServerToClient if r.data[0] == 0x08 => {
+                    let Some(t) = pending.take() else { continue };
+                    let link = world.gate(t.from_loc, t.arg as u8 + 1).unwrap();
+                    let mut built =
+                        proto::location_change(None, link.dest_gate, link.dest_loc, SpaceTarget::Ip("127.0.0.1"));
+                    let mut captured = r.data.clone();
+                    // Compare outside the address field (0x0c..0x2c).
+                    built[0x0c..0x2c].fill(0);
+                    captured[0x0c..0x2c].fill(0);
+                    assert_eq!(built, captured, "jump from {} arg {}", t.from_loc, t.arg);
+                    checked += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(checked, 3);
     }
 }
