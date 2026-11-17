@@ -99,8 +99,10 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   the real client hasn't run against it yet).
 - Accounts: any password is accepted and dropped. Add salted slow hashes
   (argon2/bcrypt) before anyone else connects.
-- Sector content: 0xA7 station list, 0x58, 0x87 near-field, per sector.
-  Currently the captured sector's copies are sent everywhere.
+- Sector content: 0xA7 station list and 0x58, per sector. Currently the
+  captured sector's copies are sent everywhere. (0x87 is universe-wide particle
+  clouds, so one list for everyone is correct. The server could own the cloud
+  list and drift it: see message-types "Particle clouds".)
 - NPCs: the next big step (see CLAUDE.md, "Design facts"). Server-simulated
   ships can reuse the S→C 0x05/0x33/0x34 relay path above.
 - RakNet `session` has no retransmission, which is fine on a LAN but needs adding

@@ -90,14 +90,14 @@ client sends `0x05`(176)+`0x17`(10); server answers a batch of `0xa7`(56)×~10 +
 | Type | Len | Dir | Name / meaning | Layout |
 |---|---|---|---|---|
 | 0xA7 | 56 | S→C | **Sector object (station/base) record** | `[A7][u64 hdr/owner][name\0 … 0xCC pad][cat@34][f32 X@36][f32 Y@40][f32 Z@44][flag@48][u32 id@52]`. `cat` 2=public station, 4=player mining HQ, 8=special/factory. Streamed **in full every heartbeat**; positions static per id. Capture held **21 distinct** (13/3/5 by cat). |
-| 0x87 | 260 | S→C | **Near-field dynamic transforms** | `[87][3 pad]` + 8×32B records `[01][class][inst][00][f32 radius][f32×3 quaternion xyz][f32×3 position xyz]`. class 6/7; only ~4 populated. Position **and rotation** — the rotating near objects. |
+| 0x87 | 260 | S→C | **Particle clouds ("weather"), universe-wide** — answer to 0x8A weather request | `[87][3 pad]` + 8 × 32 B records copied to `0xff1b18` (handler `0x9d8083`): `[type u8][kind u8][strength u8][b3][f32 radius][f32×3 drift unit vector][f32×3 position in **galaxy-map coords** (same space as locations.csv x/y/z)]`. type 0 = empty slot, 1 = particle cloud (2/3 = other phenomena, unseen). See "Particle clouds" below. [static + capture, 2026-11-17; replaces the earlier "near-field transforms" reading] |
+| 0x86 | 36? | S→C | Single particle-cloud update (handler `0x9d80c1`) | `[86][slot<8]..` + one 32-byte record @4 → `0xff1b18 + slot*32` [static] |
 | 0x73 | 251 | S→C | Object-slot occupancy table | `[73]` + `0xFF`-filled free slots + `u32 count` + zeros [inferred] |
 | 0x78 | 151 | S→C | Object list at launch | mostly zero; `[78][u8 n]…` slot list [inferred] |
 | 0xB3 | 44 | S→C | Own-ship physics echo (per heartbeat) | `[B3][3 pad]` + floats (one @12 ~7.2e7, one @26 =100.0) [inferred] |
 | 0x42 | 1 | S→C | Heartbeat ack (pairs with 0x17) | `[42]` |
 | 0x62 | 800 | S→C | Large table, empty in capture (sector contacts?) | zeros [inferred] |
 | 0x13 | 788 | S→C | Large table (world/sector state?) | [inferred] |
-| 0x87/0xB3/0xA7 | | | together = the entire streamed object population: 21 stations + 4 near-field | |
 
 Client → server in space (also see reversing-map "Weapon hits & damage": C→S 0x1D hit report, 0x1A mkill, 0x44 who-killed-me; S→C 0x03 damage):
 | Type | Len | Name | Layout / notes |
@@ -167,3 +167,39 @@ timer in `0x9ce1c0..0x9ce2f6`; all three types go on the **space** connection.
   orientation `0xff2ab8..cc`, **velocity** `0xff2ad0..d8` (copied from the
   velocity cells), position `0xff2aac..b4`,
   clock `0xff2aa0`.
+
+### Particle clouds (S→C 0x87 / 0x86)  [static + capture, 2026-11-17]
+Galaxy-scale "weather". The list is the same for every sector because it *is*
+universe-wide. After storing it, `0xa1f1d0` walks every location (from 101) and
+gives each one the effect of its nearest cloud (`0xa1eff0`), written into the
+location struct `0xfd9220 + loc*100`:
+- `+0x4c` type, `+0x4d` kind, `+0x4e` b3; kind 3 also sets `0xb4b8a7`.
+- `+0x50` **intensity I = strength · r² / d²**, with d the distance from the
+  location's galaxy-map XYZ (struct +0x2c) to the cloud.
+- `+0x54` = I·k2 and `+0x58..0x60` = drift · I · k1, where (k1, k2) by type/kind:
+  type1/kind5 (15, 0), type1/kind6 (0, 0), type1/kind7 (0, 500), type2 (25, 0),
+  type3 (20, 500). Meaning of the two outputs not traced yet.
+
+Effects in the client:
+- **Tint** (`0x9ddea0`, 13 callers, mostly the renderer `0x9ede30`): for type 1,
+  the scene colour is blended with the kind's colour (`0xa1edf0`): 1 red,
+  2 green, 3 blue, 4 yellow, 5 purple, 6 teal, 7 orange, other grey.
+- **Ambient sound on arrival** (0x08 handler `0x9d4106`): if the destination's
+  `+0x58` vector is non-zero, `play_ui_sound(0x25, …)` at a volume from I.
+- **Gas harvesting** (`0x439a10`, from the flight code at `0x42a09b`): needs a
+  non-zero cloud type in the current location, speed > 380 (`0xaeade8`; the item
+  text says "400v") and the **FuelScoop** device (device index 13 = item 165)
+  equipped. It accumulates `rand·dt·0.06 · clamp(1 + (speed−380)·0.015, ≤7.5)`,
+  × I when I > 1, and adds commodities to the hold (`0xff7d2c`), entirely
+  **client-side**. Roll 0–100 per kind (hold index i = cargo id 222+i):
+  kind 5 Helium <60, Water <75, else Xenon; kind 6 Helium <50, Water <70,
+  Boron <74, Lithium <78, Nitrogen <90, else Magnesium; kind 7 Helium <70,
+  Water <85, Phosphorus <92, else Nitrogen; other kinds Helium.
+- Renderer also special-cases kind 7 (`0x9ee302`) [effect not traced].
+
+**Drift is server-side.** The client only stores what it receives. Across the
+capture's 8 snapshots each cloud moved exactly along its drift vector
+(direction · vector = 1.000) at ≈ **0.0507 galaxy units/s per strength point**
+(strength 1: 17.4 in 343 s; strength 2: twice that). Radius stayed constant.
+The capture's 4th record (strength 0, non-unit vector (5, 0, 2), r 23) never
+moved and has zero intensity, so it's dormant.

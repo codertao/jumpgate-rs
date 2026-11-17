@@ -10,6 +10,7 @@ FILES
   jgmitm_rules.txt   optional edit/drop rules (copy next to Jumpgate.exe)
   jgdecode.py        salt/running-sum decode+encode (offline)
   jgcap_dump.py      pretty-print / stats of jgcap.bin
+  jgcap_detailed.py  readable dump: MSG_NAME (0xid) per direction + decoded fields
   pcapread.py        parse a udp pcap (timing/size only; payload is AES)
 
 INSTALL (records both directions to jgcap.bin; applies rules if present)
