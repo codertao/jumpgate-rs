@@ -10,7 +10,7 @@
 //! Usage:
 //!   jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip]
 //!                   [--state-port 5150] [--space-port 5151] [--home-station 18]
-//!                   [--verbose]
+//!                   [--no-npcs] [--verbose]
 //!
 //! `--data` is the extracts directory (default: the workspace's `notes/extracts`):
 //! locations and the gate graph.
@@ -18,23 +18,27 @@
 //! used for responses not yet built from scratch (see templates.rs). Without
 //! one, those responses are skipped and the client will likely stall at login.
 
+mod feed;
 mod game;
 mod net;
+mod npc;
 mod proto;
+mod ship;
 mod templates;
 mod world;
 
 use game::{Config, Conn, Server};
+use npc::{NpcSim, Orbit};
 use net::{Listener, NetEvent};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use templates::Templates;
 use world::World;
 
 fn usage() -> ! {
     eprintln!(
         "usage: jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip] \
-         [--state-port 5150] [--space-port 5151] [--home-station 18] [--verbose]"
+         [--state-port 5150] [--space-port 5151] [--home-station 18] [--no-npcs] [--verbose]"
     );
     std::process::exit(2);
 }
@@ -49,6 +53,7 @@ fn main() {
     let mut space_port = 5151u16;
     let mut cfg = Config::default();
     let mut verbose = false;
+    let mut npcs_on = true;
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -59,6 +64,7 @@ fn main() {
             "--state-port" => state_port = val().parse().unwrap_or_else(|_| usage()),
             "--space-port" => space_port = val().parse().unwrap_or_else(|_| usage()),
             "--home-station" => cfg.home_station = val().parse().unwrap_or_else(|_| usage()),
+            "--no-npcs" => npcs_on = false,
             "--verbose" | "-v" => verbose = true,
             _ => usage(),
         }
@@ -97,6 +103,10 @@ fn main() {
     });
     eprintln!("[server] world: {} locations, {} gate links from {data_dir}", world.names.len(), world.gates.len());
 
+    let mut sim = NpcSim::new();
+    if npcs_on {
+        spawn_demo_npcs(&mut sim, &world);
+    }
     let mut server = Server::new(cfg, tpl, world);
     let mut state = Listener::bind("state", SocketAddr::new(listen, state_port)).unwrap_or_else(|e| {
         eprintln!("bind state: {e}");
@@ -108,8 +118,18 @@ fn main() {
     });
     eprintln!("[server] advertising space server {advertise}; point clients here with SERVER_IP=<this host>");
 
+    let start = Instant::now();
+    let mut last_tick = start;
     loop {
         let mut outs = Vec::new();
+        // NPCs: simulate and publish at 5 Hz, roughly a real client's 0x33 rate
+        // in company (message-types "Location update path").
+        if last_tick.elapsed() >= NPC_TICK {
+            let now = Instant::now();
+            sim.tick((now - last_tick).as_secs_f32());
+            last_tick = now;
+            outs.extend(server.present_ships(sim.ships(), (now - start).as_secs_f32()));
+        }
         for (conn, ev) in state
             .poll()
             .into_iter()
@@ -157,6 +177,19 @@ fn main() {
         space.flush();
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+const NPC_TICK: Duration = Duration::from_millis(200);
+
+/// For now, one freighter circling Quantar Depot station (sector 118, station at
+/// the origin, radius ~1000), close enough to see on launch.
+fn spawn_demo_npcs(sim: &mut NpcSim, world: &World) {
+    let Some(hull) = world.hull(104).cloned() else {
+        eprintln!("[npc] hull 104 not in ship_types.csv; no demo NPC");
+        return;
+    };
+    eprintln!("[npc] demo: {} circling Quantar Depot (118)", hull.name);
+    sim.spawn("Hauler", hull, 118, Box::new(Orbit::new([0.0, 400.0, 0.0], 2500.0, 80.0)));
 }
 
 /// Type and length, plus a short hex prefix — except the login, which holds a

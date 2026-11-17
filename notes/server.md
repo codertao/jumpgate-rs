@@ -103,8 +103,37 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   captured sector's copies are sent everywhere. (0x87 is universe-wide particle
   clouds, so one list for everyone is correct. The server could own the cloud
   list and drift it: see message-types "Particle clouds".)
-- NPCs: the next big step (see CLAUDE.md, "Design facts"). Server-simulated
-  ships can reuse the S→C 0x05/0x33/0x34 relay path above.
+- NPCs: first server-simulated ship done (see "NPCs" below). Next: roles and a
+  population, interest management within the slot budget.
 - RakNet `session` has no retransmission, which is fine on a LAN but needs adding
   for real networks.
 - Unhandled types are logged once each. Use `--verbose` sessions to grow the table.
+
+## NPCs  [2026-11-17, first ship; live-tested with the real client]
+
+Layers, each knowing only the one below it:
+
+- `ship.rs`: plain data shared by both sides: `Hull` (from ship_types.csv via
+  `World::hull`) and `ShipView` (loc, hull, callsign, mass, pos, vel, fwd/up,
+  effective thrust, armour).
+- `npc/`: the simulation. `NpcSim` holds NPCs, each with a `Behaviour` trait
+  object that updates its `ShipView` every tick. No protocol, network or player
+  knowledge. First behaviour: `Orbit` (constant-speed horizontal circle,
+  publishing cruise thrust = drag·v² so clients' dead reckoning holds speed).
+- `feed.rs`: per-viewer presentation. Given viewers (player, sector) and ships
+  each frame, it sends 0x05 on first sight and every 25 frames, 0x33 otherwise,
+  and a 0xfa "gone" 0x05 when a ship leaves the viewer's sector. This is where
+  interest management and the 190-slot budget will go.
+- `game.rs` `Server::present_ships`: picks viewers (in space, space session
+  bound, and has sent a 0x05 from this sector, so the client has arrived) and
+  maps sim ids to wire pids `0x4000_0000 + id`.
+- `main.rs`: ticks the sim and calls `present_ships` at 5 Hz with a monotonic
+  clock (seconds since start). `--no-npcs` turns it off.
+
+Demo: one Chinook (type 104) "Hauler" circling Quantar Depot station (sector
+118) at radius 2500, y 400, 80 u/s.
+
+Live test 2026-11-17: the NPC appears as a freighter and its motion is smooth,
+so a server-built 0x05 + 0x33 is drawn and dead-reckoned like a remote player,
+and pid 0x4000_0000 is accepted. Still unconfirmed: 0xfa removal (needs an NPC
+that changes sector), and what the copied unknown 0x05 bytes control.

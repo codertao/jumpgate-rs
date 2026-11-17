@@ -2,6 +2,7 @@
 //! `notes/message-types.md`, the 2026-11-10 capture and the client handlers
 //! named below. Anything marked [inferred] still needs live confirmation.
 
+use crate::ship::{ShipView, Vec3};
 use raknet::game;
 
 // ---- C→S ----
@@ -218,6 +219,114 @@ pub fn empty_table(msg_type: u8, len: usize) -> Vec<u8> {
     m
 }
 
+// ---- server-driven ships (NPCs) ----
+//
+// The client can't tell an NPC from a remote player: both arrive as S→C 0x05
+// (create/update) and 0x33 (fast position). Field map from the handlers
+// `0x9cf7c8` (0x05) and `0x9d573c` (0x33), each read paired with the contact-slot
+// field it is stored in [static, 2026-11-17]. Conditions the client checks:
+// loc must equal its own current location, the 0x05 callsign must be ≥ 2
+// chars, and the clock must be strictly newer than the slot's (else dropped).
+
+pub const SMALL_LOC_LEN: usize = 56;
+
+/// Unit vector → i16 ×10000 (client scales by 1e-4 @0xb06918).
+fn put_unit(b: &mut [u8], o: usize, v: Vec3) {
+    for (k, x) in v.iter().enumerate() {
+        let q = (x * 10000.0).round().clamp(-32767.0, 32767.0) as i16;
+        b[o + 2 * k..o + 2 * k + 2].copy_from_slice(&q.to_le_bytes());
+    }
+}
+/// Velocity → i16 ×10 (client scales by 0.1 @0xaec470).
+fn put_vel(b: &mut [u8], o: usize, v: Vec3) {
+    for (k, x) in v.iter().enumerate() {
+        let q = (x * 10.0).round().clamp(-32767.0, 32767.0) as i16;
+        b[o + 2 * k..o + 2 * k + 2].copy_from_slice(&q.to_le_bytes());
+    }
+}
+fn put_f32(b: &mut [u8], o: usize, v: f32) {
+    b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn put_vec(b: &mut [u8], o: usize, v: Vec3) {
+    for (k, x) in v.iter().enumerate() {
+        put_f32(b, o + 4 * k, *x);
+    }
+}
+
+/// Engine-glow byte (slot +0x156d): 0x33's handler sets 0 or 50 from thrust.
+fn glow(ship: &ShipView) -> u8 {
+    if ship.thrust > 0.0 {
+        50
+    } else {
+        0
+    }
+}
+
+/// Shield/armour floats @0x9c/0xa0/0xa4 (also 0x33 @0x2c → same slot field as
+/// @0x9c). A real Thunder (armour 24000) sent 24e6, 24e6, 72e6 [inferred:
+/// current, max, ×3 something]. We scale the same way from the hull.
+fn hull_points(armour: f32) -> (f32, f32, f32) {
+    let max = armour * 1000.0;
+    (max, max, max * 3.0)
+}
+
+/// S→C 0x05 for a server-driven ship (176 B).
+///
+/// Unknown scalar bytes are copied from the user's own report (2026-11-10
+/// capture) with the callsign and the uninitialised-memory tail removed: the
+/// equipment array @4..0x14 (`19 19` then `fe` = empty), 0x14..0x19 and
+/// 0x3e..0x43. Their meaning isn't traced.
+pub fn ship_report(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
+    let mut m = vec![0u8; LOC_REPORT_LEN];
+    m[0] = 0x05;
+    m[1] = glow(ship);
+    m[4..0x14].fill(0xfe);
+    m[4] = 0x19;
+    m[5] = 0x19;
+    m[0x14..0x19].copy_from_slice(&[0x1e, 0xfe, 0x01, 0x01, 0x0b]);
+    put_cstr(&mut m[0x19..0x2f], &ship.callsign); // squad name @0x2f stays empty
+    m[0x3e..0x43].copy_from_slice(&[0x04, 0x00, 0x7d, 0x05, 0x0d]);
+    put_u16(&mut m, LOC_LOC_OFF, ship.loc);
+    put_u16(&mut m, LOC_SHIP_OFF, ship.hull_type);
+    put_unit(&mut m, 0x48, ship.fwd);
+    put_unit(&mut m, 0x4e, ship.up);
+    put_vel(&mut m, 0x54, ship.vel);
+    put_u32(&mut m, LOC_PID_OFF, pid);
+    put_f32(&mut m, 0x64, clock);
+    put_u32(&mut m, 0x68, ship.mass.round() as u32); // slot mass +0x15c0 (int)
+    put_vec(&mut m, 0x90, ship.pos);
+    let (cur, max, x3) = hull_points(ship.armour_max);
+    put_f32(&mut m, 0x9c, cur * ship.armour);
+    put_f32(&mut m, 0xa0, max);
+    put_f32(&mut m, 0xa4, x3);
+    put_f32(&mut m, 0xa8, ship.thrust); // effective thrust, slot +0x1608
+    put_f32(&mut m, 0xac, 100.0);
+    m
+}
+
+/// S→C 0x33 "small loc" for a server-driven ship (56 B).
+pub fn ship_small_loc(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
+    let mut m = vec![0u8; SMALL_LOC_LEN];
+    m[0] = 0x33;
+    put_u16(&mut m, 4, ship.loc);
+    put_unit(&mut m, 6, ship.fwd);
+    put_unit(&mut m, 0x0c, ship.up);
+    put_vel(&mut m, 0x12, ship.vel);
+    put_u32(&mut m, 0x18, pid);
+    put_vec(&mut m, 0x1c, ship.pos);
+    put_f32(&mut m, 0x28, ship.thrust);
+    put_f32(&mut m, 0x2c, hull_points(ship.armour_max).0 * ship.armour);
+    put_f32(&mut m, 0x34, clock);
+    m
+}
+
+/// 0x05 that removes a ship from clients' screens (ship type 0xfa).
+pub fn ship_gone(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
+    let mut m = ship_report(ship, pid, clock);
+    put_u16(&mut m, LOC_SHIP_OFF, SHIP_GONE);
+    m
+}
+
 // ---- byte helpers ----
 
 pub fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -311,5 +420,77 @@ mod tests {
         assert_eq!(&m[..4], &[0x04, 0x08, 18, 0]);
         assert_eq!(&m[8..15], b"Server\0");
         assert_eq!(&m[0x13..], b"hi\0");
+    }
+
+    fn npc() -> ShipView {
+        ShipView {
+            loc: 118,
+            hull_type: 104,
+            callsign: "Hauler".into(),
+            mass: 515000.0,
+            pos: [2500.0, 400.0, -12.5],
+            vel: [-3.2, 0.0, 79.9],
+            fwd: [-0.04, 0.0, 0.9992],
+            up: [0.0, 1.0, 0.0],
+            thrust: 736000.0,
+            armour: 1.0,
+            armour_max: 62500.0,
+        }
+    }
+
+    fn i16s(m: &[u8], o: usize, scale: f32) -> [f32; 3] {
+        [0, 1, 2].map(|k| i16::from_le_bytes([m[o + 2 * k], m[o + 2 * k + 1]]) as f32 * scale)
+    }
+    fn f32s(m: &[u8], o: usize) -> [f32; 3] {
+        [0, 1, 2].map(|k| f32::from_le_bytes(m[o + 4 * k..o + 4 * k + 4].try_into().unwrap()))
+    }
+    fn f1(m: &[u8], o: usize) -> f32 {
+        f32::from_le_bytes(m[o..o + 4].try_into().unwrap())
+    }
+    fn close(a: [f32; 3], b: [f32; 3], eps: f32) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() <= eps)
+    }
+
+    /// Decode with the client handler's offsets and scales (0x9cf7c8).
+    #[test]
+    fn ship_report_decodes_as_the_client_reads_it() {
+        let s = npc();
+        let m = ship_report(&s, 0x4000_0001, 12.5);
+        assert_eq!(m.len(), LOC_REPORT_LEN);
+        assert_eq!(m[0], 0x05);
+        assert_eq!(u16_at(&m, LOC_LOC_OFF), 118);
+        assert_eq!(u16_at(&m, LOC_SHIP_OFF), 104);
+        assert_eq!(u32_at(&m, LOC_PID_OFF), 0x4000_0001);
+        // Callsign must be ≥ 2 chars or the client ignores the message.
+        assert_eq!(&m[0x19..0x20], b"Hauler\0");
+        assert!(m[0x2f..0x3e].iter().all(|&b| b == 0), "no squad / no leaked bytes");
+        assert!(close(i16s(&m, 0x48, 1e-4), s.fwd, 1e-4));
+        assert!(close(i16s(&m, 0x4e, 1e-4), s.up, 1e-4));
+        assert!(close(i16s(&m, 0x54, 0.1), s.vel, 0.05));
+        assert_eq!(f32s(&m, 0x90), s.pos);
+        assert_eq!(f1(&m, 0x64), 12.5);
+        assert_eq!(u32_at(&m, 0x68), 515000);
+        assert_eq!(f1(&m, 0xa8), 736000.0);
+        assert_eq!(m[1], 50, "engine glow on while thrusting");
+        assert_eq!(u16_at(&ship_gone(&s, 1, 13.0), LOC_SHIP_OFF), SHIP_GONE);
+    }
+
+    /// Decode with the 0x33 handler's offsets (0x9d573c).
+    #[test]
+    fn ship_small_loc_decodes_as_the_client_reads_it() {
+        let s = npc();
+        let m = ship_small_loc(&s, 0x4000_0001, 12.7);
+        assert_eq!(m.len(), SMALL_LOC_LEN);
+        assert_eq!(m[0], 0x33);
+        assert_eq!(u16_at(&m, 4), 118, "client drops 0x33 for another location");
+        assert_eq!(fast_loc_pid(&m), Some(0x4000_0001));
+        assert!(close(i16s(&m, 6, 1e-4), s.fwd, 1e-4));
+        assert!(close(i16s(&m, 0x0c, 1e-4), s.up, 1e-4));
+        assert!(close(i16s(&m, 0x12, 0.1), s.vel, 0.05));
+        assert_eq!(f32s(&m, 0x1c), s.pos);
+        assert_eq!(f1(&m, 0x28), 736000.0);
+        assert_eq!(f1(&m, 0x34), 12.7);
+        // Same slot field as 0x05 @0x9c, so the two must agree.
+        assert_eq!(f1(&m, 0x2c), f32s(&ship_report(&s, 1, 0.0), 0x9c)[0]);
     }
 }

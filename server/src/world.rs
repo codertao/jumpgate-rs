@@ -7,7 +7,9 @@
 //!   `gate_dest_gate` (the arrival gate). From the client's link table at
 //!   `0x146d7a0`, filled by `0x4a7460`. Verified 2026-11-17 against all three
 //!   jumps in the capture: dest loc and the 0x08 sub byte (= arrival gate) match.
+//! - `ship_types.csv`: hull stats (from `init_ship_types` `0xa08440`).
 
+use crate::ship::Hull;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -25,6 +27,8 @@ pub struct World {
     pub names: HashMap<u16, String>,
     /// (loc, gate_number) → link.
     pub gates: HashMap<(u16, u8), GateLink>,
+    /// Ship type id → hull stats.
+    pub hulls: HashMap<u16, Hull>,
 }
 
 impl World {
@@ -41,6 +45,8 @@ impl World {
         }
         let objs = std::fs::read_to_string(dir.join("sector_objects_all.csv"))?;
         w.load_gates(&objs);
+        let ships = std::fs::read_to_string(dir.join("ship_types.csv"))?;
+        w.load_hulls(&ships);
         Ok(w)
     }
 
@@ -57,6 +63,23 @@ impl World {
                 self.gates.insert((loc, gate as u8), GateLink { dest_loc, dest_gate: dest_gate as u8 });
             }
         }
+    }
+
+    fn load_hulls(&mut self, text: &str) {
+        let mut csv = Csv::new(text);
+        while let Some(row) = csv.next_row() {
+            let f = |k: &str| row.get(k).and_then(|v| v.parse::<f32>().ok());
+            if let (Some(id), Some(mass), Some(drag), Some(armour)) =
+                (row.get("type").and_then(|v| v.parse().ok()), f("mass"), f("drag"), f("armour"))
+            {
+                let name = row.get("name").unwrap_or("?").to_string();
+                self.hulls.insert(id, Hull { type_id: id, name, mass, drag, armour });
+            }
+        }
+    }
+
+    pub fn hull(&self, type_id: u16) -> Option<&Hull> {
+        self.hulls.get(&type_id)
     }
 
     /// Where gate `gate_number` in `loc` leads.
@@ -158,6 +181,8 @@ mod tests {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"));
         let w = World::load(dir).expect("notes/extracts present in the repo");
         assert!(w.gates.len() >= 400, "only {} gates", w.gates.len());
+        let chinook = w.hull(104).unwrap();
+        assert_eq!((chinook.name.as_str(), chinook.mass, chinook.drag, chinook.armour), ("Chinook", 515000.0, 115.0, 62500.0));
         // Capture jumps: (from, 0x07 arg) → (dest, 0x08 sub). gate_number = arg + 1.
         for (from, arg, dest, sub) in [(118, 1, 241, 2), (241, 2, 249, 3), (249, 1, 108, 1)] {
             let g = w.gate(from, arg + 1).unwrap();

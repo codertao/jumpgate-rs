@@ -7,13 +7,19 @@
 //! (`notes/captures/`). Responses we can't build yet come from [`Templates`],
 //! patched with this player's fields. Each is marked in `notes/server.md`.
 
+use crate::feed::Feed;
 use crate::proto::{self, SpaceTarget, ACT_DOCK, ACT_JUMP, ACT_LAUNCH};
+use crate::ship::ShipView;
 use crate::templates::Templates;
 use crate::world::World;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
 pub type PlayerId = u32;
+
+/// Wire ids for server-driven ships start here, clear of player ids (1000+).
+/// The client only needs them unique among ships in its sector.
+pub const SHIP_PID_BASE: u32 = 0x4000_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Conn {
@@ -76,6 +82,8 @@ pub struct Server {
     missing_tpl: HashSet<u8>,
     /// Players who have been sent the sector's existing ships since arriving.
     seen_in_sector: HashSet<PlayerId>,
+    /// What each player has been shown of the server-driven ships.
+    feed: Feed,
     pub log: Vec<String>,
 }
 
@@ -106,8 +114,27 @@ impl Server {
             unhandled_cmds: HashSet::new(),
             missing_tpl: HashSet::new(),
             seen_in_sector: HashSet::new(),
+            feed: Feed::new(),
             log: Vec::new(),
         }
+    }
+
+    /// One frame of server-driven ships (from the NPC sim, or anything else):
+    /// `(id, ship)` pairs, ids local to the caller. Shown to players in space who
+    /// have reported from their sector, i.e. whose client has finished arriving.
+    pub fn present_ships<'a>(&mut self, ships: impl IntoIterator<Item = (u32, &'a ShipView)>, clock: f32) -> Vec<Out> {
+        let viewers: Vec<(PlayerId, u16)> = self
+            .players
+            .values()
+            .filter(|p| !p.docked && p.space_addr.is_some() && self.seen_in_sector.contains(&p.id))
+            .map(|p| (p.id, p.loc))
+            .collect();
+        let ships: Vec<(u32, &ShipView)> = ships.into_iter().map(|(id, s)| (SHIP_PID_BASE + id, s)).collect();
+        self.feed
+            .update(&viewers, &ships, clock)
+            .into_iter()
+            .map(|(to, msg)| Out { to, conn: Conn::State, msg })
+            .collect()
     }
 
     fn note(&mut self, s: String) {
@@ -739,5 +766,34 @@ mod tests {
             }
         }
         assert_eq!(checked, 3);
+    }
+
+    #[test]
+    fn npcs_shown_only_after_arrival_in_their_sector() {
+        let mut s = server();
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let ship = ShipView {
+            loc: 118,
+            hull_type: 104,
+            callsign: "Hauler".into(),
+            mass: 515000.0,
+            pos: [0.0; 3],
+            vel: [0.0; 3],
+            fwd: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            thrust: 0.0,
+            armour: 1.0,
+            armour_max: 62500.0,
+        };
+        // In space but no report from the sector yet: client may still be loading.
+        assert!(s.present_ships([(0, &ship)], 1.0).is_empty());
+        s.handle(Conn::Space, addr("10.0.0.1:2000"), &report(a, 1));
+        let out = s.present_ships([(0, &ship)], 2.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].to, out[0].msg[0]), (a, 0x05));
+        assert_eq!(proto::u32_at(&out[0].msg, proto::LOC_PID_OFF), SHIP_PID_BASE);
+        // Docking: no more NPC traffic.
+        s.handle(Conn::State, addr("10.0.0.1:1000"), &travel(ACT_DOCK, 118, 0, a));
+        assert!(s.present_ships([(0, &ship)], 3.0).is_empty());
     }
 }

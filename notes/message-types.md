@@ -64,6 +64,43 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 | 0x18 | 8 | Small status (medal?) | `[18][u32][ff 00 ff 01]` |
 | 0x8C | 7 | Small status | `[8C][cc cc cc][u16?]` |
 | 0x05 | 176 | **Other ship create/update** (handler `0x9cf7c8`): same layout as the C→S location report. Matched by player id @0x5c against slot `+0x15b4`; a new id takes the first free ship slot 10–199. Ship type u16 @0x46 (0xf9/0xfa = remove [inferred]), loc @0x44. This is what the fan server relays. | [static, 2026-11-17] |
+
+#### S→C 0x05 / 0x33 field map (contact slot `0x1042118 + i*0x160c`)  [static, 2026-11-17]
+From pairing each handler read with the slot field it's stored in (`0x9cf7c8`
+new-ship path `0x9cff20`; `0x9d573c` for 0x33). This is what the server uses to
+build NPC ships (`server/src/proto.rs` `ship_report` / `ship_small_loc`).
+The message is first copied to `0xba8e20`.
+
+| 0x05 off | 0x33 off | type | slot | meaning |
+|---|---|---|---|---|
+| +1 | (set from thrust) | u8 | +0x156d | engine glow: 0x33 sets 0, or 50 when thrust ≠ 0 |
+| +3 | +1 | u8 | +0x156f | ? (0 in capture) |
+| +4..+0x13 | | 16 B | +0x1568.. | equipment array (`fe` empty) |
+| +0x14..+0x17 | | u8 ×4 | +0x1580.. | ? (capture `1e fe 01 01`) |
+| +0x19 | | cstr | +0x1584 | **callsign**; the message is **ignored if strlen ≤ 1** |
+| +0x2f | | cstr | +0x159a | squad; `"$master$"` → stored empty |
+| +0x3e..+0x42 | | u8 ×5 | +0x15a9.. | ? (capture `04 00 7d 05 0d`) |
+| +0x44 | +4 | u16 | +0x15ae | location; **must equal the client's own** (`0xbe5b3e`) or the message is dropped |
+| +0x46 | | u16 | +0x15b0 | ship type; 0xf9/0xfa remove, 0xfb special |
+| +0x48 | +6 | i16 ×3 ×1e-4 | +0x15d4 | forward unit vector |
+| +0x4e | +0xc | i16 ×3 ×1e-4 | +0x15e0 | up unit vector |
+| +0x54 | +0x12 | i16 ×3 ×0.1 | +0x15ec | velocity |
+| +0x5c | +0x18 | u32 | +0x15b4 | player id (slot key) |
+| +0x60 | | u32 | +0x15b8 | ? (0) |
+| +0x64 | +0x34 | f32 | +0x15bc | clock (s); must be **strictly newer** than the slot's or the message is dropped |
+| +0x68 | | u32 | +0x15c0 | mass (int; capture 110650 for a loaded Thunder) |
+| +0x6c | | u32 | +0x15c4 | ? (0) |
+| +0x90 | +0x1c | f32 ×3 | +0x15c8 | position |
+| +0x9c | +0x2c | f32 | +0x15f8 | armour-ish (capture 24e6 = Thunder armour 24000 ×1000) [inferred] |
+| +0xa0 | | f32 | +0x15fc | same, max [inferred] |
+| +0xa4 | | f32 | +0x1600 | ? (capture 72e6 = 3× the above) |
+| +0xa8 | +0x28 | f32 | +0x1608 | **effective thrust** (thrust × throttle) used by dead reckoning; capture 7.2e6 with drag 44 → √(7.2e6/44) = 404 u/s = measured |v| |
+| +0xac | | f32 | | ? (100.0) |
+
+Server-driven ships use the same two messages: the client can't tell an NPC
+from a remote player. **Runtime-confirmed 2026-11-17:** a server-built 0x05
+(fields above, unknowns copied from a real report) + 5 Hz 0x33 shows a Chinook
+with smooth motion. Not yet confirmed: that 0xfa removes it.
 | 0x33 | var | smallloc relay: another ship's 0x33, same layout as C→S | handler `0x9d573c`. Matched by player id @0x18; dropped unless clock @0x34 is newer. Position @0x1c, velocity i16×0.1 @0x12. Error < 200 u is blended into velocity, otherwise snapped (physics.md §8) [static 2026-11-11] |
 | 0x34 | var | miniloc relay: another ship's 0x34, same layout as C→S | handler `0x9d5a9d`. id @0x14, position @0x18, clock @0x30. No velocity; same blend/snap rule [static 2026-11-11] |
 | 0x61 | 4 | **Beacon update** (handler `0x9d67d5`) | `[61][state][u16 loc]`. Valid only for loc 201..=999 and only when contact slot 5 is active with model 2 (the sector beacon); otherwise prints "Received invalid beacon packet". `state` → location table +0x3c [inferred: tuned/owner; capture sent 0]. Station sectors 101–118 have no beacon. [static + live, 2026-11-17] |
