@@ -11,6 +11,8 @@ client (`Jumpgate.exe`, SHA-256 `fef6e50f...`, "2.0127" build, server
 - **message-types.md** — per-type field layouts, both directions.
 - **key-exchange.md** — RakNet SecuredConnection crypto in detail.
 - **raknet-spec.md** — RakNet 2.x wire spec (crypto, reliability datagram, connect
+- **differences-from-samp-raknet.md** — Jumpgate's RakNet 2.x vs SA:MP's (RakSAMP fork): every
+  wire difference, what's identical, and what our `raknet` crate still lacks.
 - **../jumpgate-rs/** — Rust workspace implementing the spec: a `raknet` lib
   (crypto/reliability/handshake, all tested) and a `jumpgate-proxy` relay/MitM
   for observing your own client. Default build is a transparent relay.
