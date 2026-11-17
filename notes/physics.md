@@ -498,6 +498,31 @@ blend.
 3. A speed tripwire `0x403120` runs every frame (`0xa2666c`, gated on
    `0xbe5b90`, `!0xbe5b08`, `!0xbe3d75`):
    if speed > **1225**, it calls `0x440660(1)` and sets `0xb8e288 = 2`
+   **[confirmed 2026-11-17]** `0xb8e288 == 2` makes the main loop (`0xa27269`) set
+   checkpoint `0x3fc` and call the shutdown `0xa215e0`: a clean logout and exit
+   that writes `error_nocrash.txt`. `0x440660` only writes spaces/newline to a
+   log. Hit live with the `--dev-drag 92=0.05` patch: the launch-tube push takes
+   a low-drag ship past 1225 and the client exits. The constant (f32 `0xac2620`)
+   has this one reader, and `.rdata` is writable in this binary (0xc0000040).
+4. **Table checksums** `0xa19400` [static + live, 2026-11-17]. The main loop
+   calls it in flight (`0xa27255`: checkpoint 32 when `0xbe5b90` is set, then
+   `call 0xa19400`). It sums bytes as `Σ sbyte[i] << (16·(i mod 3))` (a shift by
+   32 wraps to 0) into 64 bits and compares with a hard-coded constant. On a
+   mismatch it sets a checkpoint and calls the shutdown `0xa215e0`. Covered:
+   - Equipment tables, byte loops: `0x146c878..ca28` (includes the **engine
+     table** `0x146c880`, cmp `0x3afe75` @`0xa1964a`), `0x146ca28..cb6c`,
+     `0x146cb6c..ccac`, `0x146ccac..cd0c`, `0x146cd0c..cf64`,
+     `0x146cf64..d0b4`, `0x146d0b4..d2e4` (cmp `0x199e201d` @`0xa19a2a`), and
+     `0x14fcbd4..d054`.
+   - **Ship-type table**: mass, drag, pitch/roll/yaw and +0x140 of every player
+     hull (types 30–40, 45, 60–71, 75, 90–101, 105) are copied into a 0x360-byte
+     buffer, cmp `0x9db03af` @`0xa1a5a2` → **Last Code 117**. Hit live by
+     `--dev-drag 92=0.25`.
+   So ship or equipment stats can't be patched in memory, and the expected
+   totals live in `.text` (0x60000020, not writable; the stock Msb32 imports no
+   VirtualProtect), so they can't be adjusted over 0xFE either. Note also that
+   the 0xFE reaches the game dispatcher as well, which logs "Received a packet
+   of unknown type 254".
    [inferred: autopilot/cruise or anti-speedhack reaction; not traced].
 4. Velocity does not go into the frequent packets: `0x33` carries
    **velocity × 10 as i16** at `@0x12` (from snapshot `0xff2ad0..d8`, scale

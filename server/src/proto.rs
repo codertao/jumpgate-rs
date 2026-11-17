@@ -184,6 +184,15 @@ pub fn motd(first: &str, second: &str) -> Vec<u8> {
 }
 
 /// 0x04 system/news chat line: `[04][08][u16 loc][cc×4][sender\0 @8, 11 B][text\0 @0x13]`.
+/// Text of a C→S 0x04 chat line (`[04][sub][u16 loc][u32 pid][callsign 11B @8]
+/// [text @0x13]`), up to the NUL; 0xCC is the client's fill byte.
+pub const CHAT_TEXT_OFF: usize = 0x13;
+pub fn chat_text(msg: &[u8]) -> Option<String> {
+    let t = msg.get(CHAT_TEXT_OFF..)?;
+    let end = t.iter().position(|&b| b == 0 || b == 0xcc).unwrap_or(t.len());
+    Some(String::from_utf8_lossy(&t[..end]).into_owned())
+}
+
 pub fn system_chat(loc: u16, sender: &str, text: &str) -> Vec<u8> {
     let mut m = vec![0x04, 0x08];
     m.extend_from_slice(&loc.to_le_bytes());

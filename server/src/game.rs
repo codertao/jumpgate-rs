@@ -89,6 +89,9 @@ pub struct Server {
 
 /// Docked station id ↔ sector id: the core stations and depots are n and n+100
 /// (reversing-map "Location ids"; capture: station 18 launches into 118).
+/// 0x08 sub for arriving at a station sector's launch point (as on launch).
+pub const LAUNCH_SLOT: u8 = 6;
+
 pub fn sector_of_station(station: u16) -> u16 {
     if station < 100 {
         station + 100
@@ -340,6 +343,11 @@ impl Server {
     /// Relay a player's chat line to every other logged-in player. [inferred:
     /// global channel, verbatim relay]
     fn chat(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        // `!` lines are server commands (the client drops unknown /commands
+        // itself, slash-commands.md), answered privately and not relayed.
+        if let Some(text) = proto::chat_text(msg).filter(|t| t.starts_with('!')) {
+            return self.bang_command(pid, &text);
+        }
         self.players
             .keys()
             .filter(|&&id| id != pid)
@@ -403,8 +411,6 @@ impl Server {
                     let text = format!("Gate {gate_number} in {} doesn't lead anywhere.", self.world.name(cur));
                     return vec![Out { to: pid, conn: Conn::State, msg: proto::system_chat(cur, "Server", &text) }];
                 };
-                let mut out = self.despawn(pid);
-                self.players.get_mut(&pid).unwrap().loc = link.dest_loc;
                 self.note(format!(
                     "player {pid} jump {} ({cur}) gate {gate_number} → {} ({}) gate {}",
                     self.world.name(cur),
@@ -412,11 +418,7 @@ impl Server {
                     link.dest_loc,
                     link.dest_gate
                 ));
-                out.extend(self.reply_tpl(pid, &[0x78]));
-                // sub = arrival gate: the client spawns the ship at that contact slot.
-                let m = proto::location_change(None, link.dest_gate, link.dest_loc, SpaceTarget::Ip(&advertise));
-                out.push(Out { to: pid, conn: Conn::State, msg: m });
-                out
+                self.relocate(pid, link.dest_loc, link.dest_gate)
             }
             ACT_DOCK => {
                 let station = station_of_sector(cur).unwrap_or(self.cfg.home_station);
@@ -448,6 +450,100 @@ impl Server {
                 Vec::new()
             }
         }
+    }
+
+    /// Move a player in space to `dest`, arriving at contact slot `sub` (a gate
+    /// number 1–4, or 6 = a station's launch point): the same 0x78 + 0x08 a
+    /// gate jump gets.
+    fn relocate(&mut self, pid: PlayerId, dest: u16, sub: u8) -> Vec<Out> {
+        let advertise = self.cfg.advertise.clone();
+        let mut out = self.despawn(pid);
+        self.players.get_mut(&pid).unwrap().loc = dest;
+        out.extend(self.reply_tpl(pid, &[0x78]));
+        // sub = arrival slot: the client spawns the ship at that contact slot.
+        let m = proto::location_change(None, sub, dest, SpaceTarget::Ip(&advertise));
+        out.push(Out { to: pid, conn: Conn::State, msg: m });
+        out
+    }
+
+    /// `!command` chat lines. Dev/test helpers for now; gate them behind GM
+    /// rights once accounts exist.
+    fn bang_command(&mut self, pid: PlayerId, text: &str) -> Vec<Out> {
+        let mut words = text.split_whitespace();
+        let cmd = words.next().unwrap_or("").to_ascii_lowercase();
+        let args: Vec<&str> = words.collect();
+        let loc = self.players[&pid].loc;
+        let reply = |t: String| vec![Out { to: pid, conn: Conn::State, msg: proto::system_chat(loc, "Server", &t) }];
+        match cmd.as_str() {
+            "!goto" => match self.parse_goto(pid, &args) {
+                Ok((dest, sub)) => {
+                    let what = if sub == LAUNCH_SLOT { "launch point".to_string() } else { format!("gate {sub}") };
+                    self.note(format!("player {pid} !goto {} ({dest}) {what}", self.world.name(dest)));
+                    self.relocate(pid, dest, sub)
+                }
+                Err(e) => reply(e),
+            },
+            "!help" => reply("!goto <sector id or name> [gate 1-4]: jump straight there (in space only).".into()),
+            _ => reply(format!("Unknown command {cmd}. Try !help.")),
+        }
+    }
+
+    /// `!goto <sector> [gate]`. Sector by id or name (case-insensitive; exact
+    /// match first, else a unique substring). Without a gate: a station's launch
+    /// point in sectors 101–118, otherwise the lowest-numbered gate.
+    fn parse_goto(&self, pid: PlayerId, args: &[&str]) -> Result<(u16, u8), String> {
+        if self.players[&pid].docked {
+            return Err("Launch first: !goto works in space.".into());
+        }
+        if args.is_empty() {
+            return Err("Usage: !goto <sector id or name> [gate 1-4]".into());
+        }
+        let (name_args, gate) = match args.last().and_then(|a| a.parse::<u8>().ok()) {
+            Some(g) if args.len() > 1 && (1..=4).contains(&g) => (&args[..args.len() - 1], Some(g)),
+            _ => (args, None),
+        };
+        let query = name_args.join(" ");
+        let is_sector = |id: u16| (101..=999).contains(&id);
+        let dest = if let Ok(id) = query.parse::<u16>() {
+            id
+        } else {
+            // Compare letters and digits only: "quantar core" finds "Quantar-Core Station".
+            let norm = |t: &str| t.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+            let q = norm(&query);
+            let named = |exact: bool| -> Vec<u16> {
+                let mut v: Vec<u16> = self
+                    .world
+                    .names
+                    .iter()
+                    .filter(|(id, n)| {
+                        let n = norm(n);
+                        is_sector(**id) && if exact { n == q } else { n.contains(&q) }
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                v.sort();
+                v
+            };
+            match (named(true).as_slice(), named(false).as_slice()) {
+                ([id], _) | ([], [id]) => *id,
+                ([], []) => return Err(format!("No sector matches {query:?}.")),
+                (_, many) => {
+                    let list: Vec<String> = many.iter().take(6).map(|id| format!("{} ({id})", self.world.name(*id))).collect();
+                    return Err(format!("{query:?} is ambiguous: {}", list.join(", ")));
+                }
+            }
+        };
+        if !is_sector(dest) || !self.world.names.contains_key(&dest) {
+            return Err(format!("{dest} isn't a sector."));
+        }
+        let gates: Vec<u8> = (1..=4).filter(|g| self.world.gates.contains_key(&(dest, *g))).collect();
+        let sub = match gate {
+            Some(g) if gates.contains(&g) => g,
+            Some(g) => return Err(format!("{} ({dest}) has no gate {g}; gates: {gates:?}", self.world.name(dest))),
+            None if station_of_sector(dest).is_some() => LAUNCH_SLOT,
+            None => *gates.first().ok_or(format!("{} ({dest}) has no gates to arrive at.", self.world.name(dest)))?,
+        };
+        Ok((dest, sub))
     }
 
     /// 176-byte report: remember it and relay to others in the same sector,
@@ -795,5 +891,70 @@ mod tests {
         // Docking: no more NPC traffic.
         s.handle(Conn::State, addr("10.0.0.1:1000"), &travel(ACT_DOCK, 118, 0, a));
         assert!(s.present_ships([(0, &ship)], 3.0).is_empty());
+    }
+
+
+    fn chat_line(pid: PlayerId, text: &str) -> Vec<u8> {
+        let mut m = vec![0u8; proto::CHAT_TEXT_OFF];
+        m[0] = 0x04;
+        m[1] = 5;
+        proto::put_u32(&mut m, 4, pid);
+        m.extend_from_slice(text.as_bytes());
+        m.push(0);
+        m
+    }
+
+    fn goto_world() -> World {
+        let mut w = test_world();
+        w.names.insert(118, "Quantar Depot".into());
+        w.names.insert(241, "Quantar Core Gate".into());
+        w.names.insert(242, "Quantar Core Approach".into());
+        w.gates.insert((241, 2), crate::world::GateLink { dest_loc: 118, dest_gate: 2 });
+        w.gates.insert((241, 3), crate::world::GateLink { dest_loc: 249, dest_gate: 3 });
+        w
+    }
+
+    fn sent_redirect(out: &[Out]) -> Option<(u8, u16)> {
+        out.iter().find(|o| o.msg[0] == 0x08).map(|o| (o.msg[1], proto::u16_at(&o.msg, proto::LOCCHG_LOC_OFF)))
+    }
+
+    #[test]
+    fn goto_moves_a_player_in_space_and_is_not_relayed() {
+        let mut s = Server::new(Config::default(), Templates::default(), goto_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let st = addr("10.0.0.1:1000");
+        // By name (exact beats substring), default gate = lowest.
+        let out = s.handle(Conn::State, st, &chat_line(a, "!goto quantar core gate"));
+        assert_eq!(sent_redirect(&out), Some((2, 241)));
+        assert!(out.iter().all(|o| o.to != b), "commands aren't relayed");
+        assert_eq!(s.players[&a].loc, 241);
+        // By id with a gate.
+        let out = s.handle(Conn::State, st, &chat_line(a, "!goto 241 3"));
+        assert_eq!(sent_redirect(&out), Some((3, 241)));
+        // Station sector without a gate: launch point.
+        let out = s.handle(Conn::State, st, &chat_line(a, "!goto Quantar Depot"));
+        assert_eq!(sent_redirect(&out), Some((LAUNCH_SLOT, 118)));
+        // Punctuation-insensitive substring.
+        s.world.names.insert(107, "Quantar-Core Station".into());
+        let out = s.handle(Conn::State, st, &chat_line(a, "!goto quantar core station"));
+        assert_eq!(sent_redirect(&out), Some((LAUNCH_SLOT, 107)));
+    }
+
+    #[test]
+    fn goto_errors_are_private_messages() {
+        let mut s = Server::new(Config::default(), Templates::default(), goto_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let st = addr("10.0.0.1:1000");
+        for bad in ["!goto", "!goto nowhere", "!goto quantar core", "!goto 241 4", "!goto 18", "!bogus"] {
+            let out = s.handle(Conn::State, st, &chat_line(a, bad));
+            assert_eq!(out.len(), 1, "{bad}");
+            assert_eq!((out[0].to, out[0].msg[0]), (a, 0x04), "{bad}");
+            assert_eq!(s.players[&a].loc, 118, "{bad} must not move the player");
+        }
+        // Docked: refused.
+        s.handle(Conn::State, st, &travel(ACT_DOCK, 118, 0, a));
+        let out = s.handle(Conn::State, st, &chat_line(a, "!goto 241"));
+        assert!(sent_redirect(&out).is_none());
     }
 }

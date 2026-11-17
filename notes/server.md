@@ -105,6 +105,12 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   list and drift it: see message-types "Particle clouds".)
 - NPCs: first server-simulated ship done (see "NPCs" below). Next: roles and a
   population, interest management within the slot budget.
+- Reconnects: the client drops its space connection on dock and opens a new one
+  from the **same UDP port** on the next launch. The listener therefore treats an
+  offline `[0A 00]` from a connected peer as a new session: it drops the old
+  endpoint (old AES key, old message numbers) and emits a disconnect first.
+  Before this fix (2026-11-17), a second launch hung the client waiting for
+  space. ID_DISCONNECTION_NOTIFICATION (0x14) also ends a session.
 - RakNet `session` has no retransmission, which is fine on a LAN but needs adding
   for real networks.
 - Unhandled types are logged once each. Use `--verbose` sessions to grow the table.
@@ -137,3 +143,27 @@ Live test 2026-11-17: the NPC appears as a freighter and its motion is smooth,
 so a server-built 0x05 + 0x33 is drawn and dead-reckoned like a remote player,
 and pid 0x4000_0000 is accepted. Still unconfirmed: 0xfa removal (needs an NPC
 that changes sector), and what the copied unknown 0x05 bytes control.
+
+## Developer 0xFE patches  [tried and removed 2026-11-17]
+
+Two user-approved dev patches were tried for faster test flying: ship-type
+drag (`0xff7eac + type*0x1e0 + 0x38`) and the 1225 speed tripwire
+(`0xac2620`). Removed: the client checksums the ship-type and equipment
+tables in flight and exits on a mismatch (Last Code 117, physics.md §9 item 4).
+The expected totals are in non-writable `.text`, so stats can't be patched over
+0xFE. Faster testing uses the `!goto` dev command instead. The server again
+sends no 0xFE at all.
+
+## Chat `!` commands  [2026-11-17]
+
+The client silently drops unknown `/commands` (slash-commands.md), so server
+commands use chat text starting with `!`. They arrive as C→S 0x04 (text @0x13)
+and are answered privately with a system chat line, never relayed.
+
+| command | effect |
+|---|---|
+| `!goto <sector id or name> [gate 1-4]` | In space only. Sends the same 0x78 + 0x08 as a gate jump. Names match without case or punctuation (exact, else unique substring). Without a gate: a station sector (101–118) arrives at the launch point (sub 6), others at their lowest gate. |
+| `!help` | lists commands |
+
+Dev helpers for now: anyone can use them. Gate them behind GM rights once
+accounts exist. Untested live: `!goto` into the sector you're already in.
