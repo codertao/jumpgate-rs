@@ -103,6 +103,7 @@ impl ReplayConn {
                             self.connected_at = Some(Instant::now());
                         }
                         Event::Message(_) => {} // client→server; ignore for replay
+                        Event::Disconnected => eprintln!("[{}] client disconnected", self.tag),
                     }
                 }
                 let out = self.endpoint.flush();

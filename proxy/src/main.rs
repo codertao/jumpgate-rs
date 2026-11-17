@@ -285,6 +285,7 @@ fn run_probe() {
                                 m.body.len()
                             );
                         }
+                        Event::Disconnected => eprintln!("[probe] server disconnected"),
                     }
                 }
                 for dg in ep.flush() {

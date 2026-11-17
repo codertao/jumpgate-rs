@@ -41,6 +41,15 @@ impl Listener {
         loop {
             match self.sock.recv_from(&mut buf) {
                 Ok((n, from)) => {
+                    // A new connection attempt from a peer we think is connected
+                    // (the client dropped space on dock and is relaunching): the
+                    // old session is dead, so start over with a fresh endpoint.
+                    let fresh = Endpoint::is_open_connection_request(&buf[..n]);
+                    if fresh && self.peers.get(&from).is_some_and(|p| p.endpoint.is_connected()) {
+                        eprintln!("[{}] {from} reconnecting; dropping old session", self.tag);
+                        self.peers.remove(&from);
+                        events.push(NetEvent::Disconnected(from));
+                    }
                     let peer = self.peers.entry(from).or_insert_with(|| {
                         eprintln!("[{}] new peer {from}", self.tag);
                         let mut endpoint = Endpoint::server();
@@ -48,14 +57,21 @@ impl Listener {
                         Peer { endpoint, last_heard: Instant::now() }
                     });
                     peer.last_heard = Instant::now();
+                    let mut closed = false;
                     for ev in peer.endpoint.recv(&buf[..n]) {
                         match ev {
                             Event::Connected => events.push(NetEvent::Connected(from)),
                             Event::Message(m) => events.push(NetEvent::Message(from, m.body)),
+                            Event::Disconnected => closed = true,
                         }
                     }
                     let out = peer.endpoint.flush();
                     Self::send_raw(&self.sock, self.tag, from, out);
+                    if closed {
+                        eprintln!("[{}] {from} disconnected", self.tag);
+                        self.peers.remove(&from);
+                        events.push(NetEvent::Disconnected(from));
+                    }
                 }
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => break,
                 // Windows reports ICMP port-unreachable as a recv error; ignore.

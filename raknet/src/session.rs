@@ -42,6 +42,8 @@ pub enum Event {
     Connected,
     /// A decoded game message arrived (`body[0]` is the message type).
     Message(GameMessage),
+    /// The peer sent ID_DISCONNECTION_NOTIFICATION; the session is over.
+    Disconnected,
 }
 
 struct OutMsg {
@@ -118,6 +120,14 @@ impl Endpoint {
 
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    /// A bare offline ID_OPEN_CONNECTION_REQUEST `[0A 00]`: the first datagram of
+    /// a new connection attempt. A server that sees this from a peer it thinks
+    /// is connected must start over with a fresh endpoint: the client has a new
+    /// key and restarts its message numbers.
+    pub fn is_open_connection_request(datagram: &[u8]) -> bool {
+        datagram.len() <= 2 && datagram.first() == Some(&(MessageId::OpenConnectionRequest as u8))
     }
 
     /// Set the peer's address, echoed in ACCEPTED (server) or
@@ -413,6 +423,13 @@ impl Endpoint {
                 self.connected = true;
                 events.push(Event::Connected);
             }
+            Some(b) if b == MessageId::DisconnectionNotification as u8 => {
+                self.tr("DISCONNECTION_NOTIFICATION");
+                if self.connected {
+                    self.connected = false;
+                    events.push(Event::Disconnected);
+                }
+            }
             Some(b) if b == MessageId::NewIncomingConnection as u8 => {
                 self.tr("NEW_INCOMING_CONNECTION");
             }
@@ -574,5 +591,44 @@ mod tests {
             }
         }
         assert_eq!(got, script, "replayed messages must arrive intact");
+    }
+
+    /// A peer that disconnects and reconnects (same address) brings a new key
+    /// and restarts its message numbers, so the old server endpoint can't carry
+    /// the new session. This is why the server's listener replaces the endpoint
+    /// on a fresh ID_OPEN_CONNECTION_REQUEST.
+    #[test]
+    fn reconnect_needs_a_fresh_server_endpoint() {
+        let (mut server, _old_client, _) = connected_pair();
+        let mut client = Endpoint::client();
+        let first = client.start();
+        assert!(first.iter().all(|d| Endpoint::is_open_connection_request(d)));
+        let mut to_server = first;
+        for _ in 0..20 {
+            let mut to_client = Vec::new();
+            for dg in to_server.drain(..) {
+                server.recv(&dg);
+            }
+            to_client.extend(server.flush());
+            for dg in to_client {
+                client.recv(&dg);
+            }
+            to_server.extend(client.flush());
+        }
+        server.queue_message(&[0x8f]);
+        let got: Vec<Event> = server.flush().iter().flat_map(|d| client.recv(d)).collect();
+        assert!(
+            !got.iter().any(|e| matches!(e, Event::Message(_))),
+            "stale endpoint unexpectedly carried the new session"
+        );
+    }
+
+    #[test]
+    fn disconnection_notification_ends_the_session() {
+        let (mut server, mut client, _) = connected_pair();
+        client.emit_transport(vec![MessageId::DisconnectionNotification as u8], true);
+        let evs: Vec<Event> = client.flush().iter().flat_map(|d| server.recv(d)).collect();
+        assert!(evs.contains(&Event::Disconnected));
+        assert!(!server.is_connected());
     }
 }
