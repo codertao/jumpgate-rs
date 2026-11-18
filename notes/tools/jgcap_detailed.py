@@ -19,14 +19,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # ---- names (per direction; the type space is shared but meanings differ) ----
 
 C2S = {
-    0x04: 'CHAT', 0x05: 'LOGIN / LOC_REPORT', 0x07: 'TRAVEL', 0x08: 'SHIP', 0x09: 'COMMAND',
+    0x04: 'CHAT', 0x05: 'LOGIN / LOC_REPORT', 0x07: 'TRAVEL', 0x08: 'CHANGE_SHIP', 0x09: 'COMMAND',
     0x0C: 'IMPACT', 0x0E: 'CONSUMABLES_UPDATE', 0x0F: 'BUILDING', 0x10: 'PRODBOOST',
     0x16: 'REJECT_SPAWN', 0x17: 'LOC_COMPANION', 0x1A: 'MKILL', 0x1B: 'INSURANCE_UPDATE_REQ',
-    0x1D: 'HIT_QUEUE', 0x2C: 'BOT_HANDOFF', 0x2E: 'CHKBLDG', 0x33: 'SMALL_LOC', 0x34: 'MINI_LOC',
+    0x1D: 'HIT_QUEUE', 0x2C: 'BOT_HANDOFF', 0x2E: 'CHKBLDG', 0x32: 'MISSILE', 0x33: 'SMALL_LOC', 0x34: 'MINI_LOC',
     0x36: 'WINGMAN', 0x37: 'PACKET_55', 0x3D: 'PACKET_61', 0x3F: 'PACKET_63', 0x40: 'PACKET_64',
     0x41: 'PACKET_65', 0x43: 'HITS_COUNTER', 0x44: 'WHO_KILLED_ME', 0x4A: 'TRADE_ACK',
-    0x4B: 'TRADE?', 0x4C: 'MISSION', 0x4D: 'MODX', 0x4E: 'MENTOR', 0x4F: 'TELEPORT',
-    0x59: 'HOME', 0x63: 'REQ_0x63', 0x65: 'CHANNEL_JOIN', 0x6A: 'PLAYER_LIST_REQ', 0x71: 'BOTLOC',
+    0x4B: 'CONTRACT', 0x4C: 'MISSION', 0x4D: 'MODX', 0x4E: 'MENTOR', 0x4F: 'TELEPORT',
+    0x59: 'HOME', 0x63: 'REQ_0x63', 0x64: 'BEACON_TUNE', 0x65: 'CHANNEL_JOIN', 0x6A: 'PLAYER_LIST_REQ', 0x71: 'BOTLOC',
     0x74: 'ASTEROID_AMOUNT', 0x75: 'ASTEROID_REQ', 0x79: 'BUILDING_2', 0x7A: 'PACKET_122',
     0x7B: 'REGISTRY_CHG', 0x83: 'LIST_CHANNELS', 0x8A: 'WEATHER_REQ', 0x8F: 'KEEPALIVE',
     0x90: 'FIND_POS_OWNER', 0x91: 'AVAILABLE_MISSIONS', 0x93: 'MODE', 0x96: 'VOLUNTEER',
@@ -39,17 +39,24 @@ C2S = {
 S2C = {
     0x03: 'DAMAGE / BOT_UPDATE', 0x04: 'CHAT', 0x05: 'SHIP_UPDATE', 0x06: 'CHAR_RECORD',
     0x08: 'LOCATION_CHANGE', 0x0A: 'LISTING', 0x0B: 'LISTING', 0x0D: 'LISTING', 0x13: 'TABLE_0x13',
-    0x14: 'STATUS_0x14', 0x18: 'STATUS_0x18', 0x33: 'SMALL_LOC_RELAY', 0x34: 'MINI_LOC_RELAY',
-    0x42: 'HEARTBEAT_ACK', 0x45: 'RANK', 0x4B: 'TRADE?', 0x50: 'LISTING', 0x51: 'LISTING',
+    0x14: 'FACTION_COUNTER?', 0x18: 'STATUS_0x18', 0x33: 'SMALL_LOC_RELAY', 0x34: 'MINI_LOC_RELAY',
+    0x42: 'HEARTBEAT_ACK', 0x45: 'CREDITS_ITEMS', 0x4B: 'CONTRACT', 0x50: 'LISTING', 0x51: 'LISTING',
     0x52: 'LISTING', 0x53: 'LISTING', 0x54: 'LISTING', 0x55: 'LISTING', 0x56: 'LISTING',
-    0x58: 'TABLE_0x58', 0x61: 'BEACON_UPDATE', 0x62: 'TABLE_0x62', 0x65: 'CHANNEL_ACK',
-    0x71: 'BOT_ASSIGN', 0x73: 'OBJECT_SLOTS', 0x76: 'MISSION_INFO?', 0x78: 'OBJECT_LIST',
+    0x58: 'TABLE_0x58', 0x61: 'BEACON_UPDATE', 0x62: 'TABLE_0x62', 0x65: 'CHANNEL_ACK', 0x70: 'BOT_SPAWN',
+    0x71: 'BOT_ASSIGN', 0x77: 'MEDAL', 0x73: 'OBJECT_SLOTS', 0x76: 'MISSION_INFO?', 0x78: 'OBJECT_LIST',
     0x81: 'MOTD', 0x86: 'CLOUD_UPDATE', 0x87: 'PARTICLE_CLOUDS', 0x8C: 'STATUS_0x8C', 0x8F: 'KEEPALIVE', 0x91: 'AVAILABLE_MISSIONS',
-    0x92: 'STATUS_0x92', 0xA7: 'SECTOR_STATION', 0xB3: 'OWN_SHIP_ECHO', 0xBA: 'UPDPR',
+    0x92: 'EXPERIENCE', 0xA7: 'SECTOR_STATION', 0xB3: 'OWN_SHIP_ECHO', 0xBA: 'UPDPR',
     0xC2: 'JOB_LIST', 0xFE: 'MEMORY_PATCH',
 }
 
 TRAVEL = {1: 'launch', 2: 'dock', 3: 'jump'}
+# Item categories (items.md); the per-category tables are the extracts.
+CATEGORY_CSV = {0: 'guns', 1: 'missiles', 3: 'cargo', 5: 'engines', 6: 'powerplants', 7: 'radars',
+                8: 'ecms', 9: 'shields', 10: 'capacitors', 11: 'devices'}
+LISTING_CATEGORY = {0x0A: 0, 0x0B: 1, 0x0D: 3, **{0x50 + i: 5 + i for i in range(7)}}
+# C→S 0x09 buy sub-ops: category + 4 for 0/1/3, category + 5 for 5..11 (0x0a-0x0f inferred
+# from the static sub list; 0x04/0x05/0x07/0x10 seen in jgcap2). 0x08 = sell from hold slot.
+BUY_CATEGORY = {0x04: 0, 0x05: 1, 0x07: 3, **{0x0A + i: 5 + i for i in range(7)}}
 # C→S 0x09 command → S→C listing type (capture order).
 LISTING_FOR_CMD = {0x00: 0x0A, 0x01: 0x0B, 0x03: 0x0D, **{0x5A + i: 0x50 + i for i in range(7)}}
 UTIL_SUBS = {0xF2: 'miltour', 0xF3: 'util-243', 0xF4: 'insurance', 0xFB: 'homewhere/oredepot?'}
@@ -64,6 +71,21 @@ try:
                 LOCS[int(r['loc_id'])] = r['name']
 except OSError:
     pass
+
+
+ITEMS = {}  # category -> {index within category: name}
+for _cat, _f in CATEGORY_CSV.items():
+    try:
+        with open(os.path.join(HERE, '..', 'extracts', _f + '.csv')) as f:
+            _rows = list(csv.DictReader(f))
+        ITEMS[_cat] = ({int(r['id']) - 222: r['name'] for r in _rows} if _cat == 3
+                       else {i: r['name'] for i, r in enumerate(_rows)})
+    except OSError:
+        ITEMS[_cat] = {}
+
+
+def item(cat, idx):
+    return ITEMS.get(cat, {}).get(idx) or 'cat%d#%d' % (cat, idx)
 
 
 def loc(v):
@@ -139,6 +161,10 @@ def d_travel(m):
 
 def d_command(m):
     cmd = u8(m, 1)
+    if cmd in BUY_CATEGORY:
+        return 'BUY %g x %s loc=%s pid=%s' % (f32(m, 12), item(BUY_CATEGORY[cmd], u32(m, 4)), loc(u16(m, 2)), u32(m, 8))
+    if cmd == 0x08:
+        return 'SELL %g from item slot %d loc=%s pid=%s' % (f32(m, 12), u32(m, 4), loc(u16(m, 2)), u32(m, 8))
     lt = LISTING_FOR_CMD.get(cmd)
     return 'cmd=0x%02x%s loc=%s pid=%s' % (cmd, ' (→ listing 0x%02x)' % lt if lt is not None else '',
                                           loc(u16(m, 2)), u32(m, 8))
@@ -225,11 +251,57 @@ def d_mem_patch(m):
 
 
 def d_listing(m):
-    n = (0x31C - 4) // 8
-    pairs = [(u32(m, 4 + 8 * k), u32(m, 8 + 8 * k)) for k in range(n) if 8 + 8 * k + 4 <= len(m)]
-    used = [p for p in pairs if p != (0, 0)]
-    show = ', '.join('%d:%d' % p for p in used[:6])
-    return '%d non-empty u32 pair(s) (a:b, meaning unknown) %s%s' % (len(used), show, ' …' if len(used) > 6 else '')
+    """Station market for one category: (u32 stock, u32 price) per item index."""
+    cat = LISTING_CATEGORY.get(m[0], -1)
+    n = len(ITEMS.get(cat, {})) if cat != 3 else 99
+    out = []
+    for k in range(n):
+        stock, price = u32(m, 4 + 8 * k), u32(m, 8 + 8 * k)
+        if stock or price:
+            out.append('%s %d@%d' % (item(cat, k), stock, price))
+    return '%s market, %d item(s) stock@price: %s' % (CATEGORY_CSV.get(cat, '?'), len(out), ', '.join(out))
+
+
+def d_credits_items(m):
+    s = 'credits=%d' % struct.unpack_from('<Q', m, 8)[0]
+    if u8(m, 0x10) == 0xFD:
+        return s + ' (credits only)'
+    slots = []
+    for k in range(48):
+        o = 0x10 + 8 * k
+        if o + 8 <= len(m) and m[o] not in (0, 0xFE):
+            slots.append('%d:%s x%g' % (k, item(m[o], m[o + 1]), round(f32(m, o + 4), 3)))
+    return s + ' items[%s]' % ', '.join(slots)
+
+
+def d_contract(m):
+    if len(m) < 0x3C:
+        return short_hex(m)
+    job, state = u8(m, 8), u8(m, 9)
+    st = 'offer %d' % (state - 0x32) if 0x33 <= state <= 0x35 else {1: 'active', 0: 'none'}.get(state, state)
+    what = item(u8(m, 0x15), u8(m, 0x16)) if u8(m, 0x16) != 0xCC else '-'
+    return ('job=%d state=%s goods=%s dest=%s xp=%d credits=%d remaining=%g'
+            % (job, st, what, loc(u16(m, 0x1A)), u32(m, 0x30), u32(m, 0x34), f32(m, 0x38)))
+
+
+def d_c_contract(m):
+    op = u8(m, 9)
+    o = {0x65: 'accept'}.get(op) or ('view offer %d' % op if op < 4 else 'close (%d)' % op if op >= 0x96 else op)
+    return 'job=%d %s pid=%s' % (u8(m, 8), o, u32(m, 4))
+
+
+def d_bot_spawn(m):
+    return 'ai_type=%d (ai_types.csv row) spawn#%d' % (u8(m, 1), u16(m, 2))
+
+
+def d_bot_death(m):
+    return 'bot#%d killer=%s reporter=%s' % (u16(m, 2), u32(m, 4), u32(m, 8))
+
+
+def d_missile(m):
+    ty = u16(m, 2)
+    return 'id=%d %s owner=%s pos=%s' % (u8(m, 1), 'removed' if ty == 0xFA else 'type=%s' % item(1, ty),
+                                         u32(m, 0x14), vec(m, 0x1C))
 
 
 def d_beacon(m):
@@ -277,7 +349,12 @@ DECODERS = {
     ('C', 0x05): d_c_05, ('C', 0x07): d_travel, ('C', 0x09): d_command, ('C', 0x04): d_c_chat,
     ('C', 0x65): d_channel_join, ('C', 0x6A): d_pid4, ('C', 0xC1): d_job_req, ('C', 0xC8): d_pid4,
     ('C', 0x33): d_small_loc, ('C', 0x34): d_mini_loc, ('C', 0x71): d_botloc, ('C', 0x74): d_asteroid,
-    ('C', 0xC3): d_util, ('C', 0x91): d_pid4, ('C', 0x4B): d_pid4,
+    ('C', 0xC3): d_util, ('C', 0x91): d_pid4, ('C', 0x4B): d_c_contract,
+    ('C', 0x44): d_bot_death, ('C', 0x32): d_missile,
+    ('C', 0x08): lambda m: 'ship_type=%d pid=%s' % (u16(m, 1), u32(m, 4)),
+    ('C', 0x64): lambda m: 'faction?=%d id=%d pid=%s' % (u8(m, 1), u16(m, 2), u32(m, 4)),
+    ('S', 0x45): d_credits_items, ('S', 0x4B): d_contract, ('S', 0x70): d_bot_spawn,
+    ('S', 0x77): lambda m: 'medal id=%d' % u8(m, 1), ('S', 0x92): lambda m: 'experience=%d' % u32(m, 4),
     ('S', 0x05): d_loc_report, ('S', 0x06): d_char_record, ('S', 0x08): d_location_change,
     ('S', 0x81): d_motd, ('S', 0x04): d_s_chat, ('S', 0xFE): d_mem_patch, ('S', 0x61): d_beacon,
     ('S', 0xA7): d_station, ('S', 0x87): d_clouds, ('S', 0x86): d_cloud_update, ('S', 0x65): d_channel_ack, ('S', 0xBA): d_updpr,

@@ -123,6 +123,16 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   `SendGameMessage` (`0x9c9c10`), which passes channel 0 and reliability 1 or 3
   [bin]. Live-confirmed 2026-11-18: NPC motion stays smooth with 0x33 sent
   sequenced, so the client accepts server-sent sequenced packets.
+- Economy (from jgcap2, 2026-11-18; see message-types "Station market"): the
+  listings, buy/sell (0x09), credits and item list (0x45), experience (0x92) and
+  contracts (0x4B) are now decoded well enough to build. The server could
+  answer listings from the extracts with its own stock and prices instead of
+  the captured template, apply buys and sells to a per-player 0x45, and offer
+  contracts. Prices are a design question: the captured ones are a reference
+  only.
+- Conflux: the live server spawns them with S→C 0x70 (ai_type, spawn#) on
+  sector entry; the client flies them and reports deaths with C→S 0x44. That's
+  the stock-bot path (approach b in CLAUDE.md), seen working in solo play.
 - Unhandled types are logged once each. Use `--verbose` sessions to grow the table.
 
 ## NPCs  [2026-11-17, first ship; live-tested with the real client]

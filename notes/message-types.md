@@ -25,7 +25,9 @@ Common sub-fields seen across many messages:
 | 0x05 | 33 | **Login** | `[05]` + callsign`\0` @1 + password`\0` (ends before +0x16) + version ("2.0127") at +0x16. **Cleartext password.** [capture, 2026-11-17] |
 | 0x05 | 176 | Ship / loadout state (periodic, ~13 s) | `[05][u16?]` + callsign + slot list + floats; also contains some uninitialized client memory (minor info leak) |
 | 0x07 | 12 | **Launch / Dock / Jump** | `[07][action][u16 from_loc][u32 to_loc][u32 player_id]`; action 1=launch, 2=dock, 3=jump |
-| 0x09 | 16 | **Command / listing request** | `[09][cmd][u16 loc][u32 0][u32 player_id][u32]`; ~25 cmd values. Replies come back as the 896-byte listing tables (see below). |
+| 0x09 | 16 | **Command: market listing, buy, sell, misc** | `[09][cmd][u16 loc][u32 index @4][u32 player_id @8][f32 quantity @12]`. Listing requests, buys and sells: see "Station market" below. Other cmds are slash commands (slash-commands.md). [capture jgcap2, 2026-11-18] |
+| 0x08 | 8 | **Change ship** | `[08][u16 ship_type][u8][u32 player_id]`. Seen switching to type 94 (Hurricane) while docked. The server answered with 13 × 0x45 (the old ship's fittings moved to the item list) and a 0x06. [capture jgcap2] |
+| 0x4B | 60 | **Contract board** | `[4b][3 junk][u32 player_id @4][u8 job @8][u8 op @9]`, rest zero except a u8 @0x18 (7 at Corridor, 0x0e at Quantar Core; meaning unknown). op 1–3 = view offer n, 0x65 = accept, 0x96+n = close offer n. Answered by S→C 0x4B. [capture jgcap2] |
 | 0x0E | 16 | Consumables update | `[0E]...` |
 | 0x04 | 27 | Chat line | `[04][05][u16 loc][u32 player_id][callsign\0][text...]` |
 | 0x65 | 36 | Join chat channel ("chat") | `[65][u16 loc?][u32 player_id]["chat"\0]...` |
@@ -55,7 +57,13 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 | 0x06 | 544 | Character / ship record (handler `0x9d205f`) | `[06][03][1e]` + callsign`\0` @3 … **space-server address @0x22** (UTF-16, same rule as 0x08, acted on only if **mode @0x45 == 1**) … **u16 loc @0x50**, **u32 player id @0x54** (→ `0xbe5da0`) … "My Ship" + 8-byte cargo/equip slots (`fe fe` = empty slot). [static + capture, 2026-11-17] |
 | 0x81 | ~850 | Message of the day | `[81]` + ASCII ("Welcome back! ...") |
 | 0xFE | 321 | **Memory patch** | `[FE]` then records `[01][u32 addr][u16 len][bytes]`. In capture: only award/medal name strings. See network-protocol.md §3. |
-| 0x0A/0x0B/0x0D, 0x50–0x56 | 896 | **Station listing tables** (one per category) | `[type][3 pad][N × (u32,u32)]` + `N` bytes at +0x31C. Each answers one 0x09 Command request, in request order (cmd 0x03 "commodity"→0x0D, 0x01 "missile"→0x0B, 0x5A–0x60→0x50–0x56). Pairs look like price/quantity [inferred]. |
+| 0x0A/0x0B/0x0D, 0x50–0x56 | 896 | **Station market, one category per message** | `[type][3 pad]` + N × `(u32 stock, u32 price)` + N flag bytes at +0x31C. Entry i = item i of that category. See "Station market" below. [static + capture jgcap2, 2026-11-18] |
+| 0x45 | 400 | **Credits and item list** (handler `0x9d662a`; previously called "rank") | `[45][7 pad][u64 credits @8 → 0xff7cf8]` then, unless byte @0x10 is `0xfd` (credits-only update), 48 × 8-byte slots @0x10 copied to `0xff7d2c`: `[u8 category][u8 index][cc cc][f32 quantity]`, `fe` = empty. The list holds cargo and unfitted equipment. C→S 0x09 sell names a slot index from it. Sent after every credit change, purchase, fitting, and while mining. [static + capture jgcap2] |
+| 0x92 | 8 | **Experience total** (handler `0x9d8120`) | `[92][3 pad][u32 experience @4 → 0xbe5da8]`. Rises by exactly the experience in the reward chat lines. [static + capture jgcap2] |
+| 0x77 | 2 | **Medal awarded** (handler `0x9d7ccb`) | `[77][u8 medal id]`. Followed by a system chat "You receive N experience for the medal." The medal names are what the tri server's 0xFE patches into client memory. [static + capture jgcap2] |
+| 0x70 | 6 | **Bot spawn order** (handler `0x9cbac0`) | `[70][u8 ai_type][u16 spawn#][cc cc]`. ai_type = ai_types.csv row (12–14 = conflux types 236–238 in The Dark Trail / Inner Roh-Cloud). Queued in a 40-entry table at `0xba7ad0`. If the table is full, the client sends it back as **C→S 0x16 RejectSpawn** (same bytes, type changed). Sent on sector entry, right after 0x73. The client then flies the bot (C→S 0x71 botloc) and reports its death with C→S 0x44. No S→C 0x71 was seen in this solo session. [static + capture jgcap2] |
+| 0x4B | 60 | **Contract** (handler `0x9d66ee`) | Bytes 8..0x3c are copied to `0xff1e58`. `[u8 job @8]` (0 = no contract) `[u8 state @9]` (0x33–0x35 = viewing offer 1–3, 1 = active) … `[u8 category @0x15][u8 item index @0x16]` (goods to deliver, 0xcc = none), `[u16 destination loc @0x1a]`, i16s @0x1c..0x2f (probably waypoint data, unused for trade), **`u32 experience @0x30`** (UI `mission_experienceearned`), **`u32 credits @0x34`** (UI `mission_creditsearn`), **`f32 remaining @0x38`**. When goods of the matching category/index are sold at the destination, the client subtracts the quantity from `remaining` (`0x4569cf`). The server's completion message carried 1 − sold (−15 after selling 16). [static + capture jgcap2] |
+| 0x14 | 16 | Per-faction counter? | `[14][3 pad][u32 index 0–2][u32 new][u32 previous]`. Values ~100–330, change every few minutes. Faction beacon/sector counts? [inferred] |
 | 0x08 | 64 | **Location change / space-server redirect** (handler `0x9d30c6`) | `[08][sub]` … space-server address @0x0c (UTF-16LE, ≤16 units incl. NUL, field ends at 0x2c) … **u16 dest loc @0x2c** (checked 1..1005) … @0x34. If the address differs from the current one (`0xba79a0`), the client drops space and connects to `<addr>:5151` (`0x9c7190`). Dock sends **"none" as narrow ASCII bytes**: the compare is `wcscmp` (0xaabf39) against a narrow literal at `0xb05afc`, which only works because both are the same raw bytes. **sub @1 = contact slot to appear at**: the arrival gate number (= extract `gate_dest_gate`) for a jump, 6 for a launch, 0xcc on dock (the handler uses `slot = msg[1]`, position = slot pos + random offset). Verified against all captured jumps. [static + capture, 2026-11-17] |
 | 0x04 | 20 / 69 | Chat line (e.g. "KTRI" news bot) | `[04][sub][u16 loc][u32 player_id][callsign\0]...` |
 | 0x65 | 35 | Channel-join ack | `[65][...][u32 handle]` |
@@ -103,8 +111,7 @@ from a remote player. **Runtime-confirmed 2026-11-17:** a server-built 0x05
 with smooth motion. Not yet confirmed: that 0xfa removes it.
 | 0x33 | var | smallloc relay: another ship's 0x33, same layout as C→S | handler `0x9d573c`. Matched by player id @0x18; dropped unless clock @0x34 is newer. Position @0x1c, velocity i16×0.1 @0x12. Error < 200 u is blended into velocity, otherwise snapped (physics.md §8) [static 2026-11-11] |
 | 0x34 | var | miniloc relay: another ship's 0x34, same layout as C→S | handler `0x9d5a9d`. id @0x14, position @0x18, clock @0x30. No velocity; same blend/snap rule [static 2026-11-11] |
-| 0x61 | 4 | **Beacon update** (handler `0x9d67d5`) | `[61][state][u16 loc]`. Valid only for loc 201..=999 and only when contact slot 5 is active with model 2 (the sector beacon); otherwise prints "Received invalid beacon packet". `state` → location table +0x3c [inferred: tuned/owner; capture sent 0]. Station sectors 101–118 have no beacon. [static + live, 2026-11-17] |
-| 0x45 | — | rank | handler `0x9d662a` |
+| 0x61 | 4 | **Beacon update** (handler `0x9d67d5`) | `[61][state][u16 loc]`. Valid only for loc 201..=999 and only when contact slot 5 is active with model 2 (the sector beacon); otherwise prints "Received invalid beacon packet". `state` → location table +0x3c. In jgcap2, state was 0 on entering an untuned sector, and 3 right after the player tuned the beacon (C→S 0x64), so it's probably the owning faction [inferred]. Station sectors 101–118 have no beacon. [static + live, 2026-11-17; capture jgcap2] |
 | 0x8F | 896 | welcome / initial world state | `[8F]...` |
 
 Notes:
@@ -146,7 +153,12 @@ Client → server in space (also see reversing-map "Weapon hits & damage": C→S
 | 0x71 | 52 | **Bot (conflux) state report "botloc"** — sent by the bot's controlling client | `[71][state][hull%][shield%][b][b][u16 id]…[u16 loc]` + i16 vel/orientation + `u32 player` + f32 pos. One per bot this client controls, after every 0x05; empty when you control none (so all-zero in the solo capture). See reversing-map "Conflux / bot AI". |
 | 0x2C | 12 | "bxr" bot handoff request | sent when I'm closer to a bot than its current controller |
 | 0x74 | 16 | **Asteroid amount request/update** | `[74][asteroid id][loc id=0x0ef9]…`. Client *queries* the server for a mineable asteroid's ore amount; strings: "request/update asteroid amount packet". |
-| 0x0F | 392 | Building / station interaction | sent on approach to a station. |
+| 0x0F | 392 | Building / station interaction | sent on approach to a station; every ~11 s while mining near one. |
+| 0x44 | 16 | **Bot destroyed** ("who killed me", sent by the bot's controlling client) | `[44][u8][u16 bot spawn#][u32 killer pid][u32 reporter pid][4 zero]`. The server answered with "Received 3000 credits and 320 experience" (3300/350 for the second), "<callsign> destroyed a member of the Conflux", 0x92, 0x45. [capture jgcap2] |
+| 0x32 | 40 | **Missile** create/remove | `[32][u8 missile id][u16 type @2]` (missile index, e.g. 7 = Purgatory; **0xfa = removed**, the same value as a 0x05 ship removal) … `u32 owner pid @0x14`, `@0x18`, `f32×3 position @0x1c`. One create and one remove per missile fired. [capture jgcap2] |
+| 0x64 | 8 | **Beacon tune** | `[64][u8 3][u16 0x086f][u32 player_id]`. The server answered with 0x61 state 3 for the sector. Whether byte 1 is the faction and the u16 the beacon id is unknown. [capture jgcap2] |
+| 0x43 | 12 | Hits counter, every 30 s in space | `[43][u8][u8][u16 0][u16 @4][u16 @6][u32 player_id]`. Small counts (shots/hits?). [capture jgcap2] |
+| 0x66 | 12 | Unknown | `[66][u8 0–3][u8][u8][u8][3 bytes][u32 player_id]`. Bursts in combat, on ship change (4 at once, slots 0–3) and after buying missiles. Probably weapon-slot or loadout state. [capture jgcap2] |
 
 ### Where the map comes from  [capture + strings + disk]
 > **Superseded:** asteroids/gates/beacons are in fact **hardcoded in the exe**
@@ -204,6 +216,55 @@ timer in `0x9ce1c0..0x9ce2f6`; all three types go on the **space** connection.
   orientation `0xff2ab8..cc`, **velocity** `0xff2ad0..d8` (copied from the
   velocity cells), position `0xff2aac..b4`,
   clock `0xff2aa0`.
+
+### Station market (C→S 0x09 ↔ listings)  [static + capture jgcap2, 2026-11-18]
+
+Each category has a listing request, a reply type, an item count, and a buy sub-op:
+
+| category | listing cmd | reply | entries | client array | buy cmd |
+|---|---|---|---|---|---|
+| 0 guns | 0x00 | 0x0A | 60 | `0xff5e80` | 0x04 |
+| 1 missiles | 0x01 | 0x0B | 24 | `0xff6060` | 0x05 |
+| 3 commodities | 0x03 | 0x0D | 99 (cargo ids 222–320) | `0xff6750` | 0x07 |
+| 5 engines | 0x5A | 0x50 | 27 | `0xff6120` | 0x0A* |
+| 6 powerplants | 0x5B | 0x51 | 27 | `0xff61f8` | 0x0B* |
+| 7 radars | 0x5C | 0x52 | 20 | `0xff6398` | 0x0C* |
+| 8 ECMs | 0x5D | 0x53 | 8 | `0xff6438` | 0x0D* |
+| 9 shields | 0x5E | 0x54 | 25 | `0xff62d0` | 0x0E* |
+| 10 capacitors | 0x5F | 0x55 | 21 | `0xff6478` | 0x0F* |
+| 11 devices | 0x60 | 0x56 | 70 | `0xff6520` | 0x10 |
+
+\* inferred from the static sub-op list (04 05 07 08 0a–10); the others were seen.
+
+- **Listing entry i** = item i of the category, in extract order. Commodities are
+  cargo id 222 + i, so 0 = Water … 37 = Electronics … 98 = Trap. Each entry is
+  `(u32 stock, u32 price)`. The market popup (`0x44c7b0`) prints the low 16 bits of
+  stock under `market_popup_quantity`. Price is read as unsigned, converted to
+  float and multiplied by `0xbe6dc0`. That factor is set from the 0x06 character
+  record (`0x9d23a4`), defaults to 1.0, and is 1.01 in one place (`0xa25481`): a
+  standing or faction markup [inferred]. A buy multiplies by the quantity
+  (`0xbe5e00`). Commodity flag bytes are ignored (the handler zeroes them).
+  Other categories keep one flag byte per item (meaning unknown).
+- **Buy:** `09 <buy cmd> <loc> <u32 item index> <pid> <f32 quantity>`. Seen:
+  16 × Electronics (Corridor stock 59 → 43 in the next listing), 2 × Financier,
+  6 × Purgatory, 1 × DeepRadar.
+- **Sell:** cmd 0x08 with the u32 = **slot in the 0x45 item list** and an f32
+  quantity. Ore sells in fractional tons (41.29, 0.442, ...).
+- After a buy or sell, the server sends 0x45 (credits and items), sometimes 0x06,
+  and the client re-requests the open category's listing.
+- Stock and price drift slowly between listings (prices by a few credits). Mined
+  ores are commodity indices 175–179 (cargo 397 Common Metals … 401 Precious
+  Metals). They aren't in the 99-entry market, so ore is sold from the item list
+  at a price that never appears in a listing.
+
+### Rewards seen (server-side rules, jgcap2)
+
+- Conflux kill: "Received 3000 credits and 320 experience." (the second kill: 3300/350).
+- Beacon income, periodic per tuned beacon: "You gain c1666, and 46 exp for
+  holding sector Hook of Roh beacon" (amounts vary per sector).
+- Medals (0x77) with a fixed experience bonus each: 250, 500 or 2500.
+- Contracts: experience and credits are in the 0x4B offer. Delivery is done
+  by selling the goods at the destination station.
 
 ### Particle clouds (S→C 0x87 / 0x86)  [static + capture, 2026-11-17]
 Galaxy-scale "weather". The list is the same for every sector because it *is*

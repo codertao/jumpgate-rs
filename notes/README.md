@@ -41,6 +41,11 @@ client (`Jumpgate.exe`, SHA-256 `fef6e50f...`, "2.0127" build, server
   - `server_messages_decoded.txt` — decoded server→client messages.
   - `timeline_sanitized.txt` — full session timeline (login **redacted**).
   - `send_types.txt` — client→server types from static analysis.
+  - A second session (`jgcap2.bin`, 2026-11-18; kept local, not committed):
+    trade contract, buy/sell, beacon tune, conflux fight, missiles, ship change,
+    mining contract and ore sale. Its findings are in message-types.md ("Station
+    market", 0x45/0x4B/0x70/0x77/0x92, C→S 0x08/0x32/0x44/0x64), decoded by
+    `tools/jgcap_detailed.py`.
 - **tools/** — the capture/MitM tooling (see `tools/README.txt`):
   - `Msb32.dll` (+ `msb32_proxy.c`) — drop-in recording/MitM shim.
   - `jgdecode.py`, `jgcap_dump.py`, `pcapread.py`, `jgrelay.py`,
