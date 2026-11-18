@@ -130,6 +130,10 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   the captured template, apply buys and sells to a per-player 0x45, and offer
   contracts. Prices are a design question: the captured ones are a reference
   only.
+  Ore sale prices must follow the client's mineral-composition formula
+  (message-types "Station market"), and mined amounts arrive in C→S 0x0F
+  cargo reports, which the client controls: cap them by mining time and
+  laser rate before crediting.
 - Conflux: the live server spawns them with S→C 0x70 (ai_type, spawn#) on
   sector entry; the client flies them and reports deaths with C→S 0x44. That's
   the stock-bot path (approach b in CLAUDE.md), seen working in solo play.

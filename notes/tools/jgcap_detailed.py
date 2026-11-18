@@ -20,13 +20,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 C2S = {
     0x04: 'CHAT', 0x05: 'LOGIN / LOC_REPORT', 0x07: 'TRAVEL', 0x08: 'CHANGE_SHIP', 0x09: 'COMMAND',
-    0x0C: 'IMPACT', 0x0E: 'CONSUMABLES_UPDATE', 0x0F: 'BUILDING', 0x10: 'PRODBOOST',
+    0x0C: 'IMPACT', 0x0E: 'CONSUMABLES_UPDATE', 0x0F: 'CARGO_REPORT', 0x10: 'PRODBOOST',
     0x16: 'REJECT_SPAWN', 0x17: 'LOC_COMPANION', 0x1A: 'MKILL', 0x1B: 'INSURANCE_UPDATE_REQ',
     0x1D: 'HIT_QUEUE', 0x2C: 'BOT_HANDOFF', 0x2E: 'CHKBLDG', 0x32: 'MISSILE', 0x33: 'SMALL_LOC', 0x34: 'MINI_LOC',
     0x36: 'WINGMAN', 0x37: 'PACKET_55', 0x3D: 'PACKET_61', 0x3F: 'PACKET_63', 0x40: 'PACKET_64',
-    0x41: 'PACKET_65', 0x43: 'HITS_COUNTER', 0x44: 'WHO_KILLED_ME', 0x4A: 'TRADE_ACK',
+    0x41: 'PACKET_65', 0x43: 'COMBAT_STATS', 0x44: 'WHO_KILLED_ME', 0x4A: 'TRADE_ACK',
     0x4B: 'CONTRACT', 0x4C: 'MISSION', 0x4D: 'MODX', 0x4E: 'MENTOR', 0x4F: 'TELEPORT',
-    0x59: 'HOME', 0x63: 'REQ_0x63', 0x64: 'BEACON_TUNE', 0x65: 'CHANNEL_JOIN', 0x6A: 'PLAYER_LIST_REQ', 0x71: 'BOTLOC',
+    0x59: 'HOME', 0x63: 'REQ_0x63', 0x64: 'BEACON_EVENT', 0x66: 'FITTING', 0x65: 'CHANNEL_JOIN', 0x6A: 'PLAYER_LIST_REQ', 0x71: 'BOTLOC',
     0x74: 'ASTEROID_AMOUNT', 0x75: 'ASTEROID_REQ', 0x79: 'BUILDING_2', 0x7A: 'PACKET_122',
     0x7B: 'REGISTRY_CHG', 0x83: 'LIST_CHANNELS', 0x8A: 'WEATHER_REQ', 0x8F: 'KEEPALIVE',
     0x90: 'FIND_POS_OWNER', 0x91: 'AVAILABLE_MISSIONS', 0x93: 'MODE', 0x96: 'VOLUNTEER',
@@ -39,7 +39,7 @@ C2S = {
 S2C = {
     0x03: 'DAMAGE / BOT_UPDATE', 0x04: 'CHAT', 0x05: 'SHIP_UPDATE', 0x06: 'CHAR_RECORD',
     0x08: 'LOCATION_CHANGE', 0x0A: 'LISTING', 0x0B: 'LISTING', 0x0D: 'LISTING', 0x13: 'TABLE_0x13',
-    0x14: 'FACTION_COUNTER?', 0x18: 'STATUS_0x18', 0x33: 'SMALL_LOC_RELAY', 0x34: 'MINI_LOC_RELAY',
+    0x14: 'CONFLUX_SWARM', 0x18: 'STATUS_0x18', 0x33: 'SMALL_LOC_RELAY', 0x34: 'MINI_LOC_RELAY',
     0x42: 'HEARTBEAT_ACK', 0x45: 'CREDITS_ITEMS', 0x4B: 'CONTRACT', 0x50: 'LISTING', 0x51: 'LISTING',
     0x52: 'LISTING', 0x53: 'LISTING', 0x54: 'LISTING', 0x55: 'LISTING', 0x56: 'LISTING',
     0x58: 'TABLE_0x58', 0x61: 'BEACON_UPDATE', 0x62: 'TABLE_0x62', 0x65: 'CHANNEL_ACK', 0x70: 'BOT_SPAWN',
@@ -269,7 +269,7 @@ def d_credits_items(m):
     slots = []
     for k in range(48):
         o = 0x10 + 8 * k
-        if o + 8 <= len(m) and m[o] not in (0, 0xFE):
+        if o + 8 <= len(m) and m[o] != 0xFE:  # category 0 = guns
             slots.append('%d:%s x%g' % (k, item(m[o], m[o + 1]), round(f32(m, o + 4), 3)))
     return s + ' items[%s]' % ', '.join(slots)
 
@@ -277,11 +277,13 @@ def d_credits_items(m):
 def d_contract(m):
     if len(m) < 0x3C:
         return short_hex(m)
-    job, state = u8(m, 8), u8(m, 9)
+    job, state, n = u8(m, 8), u8(m, 9), u8(m, 0x14)
     st = 'offer %d' % (state - 0x32) if 0x33 <= state <= 0x35 else {1: 'active', 0: 'none'}.get(state, state)
     what = item(u8(m, 0x15), u8(m, 0x16)) if u8(m, 0x16) != 0xCC else '-'
-    return ('job=%d state=%s goods=%s dest=%s xp=%d credits=%d remaining=%g'
-            % (job, st, what, loc(u16(m, 0x1A)), u32(m, 0x30), u32(m, 0x34), f32(m, 0x38)))
+    wps = ' waypoints=[%s]' % ', '.join('%s%s' % (loc(u16(m, 0x1A + 2 * i)), ' ✓' if m[0x0A + i] else '')
+                                       for i in range(min(n, 10))) if n > 1 else ''
+    return ('job=%d state=%s board=%d goods=%s dest=%s%s xp=%d credits=%d remaining=%g'
+            % (job, st, u8(m, 0x18), what, loc(u16(m, 0x1A)), wps, u32(m, 0x30), u32(m, 0x34), f32(m, 0x38)))
 
 
 def d_c_contract(m):
@@ -351,8 +353,16 @@ DECODERS = {
     ('C', 0x33): d_small_loc, ('C', 0x34): d_mini_loc, ('C', 0x71): d_botloc, ('C', 0x74): d_asteroid,
     ('C', 0xC3): d_util, ('C', 0x91): d_pid4, ('C', 0x4B): d_c_contract,
     ('C', 0x44): d_bot_death, ('C', 0x32): d_missile,
-    ('C', 0x08): lambda m: 'ship_type=%d pid=%s' % (u16(m, 1), u32(m, 4)),
-    ('C', 0x64): lambda m: 'faction?=%d id=%d pid=%s' % (u8(m, 1), u16(m, 2), u32(m, 4)),
+    ('C', 0x08): lambda m: 'ship_type=%d pid=%s' % (u8(m, 1), u32(m, 4)),
+    ('C', 0x0F): lambda m: 'flag=%d pid=%s items[%s]' % (u8(m, 1), u32(m, 0x184), ', '.join(
+        '%d:%s x%g' % (k, item(m[4 + 8 * k], m[5 + 8 * k]), round(f32(m, 8 + 8 * k), 3))
+        for k in range(48) if 12 + 8 * k <= len(m) and m[4 + 8 * k] != 0xFE)),
+    ('C', 0x64): lambda m: 'arg=%d (beacon: faction; 8 = waypoint reached; 9 = patrol event) pid=%s' % (u8(m, 1), u32(m, 4)),
+    ('C', 0x43): lambda m: 'missiles fired=%d hit=%d, gun shots=%d hits=%d' % (u8(m, 1), u8(m, 2), u16(m, 4), u16(m, 6)),
+    ('C', 0x66): lambda m: '%s %s item-list slot %d <-> ship slot %d' % (
+        {0: 'unfit', 1: 'fit', 2: 'missile fired'}.get(u8(m, 4), 'op%d' % u8(m, 4)),
+        CATEGORY_CSV.get(u8(m, 2), 'cat%d' % u8(m, 2)), u8(m, 1), u8(m, 3)),
+    ('S', 0x14): lambda m: 'swarm %d now %s (from %s)' % (u32(m, 4), loc(u32(m, 8)), loc(u32(m, 12)) if u32(m, 12) else '-'),
     ('S', 0x45): d_credits_items, ('S', 0x4B): d_contract, ('S', 0x70): d_bot_spawn,
     ('S', 0x77): lambda m: 'medal id=%d' % u8(m, 1), ('S', 0x92): lambda m: 'experience=%d' % u32(m, 4),
     ('S', 0x05): d_loc_report, ('S', 0x06): d_char_record, ('S', 0x08): d_location_change,
