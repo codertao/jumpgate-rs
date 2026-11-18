@@ -12,25 +12,29 @@ summary on stderr.
 To name a function: add a row to function_names.csv and re-run. Never edit
 functions.csv by hand -- it is regenerated.
 """
-import csv, os, re, struct, sys, collections
+import bisect, csv, os, re, struct, sys, collections
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import jg_static_dump as jsd  # disassemble(), region_functions(), PE, SHA check
+import jg_sendsites  # C->S type at each SendGameMessage call
 
 DISPATCH_IDX, DISPATCH_TBL, DISPATCH_BASE, DISPATCH_N = 0x9da24c, 0x9da0f0, 3, 0xc1
 DISPATCH_DEFAULT = 0x9d9f3e
 TEXT = (0x401000, 0xac2000)
 # known S->C message names for dispatcher cases (see message-types.md)
-MSG_NAMES = {0x03: 'damage', 0x04: 'chat', 0x06: 'char_record', 0x08: 'redirect',
-             0x0a: 'listing', 0x0b: 'listing', 0x0d: 'listing', 0x13: 'sector_table',
-             0x15: 'force_location', 0x33: 'smallloc_relay', 0x34: 'miniloc_relay',
-             0x42: 'heartbeat_ack', 0x45: 'rank', 0x50: 'listing', 0x51: 'listing',
-             0x52: 'listing', 0x53: 'listing', 0x54: 'listing', 0x55: 'listing',
-             0x56: 'listing', 0x62: 'contacts_table', 0x65: 'channel_ack',
-             0x71: 'bot_spawn_assign', 0x73: 'slot_table', 0x78: 'object_list',
-             0x81: 'motd', 0x87: 'nearfield_transforms', 0x8c: 'status', 0x8f: 'welcome',
-             0xa7: 'sector_station', 0xb3: 'ownship_echo', 0xc2: 'table_c2'}
+MSG_NAMES = {0x03: 'damage', 0x04: 'chat', 0x06: 'char_record', 0x08: 'location_change',
+             0x0a: 'listing_guns', 0x0b: 'listing_missiles', 0x0d: 'listing_commodities',
+             0x13: 'sector_table', 0x14: 'conflux_swarm', 0x15: 'force_location',
+             0x33: 'smallloc_relay', 0x34: 'miniloc_relay', 0x42: 'heartbeat_ack',
+             0x45: 'credits_items', 0x4b: 'contract', 0x50: 'listing_engines',
+             0x51: 'listing_powerplants', 0x52: 'listing_radars', 0x53: 'listing_ecms',
+             0x54: 'listing_shields', 0x55: 'listing_capacitors', 0x56: 'listing_devices',
+             0x61: 'beacon_faction', 0x62: 'contacts_table', 0x65: 'channel_ack',
+             0x70: 'bot_spawn', 0x71: 'bot_assign', 0x73: 'slot_table', 0x77: 'medal',
+             0x78: 'object_list', 0x81: 'motd', 0x87: 'particle_clouds', 0x8c: 'status',
+             0x8f: 'welcome', 0x92: 'experience', 0xa7: 'sector_station', 0xb3: 'ownship_echo',
+             0xc2: 'job_list', 0xfe: 'memory_patch'}
 
 
 def enumerate_functions(lines, data, pe):
@@ -203,6 +207,11 @@ def main():
     iat = read_imports(data)
     auto, imps = auto_names(lines, starts, pe, iat)
     size = {a: (starts[i + 1] - a) if i + 1 < len(starts) else 0 for i, a in enumerate(starts)}
+    # C->S message types each function sends (jg_sendsites); '?' = not resolved statically
+    sends = collections.defaultdict(list)
+    for site, t in jg_sendsites.send_sites(lines):
+        i = bisect.bisect_right(starts, site) - 1
+        if i >= 0: sends[starts[i]].append(t)
     rows = []
     for a in starts:
         c = curated.get(a)
@@ -217,10 +226,17 @@ def main():
             name, src, conf, ref = auto[a]; area = ''
         else:
             name = area = conf = ref = src = ''
+        types = sends.get(a, [])
+        known = sorted({t for t in types if t is not None})
+        if (not name or src == 'string') and len(known) == 1 and None not in types and size[a] <= 512:
+            t = known[0]
+            name, src, conf = f'send_{jg_sendsites.C2S.get(t, "msg")}_0x{t:02x}', 'send-site', 'med'
+            ref = ref or f'SendGameMessage type 0x{t:02x}'
         if not area: area = band(a)
         rows.append({'addr': f'0x{a:x}', 'kind': kind, 'size_est': size[a],
                      'callers': callers.get(a, 0), 'name': name, 'name_source': src,
                      'area': area, 'confidence': conf, 'ref': ref,
+                     'sends': ' '.join('?' if t is None else f'{t:02x}' for t in sends.get(a, [])),
                      'imports': ' '.join(sorted(imps.get(a, ())))[:120]})
     for a, types in sorted(cases.items()):
         nm = '/'.join(MSG_NAMES.get(t, '') or f'{t:02x}' for t in types)
@@ -229,7 +245,13 @@ def main():
                      'callers': '', 'name': ('on_' + nm) if known else '',
                      'name_source': 'dispatch' if known else '',
                      'area': 'net-msg-handler', 'confidence': 'med' if known else '',
-                     'ref': 'S->C type ' + ','.join(f'0x{t:02x}' for t in types), 'imports': ''})
+                     'ref': 'S->C type ' + ','.join(f'0x{t:02x}' for t in types), 'sends': '', 'imports': ''})
+    # Ghidra tolerates duplicate names but they read badly: suffix the address
+    # onto non-curated repeats (e.g. four send_trade_ack_0x4a senders).
+    seen = collections.Counter(r['name'] for r in rows if r['name'] and r['name_source'] not in ('compiler', 'curated', 'region'))
+    for r in rows:
+        if r['name'] and seen[r['name']] > 1 and r['name_source'] not in ('compiler', 'curated', 'region'):
+            r['name'] += '_' + r['addr'][2:]
     with open(out, 'w', newline='') as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0])); w.writeheader(); w.writerows(rows)
 
