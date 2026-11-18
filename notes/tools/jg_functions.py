@@ -25,14 +25,14 @@ TEXT = (0x401000, 0xac2000)
 # known S->C message names for dispatcher cases (see message-types.md)
 MSG_NAMES = {0x03: 'damage', 0x04: 'chat', 0x06: 'char_record', 0x08: 'location_change',
              0x0a: 'listing_guns', 0x0b: 'listing_missiles', 0x0d: 'listing_commodities',
-             0x13: 'sector_table', 0x14: 'conflux_swarm', 0x15: 'force_location',
+             0x13: 'sector_table', 0x58: 'mineral_vein', 0x14: 'conflux_swarm', 0x15: 'force_location',
              0x33: 'smallloc_relay', 0x34: 'miniloc_relay', 0x42: 'heartbeat_ack',
              0x45: 'credits_items', 0x4b: 'contract', 0x50: 'listing_engines',
              0x51: 'listing_powerplants', 0x52: 'listing_radars', 0x53: 'listing_ecms',
              0x54: 'listing_shields', 0x55: 'listing_capacitors', 0x56: 'listing_devices',
              0x61: 'beacon_faction', 0x62: 'contacts_table', 0x65: 'channel_ack',
-             0x70: 'bot_spawn', 0x71: 'bot_assign', 0x73: 'slot_table', 0x77: 'medal',
-             0x78: 'object_list', 0x81: 'motd', 0x87: 'particle_clouds', 0x8c: 'status',
+             0x70: 'bot_spawn', 0x71: 'bot_assign', 0x73: 'asteroid_levels', 0x77: 'medal',
+             0x78: 'building_sites', 0x19: 'building_info', 0x81: 'motd', 0x87: 'particle_clouds', 0x8c: 'status',
              0x8f: 'welcome', 0x92: 'experience', 0xa7: 'sector_station', 0xb3: 'ownship_echo',
              0xc2: 'job_list', 0xfe: 'memory_patch'}
 

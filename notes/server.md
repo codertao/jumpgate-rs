@@ -72,7 +72,7 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 | 0xc1 | state | 0xc2 | capture |
 | 0x65 | state | 0x65 ack | capture |
 | 0x04 chat | state | relayed verbatim to every other player [inferred] | — |
-| 0x63 / 0xc3 / 0x8a | state | 0x62 / 3×0x14 / weather: docked 0x87, in space 0x73+0x87, plus 0x61 beacon only in sectors 201–999 | capture, pairing [inferred] |
+| 0x63 / 0xc3 / 0x8a | state | 0x62 / 3×0x14 / weather: docked 0x87, in space 0x73+0x87 (0x73 is the captured Depot asteroid bitmap; build per sector, see message-types "Asteroid ore levels"), plus 0x61 beacon only in sectors 201–999 | capture, pairing [inferred] |
 | 0x91 / 0x4b | state | 0x91+2×0x76 / 0x4b | capture |
 | 0x17 | state | 0x42 + 0xb3 | capture |
 | 0x07 launch | state | loc = station+100; 0x06, 0x78, **0x08 → our IP**, dest sector | capture |

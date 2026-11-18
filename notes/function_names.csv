@@ -34,7 +34,6 @@ addr,name,area,confidence,ref
 0x9c8ca0,msg_obfuscate_encode,net-msg,high,network-protocol.md
 0x9c8d30,msg_obfuscate_decode,net-msg,high,network-protocol.md
 0x9c9c10,SendGameMessage,net-msg,high,reversing-map.md#game-message-layer
-0x9c9c90,SendSpaceMessage,net-msg,med,
 0x9c9d10,send_botloc_owned,bot-ai,high,reversing-map.md#conflux
 0x9caa20,send_hits_counter_0x43,weapons,high,reversing-map.md#weapon-hits
 0x9cab20,send_who_killed_me_0x44,weapons,high,reversing-map.md#weapon-hits
@@ -121,3 +120,187 @@ addr,name,area,confidence,ref
 0xa79770,aes_blockEncrypt,net-crypto,high,raknet-spec.md
 0xa79ac0,aes_blockDecrypt,net-crypto,high,raknet-spec.md
 0xa637a0,RakPeer_Send_common,net,med,raknet-spec.md#function-map
+# --- 2026-11-18: from the notes (addresses cited there as function starts) ---
+0x409e10,ship_mesh_hit_test,weapons,med,ai.md (swept segment vs models 30-121)
+0x439a10,harvest_gas_tick,mining,high,message-types.md (gas harvesting; sends 0x0F cargo report; 'Cargo bay is full.')
+0x43eb30,missile_splash_damage,weapons,med,ai.md (models 284-287 radius 2000)
+0x440660,log_write_spacer,debug,med,physics.md#9 (writes spaces/newline to a log)
+0x441740,format_equipment_list,ui,med,slash-commands.md (/list; '%sGuns: %s')
+0x449690,compute_ore_prices,economy,high,message-types.md#station-market (ore entries 175-179 from mineral mix)
+0x4848a0,chat_print_line,ui-chat,high,slash-commands.md
+0x499d00,input_poll_device_a,input,low,physics.md (DirectInput poll; device inferred)
+0x49bb20,input_poll_device_b,input,low,physics.md (DirectInput poll; device inferred)
+0x49c080,cmd_bot,slash,high,slash-commands.md (/bot; -stop -mt -rs -time)
+0x4ba420,load_sector_world_objects,world,med,physics.md (fills world object table on location change)
+0x9c7190,connect_space_server,net,med,message-types.md S->C 0x08 (drops space, connects <addr>:5151)
+0x9c9660,on_conflux_swarm_0x14,net-msg-handler,high,message-types.md S->C 0x14
+0x9cad80,send_beacon_event_0x64,net-msg,high,message-types.md C->S 0x64
+0x9cb4d0,send_keepalive_0x8f,net-msg,high,network-protocol.md (send site type 0x8f)
+0x9ddea0,set_scene_light,render,high,message-types.md (D3D directional light: diffuse args 0-2, ambient 3-5; cloud tint; asteroid depletion)
+0x9ede30,render_world,render,med,message-types.md (95 KB scene renderer)
+0xa19400,table_checksum_check,anti-tamper,high,physics.md#9 item 4
+0xa1edf0,cloud_kind_colour,render,med,message-types.md#particle-clouds
+0xa1eff0,nearest_cloud_effect,world,med,message-types.md#particle-clouds
+0xa1f1d0,assign_cloud_effects_to_locations,world,med,message-types.md#particle-clouds
+0xa63ae0,rak_packet_skip_timestamp_a,net,med,network-protocol.md (ID_TIMESTAMP skip)
+0xa63b00,rak_packet_skip_timestamp_b,net,med,network-protocol.md (ID_TIMESTAMP skip)
+0xa6aca0,rak_send_ping,raknet,med,raknet-spec.md
+0xa6f750,rak_install_aes_key,raknet,med,raknet-spec.md (key installed after ACCEPTED)
+0xa70270,rak_internal_packet_write,raknet,high,raknet-spec.md#3.1
+0xa70390,rak_internal_packet_read,raknet,high,raknet-spec.md#3.1
+0xa723c0,RangeList_Deserialize,raknet,high,raknet-spec.md#3.2
+# --- 2026-11-18: jgcap2 work (market / contracts / fitting / bots) ---
+0x436dd0,fire_missile,weapons,med,sends C->S 0x66 op 2 (missile fired); precedes player_fire_weapons
+0x9cbac0,on_bot_spawn_0x70,net-msg-handler,high,message-types.md S->C 0x70 (queues at 0xba7ad0; full -> C->S 0x16)
+0x9cbb60,process_bot_spawn_queue,ai,low,sends C->S 0x16; next to on_bot_spawn_0x70
+0x9cac90,send_weather_req_0x8a,net-msg,high,send site 0x8a ('Error Sending W.All.R. Packet!')
+0x9cad00,send_req_0x63,net-msg,high,send site 0x63
+0x4524e0,market_buy_sell,economy,high,'Station: Item purchased.'; sends C->S 0x09 buy/sell
+0x449210,market_store_item,economy,med,'You have no more available storage space.'
+0x450020,market_tab_capacitors,economy,high,'market_capacitors' button; sends listing cmd
+0x4503c0,market_tab_commodities,economy,high,'market_commodities' button; sends listing cmd 0x03
+0x450770,market_tab_ecm,economy,high,'market_ecm' button; sends listing cmd
+0x450b10,market_tab_engines,economy,high,'market_engines' button; sends listing cmd
+0x450ec0,market_tab_guns,economy,high,'market_guns' button; sends listing cmd 0x00
+0x451260,market_tab_missiles,economy,high,'market_missiles' button; sends listing cmd 0x01
+0x451600,market_tab_modx,economy,high,'market_modx' button; sends listing cmd
+0x4519a0,market_tab_powerplants,economy,high,'market_powerplants' button; sends listing cmd
+0x451d40,market_tab_radar,economy,high,'market_radar' button; sends listing cmd
+0x452110,market_tab_shields,economy,high,'market_shields' button; sends listing cmd
+0x4089f0,market_buy_checks,economy,med,'Your funds are insufficient'/'not high enough rank'
+0x45dcc0,contract_offer_popup,contracts,high,mission_payment/mission_experience/mission_objectives
+0x45d290,contract_hud_refresh,contracts,med,mission_current_remaining/mission_creditsearn
+0x45deb0,contract_fail,contracts,med,'mission_fail'; sends C->S 0x4C
+0x459a10,mission_terminal_open,contracts,med,'Accessing JOSSH mission computers...'
+0x45a730,mission_type_buttons,contracts,med,mission_mining/patrol/transport/...
+0x4589f0,send_mission_0x4c,contracts,high,send site 0x4C ('Error Sending Mission Packet')
+0x483240,pilot_info_bar_refresh,ui,high,'%s(%d) %s c%I64d Exp %ld Cargo ...'
+0x483970,pilot_info_line,ui,med,pilotinfo_txt format
+0x4790a0,config_change_ship,fitting,high,sends C->S 0x08 + 0x66 (ship change and refit)
+0x47a8f0,config_equip_item,fitting,med,'Ship: Nothing in inventory to equip.'; sends 0x66
+0x477fe0,config_unequip_item,fitting,low,sends 0x66 x9; partner of config_equip_item
+0x4775d0,config_screen_refresh,fitting,low,ship_configurator_s; calls power_budget
+# --- 2026-11-18: UI screens, from their widget strings ---
+0x401280,load_cursor_bitmaps,ui,high,cursor24.bmp c00..
+0x402a40,video_settings_save,settings,med,video.bin writer (10 callers; siblings 0x4028c0-0x402b40)
+0x403010,login_dialog_text,ui-login,med,opt_conerror/opt_username_txt1
+0x407190,log_splash,debug,low,SPLASH24.BMP
+0x4112c0,init_asteroid_names,world,med,'Flatiron' 'Pod' 'Rocky' ...
+0x426690,init_commodity_abbrevs,items,med,'H2O' 'GRN' 'MED' 'CPU' ...
+0x4406a0,flags_bin_load,settings,high,flags.bin reader
+0x440d50,flags_bin_save,settings,med,opt_passsave_s + flags.bin
+0x440a40,help_bin_save,tutorial,high,'Error saving to help.bin'
+0x440e50,help_load,tutorial,high,help.bin / help.txt
+0x440ae0,tutorial_hint_popup,tutorial,high,tutorial_hint_popup (39 callers)
+0x4427f0,jobs_popup_draw,ui-jobs,med,popup_jobs job_lg_textbox_type_N
+0x443170,chat_set_whisper,ui-chat,med,'Now whispering to (%s)'
+0x443850,send_job_list_req_0xc1_b,ui-jobs,med,send site 0xC1
+0x444650,market_list_rows,economy,med,market_item_%d_amount/name/cost
+0x444c90,market_item_details,economy,med,'Mass: %d' 'Name: %s' 'Size: %d'
+0x445d80,market_list_rows_p,economy,med,market_item_p%d_amount/name/cost
+0x446360,market_inventory_panel,economy,med,pos_marketinfo 'Used:%d Free:%d'
+0x447900,market_sell_popup,economy,med,market_popup market_sell market_quantityup
+0x447e60,market_popup_quantity,economy,med,'You may only buy or sell one unit...'
+0x448ca0,pos_screen_text,pos,med,pos_credits_txt pos_stationname
+0x44bef0,market_item_icons,economy,med,market_item1 '%sitem%d.bmp'
+0x44f280,market_sort_buttons,economy,med,market_sort_*
+0x44f870,item_icon_path,ui,low,gun// missile// ... (15 callers)
+0x457040,station_menu_buttons,ui-station,med,market_s mission_s ship_configurator_s trade_s simulator_s station_admin
+0x457550,pos_module_names,pos,med,'Tooling Center' 'Nano Assembler' 'Naval Yard'
+0x458570,mission_popup_draw,contracts,med,mission_popup mission_accept
+0x45e1d0,login_popup,ui-login,high,opt_connect_popup opt_username_txt opt_password_txt
+0x45e580,options_video_screen,settings,med,opt_video_box
+0x45f5d0,sound_bin_save,settings,med,sound.bin
+0x45f960,options_keys_tabs,settings,med,opt_key_*_s
+0x460000,key_name,settings,med,'NUMPD0'... (46 callers)
+0x460740,controls_save,settings,high,controls.bin joystick.bin trackir.bin writer
+0x466af0,controls_load,settings,high,controls.bin joystick.bin trackir.bin reader
+0x460880,options_video_widescreen,settings,med,opt_video_w1280...
+0x460c10,options_video_resolution,settings,med,opt_video_640...
+0x461240,options_sound_screen,settings,med,opt_sound_*
+0x467940,config_item_buttons,fitting,med,config_equip_%i config_unequip_%i
+0x46e060,config_stats_panel,fitting,med,config_cap_txt config_engines_txt
+0x471120,ship_name_text,fitting,low,ship_name_txt with faction names
+0x475a90,config_tab_buttons,fitting,med,config_guns_s config_missiles_s config_equipment_s config_modx_s
+0x47ba60,simulator_buttons,simulator,med,sim_button%d
+0x47c240,simulator_toggle,simulator,med,sim_on/sim_off; sends C->S 0x6D
+0x47cba0,trade_buttons,trade,med,trade_accept trade_offer
+0x47d2c0,trade_request_text,trade,med,trade_request_name/rank/faction
+0x47fd20,trade_amount_checks,trade,med,'You can not trade fractional amounts.'
+0x480500,trade_popup,trade,med,trade_popup
+0x4814f0,load_text_tables,ui,high,samples.txt rollovers.txt newtips.txt
+0x4825e0,pos_destination_popup,pos,med,pos_deststationpopup
+0x482740,insurance_options_text,insurance,med,ins_check_on_%d 'c0:Uninsured'
+0x482e20,user_bin_save_username,settings,med,opt_username_txt1 + user.bin
+0x4830b0,user_bin_save_password,settings,med,opt_password_txt1 + user.bin (stored by the client; see notes security)
+0x483c10,station_commlink,ui-station,med,station_commlink_access comm_name_NN
+0x4844c0,medal_popup,ui,high,popup_medal interface//medals//medal%d.bmp
+0x484fd0,storage_screen,economy,med,'click this item to put it in storage'
+0x485c70,market_item_tooltips,economy,low,'market item available for purchase'
+0x486600,market_screen_draw,economy,low,market_item1 + category paths
+0x487e60,mentor_popup,ui,med,popup_mentor
+0x487f60,send_mentor_0x4e,ui,high,send site 0x4E
+0x4883a0,pos_admin_screen,pos,med,station_admin pos_upkeep
+0x489250,pos_module_type_name,pos,med,'Repair' 'Rearm' 'Refuel' 'Ore Silo'
+0x489bc0,pos_module_text,pos,med,'Cost per Repair.'
+0x48a830,pos_screen_draw,pos,med,'Weekly Upkeep Fee: %d'
+0x48bf60,load_ship_sprites,ui,low,escape_pod_st.bmp ship_shadow
+0x48c190,tooltip_draw,ui,med,tooltip_txt
+0x48da20,send_network_problem,net-msg,low,'Network problems detected!'
+0x48daa0,send_registry_chg_0x7b,net-msg,high,send site 0x7B ('Error sending registry chg request')
+0x48daf0,insurance_popup,insurance,med,popup_insurance 'Waiting for data...'
+0x48e210,send_insurance_update_0x1b,insurance,high,send site 0x1B
+0x48e710,pirate_popup,ui,med,pirate_popup
+0x48e7b0,military_popup,ui,med,military_popup
+0x48e860,registry_change_checks,ui,med,'You can only change your registration above Rank 8.'
+0x48e9b0,station_ui_mouse,ui-station,low,tooltips + sends 0xAA/0xAB invite (20 KB)
+0x493f00,load_interface_bitmap,ui,med,interface//%s
+0x4943d0,load_interface_layouts,ui,high,iface_*.itr
+0x494610,interface_main_draw,ui,low,frame_* ship_shadow (9 KB)
+0x496b90,frame_bottom_tabs,ui,low,frame_bottom ship_configurator market trade mission simulator
+0x497ff0,rotacol_load,settings,high,rotacol.bin reader
+0x498030,rotacol_save,settings,high,rotacol.bin writer
+0x49d490,dinput_keyboard_error,input,med,'unknown keyboard error' DIERR_*
+0x4ad200,load_map_tips,map,high,maptips.txt
+0x4b4b00,spawn_artifacts,world,med,S->C 0x58 record 2 (artifact1-5.x, models 0x190-0x194); art1..4.bmp
+0x4b5c70,map_faction_buttons,map,med,mb_all mb_s mb_o mb_q ...
+0x4bb9a0,map_skybox,map,med,mapskybox.bmp
+0x9c3b50,miles_shutdown,sound,high,'SHUTDOWN MILES'
+0x9c48b0,music_playlist_select,sound,high,neutral.m3u solrain.m3u ...
+0x9c4d20,sound_init,sound,high,miles + *.wav; calls InitMiles3D
+0x9c57d0,init_contract_texts,contracts,high,'Deliver %%amount%% units of %%oretype%%...'
+0x9c7a30,init_medal_names,ui,high,'Spirit of Unity' 'Merit of Defense' ...
+0x9c91c0,on_station_impact_msg,net-msg-handler,med,'Station: Pilot %s has impacted the station.'
+0x9c9250,on_building_info_0x19,net-msg-handler,high,S->C 0x19: appends a building record to bldginfo.txt (message-types Building sites)
+0x9c9710,on_tips_msg,net-msg-handler,med,'TIPS:%s'
+0x9c9770,on_faction_standing_msg,net-msg-handler,med,'WARNING:Your faction is now %s toward %s'
+0x9ca140,login_wait_text,ui-login,low,'May take a few seconds...'
+0x9ca4c0,send_login,net-msg,high,'Login Sent OK.' (C->S 0x05 login; password field: never log)
+0x9cb770,set_chat_channel,ui-chat,med,'Booth channel set to (%s)'
+0x9da500,profanity_mask,ui-chat,med,'@#$!*^*@$...' + crt_rand
+0x9db470,load_profanity_list,ui-chat,med,word list
+0x9dbdf0,login_failed,ui-login,med,'Login Failed!'
+0x9dbf10,pos_build_distance_check,pos,med,'You cannot build this close to an existing object.'
+0x9dc0d0,trackir_load,input,high,NPClient.dll NP_GetSignature
+0x9de700,particle_spawn,render,med,'Failed to create new particle' (68 callers)
+0x9e57c0,hud_target_info,ui-hud,low,'COMBAT' and target readouts (18 KB)
+0x9ebea0,load_flight_cursor,ui-hud,med,flight_cursor.bmp
+0xa1a770,log_dpnet,debug,low,dpnet.dll
+0xa1c150,load_map_textures,map,med,cursor8bit.bmp mb_*.bmp
+0xa1cab0,load_station_textures,render,med,st1a_e0%d.bmp ...
+0xa1d240,load_effect_textures,render,med,jg01.bmp shld24a.bmp
+0xa1f410,exception_code_name,debug,high,STATUS_* names
+0xa20950,on_medal_received,ui,med,'Medal received: %s'
+0xa20db0,load_ocr_font,render,med,'OCR A Extended'
+0xa20fe0,draw_fps,render,high,'%5.02ffps(%dx%dx%d)'
+0xa277b0,load_ship_hud_models,render,med,cc0%d_hud.x
+0xa38b90,load_space_object_models,render,med,debris.x beacon.x
+0xa3d4c0,load_gate_models,render,med,jump_ends.x
+0xa469f0,load_ship_models,render,high,'Error loading ship main X file'
+0xa587b0,load_explosion_models,render,med,cargo.x exp%d.x
+0xa32d30,load_artifact_models,render,med,artifact1.x docking_beacon.x
+0x4b4750,spawn_building_site_object,world,high,message-types.md Building sites (S->C 0x78 -> slot 300+i)
+0x9c9980,on_special_object_969,world,low,sets world object 969 (model 0x1ad) from a message; physics.md
+0x9c7a00,asteroid_level_get,mining,high,message-types.md Asteroid ore levels (2-bit level of world object i from 0x73 bitmap)
+0x43b1b0,flight_devices_tick,devices,low,mining laser tick + 0x74 report (0x43ce8b-0x43d563), teleport/burglar
+0x9c7460,decode_obfuscated_coord,net-msg,high,float(v ^ 0xc0b55); S->C 0x58 vein/artifact positions

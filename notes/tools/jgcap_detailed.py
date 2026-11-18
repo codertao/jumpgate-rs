@@ -27,7 +27,7 @@ C2S = {
     0x41: 'PACKET_65', 0x43: 'COMBAT_STATS', 0x44: 'WHO_KILLED_ME', 0x4A: 'TRADE_ACK',
     0x4B: 'CONTRACT', 0x4C: 'MISSION', 0x4D: 'MODX', 0x4E: 'MENTOR', 0x4F: 'TELEPORT',
     0x59: 'HOME', 0x63: 'REQ_0x63', 0x64: 'BEACON_EVENT', 0x66: 'FITTING', 0x65: 'CHANNEL_JOIN', 0x6A: 'PLAYER_LIST_REQ', 0x71: 'BOTLOC',
-    0x74: 'ASTEROID_AMOUNT', 0x75: 'ASTEROID_REQ', 0x79: 'BUILDING_2', 0x7A: 'PACKET_122',
+    0x74: 'MINING_REPORT', 0x75: 'ASTEROID_REQ', 0x79: 'BUILDING_2', 0x7A: 'PACKET_122',
     0x7B: 'REGISTRY_CHG', 0x83: 'LIST_CHANNELS', 0x8A: 'WEATHER_REQ', 0x8F: 'KEEPALIVE',
     0x90: 'FIND_POS_OWNER', 0x91: 'AVAILABLE_MISSIONS', 0x93: 'MODE', 0x96: 'VOLUNTEER',
     0x98: 'REFER', 0x9B: 'VOLUNTEER_OFF', 0x9C: 'EVENT_QUERY', 0x9D: 'VOUCH', 0xA0: 'LAUNCH_SPACE',
@@ -42,8 +42,8 @@ S2C = {
     0x14: 'CONFLUX_SWARM', 0x18: 'STATUS_0x18', 0x33: 'SMALL_LOC_RELAY', 0x34: 'MINI_LOC_RELAY',
     0x42: 'HEARTBEAT_ACK', 0x45: 'CREDITS_ITEMS', 0x4B: 'CONTRACT', 0x50: 'LISTING', 0x51: 'LISTING',
     0x52: 'LISTING', 0x53: 'LISTING', 0x54: 'LISTING', 0x55: 'LISTING', 0x56: 'LISTING',
-    0x58: 'TABLE_0x58', 0x61: 'BEACON_UPDATE', 0x62: 'TABLE_0x62', 0x65: 'CHANNEL_ACK', 0x70: 'BOT_SPAWN',
-    0x71: 'BOT_ASSIGN', 0x77: 'MEDAL', 0x73: 'OBJECT_SLOTS', 0x76: 'MISSION_INFO?', 0x78: 'OBJECT_LIST',
+    0x58: 'MINERAL_VEIN', 0x61: 'BEACON_UPDATE', 0x62: 'TABLE_0x62', 0x65: 'CHANNEL_ACK', 0x70: 'BOT_SPAWN',
+    0x71: 'BOT_ASSIGN', 0x77: 'MEDAL', 0x73: 'ASTEROID_LEVELS', 0x76: 'MISSION_INFO?', 0x78: 'BUILDING_SITES',
     0x81: 'MOTD', 0x86: 'CLOUD_UPDATE', 0x87: 'PARTICLE_CLOUDS', 0x8C: 'STATUS_0x8C', 0x8F: 'KEEPALIVE', 0x91: 'AVAILABLE_MISSIONS',
     0x92: 'EXPERIENCE', 0xA7: 'SECTOR_STATION', 0xB3: 'OWN_SHIP_ECHO', 0xBA: 'UPDPR',
     0xC2: 'JOB_LIST', 0xFE: 'MEMORY_PATCH',
@@ -296,6 +296,42 @@ def d_bot_spawn(m):
     return 'ai_type=%d (ai_types.csv row) spawn#%d' % (u8(m, 1), u16(m, 2))
 
 
+BLDG_TYPES = {1: 'TC', 2: 'NA', 3: 'NY', 4: 'SF', 5: 'OD', 6: 'CP', 7: 'RF', 8: 'RP',
+              9: 'RA', 10: 'ST', 11: 'SDS', 15: 'CFX'}
+
+
+def d_building_sites(m):
+    """S->C 0x78: 50 x [type<<2|stage][cat][item] for world objects 950+i."""
+    out = []
+    for i in range(50):
+        b0, cat, idx = m[1 + 3 * i:4 + 3 * i] if 4 + 3 * i <= len(m) else (0, 0, 0)
+        if not b0: continue
+        t, st = b0 >> 2, b0 & 3
+        what = '' if t in (11, 15) else ' ' + item(cat, idx)
+        out.append('site%d:%s s%d%s' % (i, BLDG_TYPES.get(t, t), st, what))
+    return ', '.join(out) or 'no buildings'
+
+
+def d_asteroid_levels(m):
+    """S->C 0x73: 1000 x 2-bit ore level (3 full .. 0 mined out) per world object id."""
+    lv = [(m[1 + i // 4] >> (2 * (i % 4))) & 3 for i in range(min(1000, 4 * (len(m) - 1)))]
+    low = ['%d:%d/3' % (i, v) for i, v in enumerate(lv) if v in (1, 2)]
+    return '%d objects with ore, full %d%s' % (sum(1 for v in lv if v), lv.count(3),
+                                              (', partial ' + ' '.join(low)) if low else '')
+
+
+def d_mining_report(m):
+    return 'asteroid %d loc %s mined %.3f pid=%d' % (u16(m, 2), loc(u16(m, 4)), f32(m, 8), u32(m, 12))
+
+
+def d_mineral_vein(m):
+    """S->C 0x58: vein (world object 948) commodity/type/pos + artifact; coords are i32 ^ 0xc0b55."""
+    if len(m) < 0x21: return short_hex(m)
+    c = lambda o: (struct.unpack_from('<i', m, o)[0] ^ 0xc0b55)
+    return 'vein %s type %d at (%d,%d,%d) burst=%d; artifact %d at (%d,%d,%d) clear=%d' % (
+        item(3, m[1]), m[2], c(4), c(8), c(12), m[0x10], m[0x11], c(0x14), c(0x18), c(0x1c), m[0x20])
+
+
 def d_bot_death(m):
     return 'bot#%d killer=%s reporter=%s' % (u16(m, 2), u32(m, 4), u32(m, 8))
 
@@ -350,7 +386,7 @@ def d_nonzero(m):
 DECODERS = {
     ('C', 0x05): d_c_05, ('C', 0x07): d_travel, ('C', 0x09): d_command, ('C', 0x04): d_c_chat,
     ('C', 0x65): d_channel_join, ('C', 0x6A): d_pid4, ('C', 0xC1): d_job_req, ('C', 0xC8): d_pid4,
-    ('C', 0x33): d_small_loc, ('C', 0x34): d_mini_loc, ('C', 0x71): d_botloc, ('C', 0x74): d_asteroid,
+    ('C', 0x33): d_small_loc, ('C', 0x34): d_mini_loc, ('C', 0x71): d_botloc,
     ('C', 0xC3): d_util, ('C', 0x91): d_pid4, ('C', 0x4B): d_c_contract,
     ('C', 0x44): d_bot_death, ('C', 0x32): d_missile,
     ('C', 0x08): lambda m: 'ship_type=%d pid=%s' % (u8(m, 1), u32(m, 4)),
@@ -363,13 +399,13 @@ DECODERS = {
         {0: 'unfit', 1: 'fit', 2: 'missile fired'}.get(u8(m, 4), 'op%d' % u8(m, 4)),
         CATEGORY_CSV.get(u8(m, 2), 'cat%d' % u8(m, 2)), u8(m, 1), u8(m, 3)),
     ('S', 0x14): lambda m: 'swarm %d now %s (from %s)' % (u32(m, 4), loc(u32(m, 8)), loc(u32(m, 12)) if u32(m, 12) else '-'),
-    ('S', 0x45): d_credits_items, ('S', 0x4B): d_contract, ('S', 0x70): d_bot_spawn,
+    ('S', 0x45): d_credits_items, ('S', 0x4B): d_contract, ('S', 0x70): d_bot_spawn, ('S', 0x78): d_building_sites, ('S', 0x58): d_mineral_vein, ('S', 0x73): d_asteroid_levels, ('C', 0x74): d_mining_report,
     ('S', 0x77): lambda m: 'medal id=%d' % u8(m, 1), ('S', 0x92): lambda m: 'experience=%d' % u32(m, 4),
     ('S', 0x05): d_loc_report, ('S', 0x06): d_char_record, ('S', 0x08): d_location_change,
     ('S', 0x81): d_motd, ('S', 0x04): d_s_chat, ('S', 0xFE): d_mem_patch, ('S', 0x61): d_beacon,
     ('S', 0xA7): d_station, ('S', 0x87): d_clouds, ('S', 0x86): d_cloud_update, ('S', 0x65): d_channel_ack, ('S', 0xBA): d_updpr,
-    ('S', 0x33): d_small_loc, ('S', 0x34): d_mini_loc, ('S', 0x78): d_nonzero, ('S', 0x62): d_nonzero,
-    ('S', 0x73): d_nonzero,
+    ('S', 0x33): d_small_loc, ('S', 0x34): d_mini_loc, ('S', 0x62): d_nonzero,
+
     **{('S', t): d_listing for t in (0x0A, 0x0B, 0x0D, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56)},
 }
 

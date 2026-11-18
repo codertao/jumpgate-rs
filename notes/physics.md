@@ -342,9 +342,9 @@ remembered. Remote ships are not run through the static-object probe either
 | model | effect |
 |---|---|
 | `0x19e` (414, `x_ai_gate`, the active jumpgate) | **Pull** for 1 < d < 400: `v -= (10000/m)·(1 − cos(d·π/200))·r̂` (r̂ points away from the gate centre). Applied **per frame, not × dt**. **Gate burn:** after loitering within 375 units for more than 17.99 s, shields/hull take `(400−d)·0.0025·(ln(1+t')+t')·dt·1e7 / (110−t')` per frame, with t' = t − 17.99. |
-| `0x19a` (410) | Excluded from the pull. Within 129.5 units you die instantly (`0x42a110` tail). `0x9cc750` puts this model into flagged gate slots [inferred: closed/inactive gate]. |
+| `0x19a` (410) | Excluded from the pull. Within 129.5 units you die instantly (`0x42a110` tail). `0x9cc750` puts this model into flagged gate slots. The model is `cf_infest.x`, so this is probably a conflux-infested gate (2026-11-18; earlier guess "closed gate"). |
 | `0x130` (304) | On contact, damage = (1 / distance)·dt·1e8 per frame [inferred: sun/hazard body]. |
-| `0x1ae` (430) | **Repulsor** within 2000: `v += r̂·(10000/m)·(1 + 1/d)` per frame (not × dt). |
+| `0x1ae` (430, `cf_eruption.x`, placed by S→C 0x78 type 15) | **Repulsor** within 2000: `v += r̂·(10000/m)·(1 + 1/d)` per frame (not × dt). |
 
 **Docking with stations** (model points `+0x7f4` → `+0x814` define the docking
 axis; four guide segments at `+0x834 + k*0x20`):

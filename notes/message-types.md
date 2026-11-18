@@ -68,7 +68,7 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 | 0x04 | 20 / 69 | Chat line (e.g. "KTRI" news bot) | `[04][sub][u16 loc][u32 player_id][callsign\0]...` |
 | 0x65 | 35 | Channel-join ack | `[65][...][u32 handle]` |
 | 0xC2 | 750 | Table of 41 × 18-byte entries, mostly empty | `[C2]` + entries padded with `cc`/`ff ff ff` |
-| 0x78 | 150 | Empty object list at launch (sim) [inferred] | all zero |
+| 0x78 | 151 | **Building sites** (see "Building sites" below) | `[78]` + 50 × 3-byte entries; all zero in empty sectors |
 | 0x18 | 8 | Small status (medal?) | `[18][u32][ff 00 ff 01]` |
 | 0x8C | 7 | Small status | `[8C][cc cc cc][u16?]` |
 | 0x05 | 176 | **Other ship create/update** (handler `0x9cf7c8`): same layout as the C→S location report. Matched by player id @0x5c against slot `+0x15b4`; a new id takes the first free ship slot 10–199. Ship type u16 @0x46 (0xf9/0xfa = remove [inferred]), loc @0x44. This is what the fan server relays. | [static, 2026-11-17] |
@@ -136,8 +136,8 @@ client sends `0x05`(176)+`0x17`(10); server answers a batch of `0xa7`(56)×~10 +
 | 0xA7 | 56 | S→C | **Sector object (station/base) record** | `[A7][u64 hdr/owner][name\0 … 0xCC pad][cat@34][f32 X@36][f32 Y@40][f32 Z@44][flag@48][u32 id@52]`. `cat` 2=public station, 4=player mining HQ, 8=special/factory. Streamed **in full every heartbeat**; positions static per id. Capture held **21 distinct** (13/3/5 by cat). |
 | 0x87 | 260 | S→C | **Particle clouds ("weather"), universe-wide** — answer to 0x8A weather request | `[87][3 pad]` + 8 × 32 B records copied to `0xff1b18` (handler `0x9d8083`): `[type u8][kind u8][strength u8][b3][f32 radius][f32×3 drift unit vector][f32×3 position in **galaxy-map coords** (same space as locations.csv x/y/z)]`. type 0 = empty slot, 1 = particle cloud (2/3 = other phenomena, unseen). See "Particle clouds" below. [static + capture, 2026-11-17; replaces the earlier "near-field transforms" reading] |
 | 0x86 | 36? | S→C | Single particle-cloud update (handler `0x9d80c1`) | `[86][slot<8]..` + one 32-byte record @4 → `0xff1b18 + slot*32` [static] |
-| 0x73 | 251 | S→C | Object-slot occupancy table | `[73]` + `0xFF`-filled free slots + `u32 count` + zeros [inferred] |
-| 0x78 | 151 | S→C | Object list at launch | mostly zero; `[78][u8 n]…` slot list [inferred] |
+| 0x73 | 251 | S→C | **Asteroid ore levels** for the sector (reply to 0x75, and on sector entry) | `[73]` + 1000 × 2-bit level, one per world object; see "Asteroid ore levels" [static + capture] |
+| 0x78 | 151 | S→C | **Building sites** of the destination sector, sent before every 0x08 (launch, jump) | 50 × `[b0][cat][item]`; see "Building sites" [static + capture] |
 | 0xB3 | 44 | S→C | Own-ship physics echo (per heartbeat) | `[B3][3 pad]` + floats (one @12 ~7.2e7, one @26 =100.0) [inferred] |
 | 0x42 | 1 | S→C | Heartbeat ack (pairs with 0x17) | `[42]` |
 | 0x62 | 800 | S→C | Large table, empty in capture (sector contacts?) | zeros [inferred] |
@@ -152,7 +152,7 @@ Client → server in space (also see reversing-map "Weapon hits & damage": C→S
 | 0x17 | 10 | Compact companion report (1:1 with 0x05; sent by `0x9cb330` right after it, on the *state* connection) | `[17]` + 9 bytes that change every send — compact heading/input or state-hash [inferred]. |
 | 0x71 | 52 | **Bot (conflux) state report "botloc"** — sent by the bot's controlling client | `[71][state][hull%][shield%][b][b][u16 id]…[u16 loc]` + i16 vel/orientation + `u32 player` + f32 pos. One per bot this client controls, after every 0x05; empty when you control none (so all-zero in the solo capture). See reversing-map "Conflux / bot AI". |
 | 0x2C | 12 | "bxr" bot handoff request | sent when I'm closer to a bot than its current controller |
-| 0x74 | 16 | **Asteroid amount request/update** | `[74][asteroid id][loc id=0x0ef9]…`. Client *queries* the server for a mineable asteroid's ore amount; strings: "request/update asteroid amount packet". |
+| 0x74 | 16 | **Mining report** (sender in `0x43b1b0` @`0x43d525`, every ≥10 s while mining) | `[74][junk][u16 asteroid id @2][u16 loc @4][2 junk][f32 ore mined since last report @8][u32 player_id @0x0c]`. Bytes 1 and 6–7 are uninitialised stack. The amount is the accumulator `0xbe5e10`, reset after each send. See "Asteroid ore levels" [static + capture jgcap2] |
 | 0x0F | 392 | **Cargo report** (sender `0x439f16`; named "building" in the error strings) | `[0f][u8 flag][2 bytes uninitialised][48 × 8-byte item-list slots @4, copied from 0xff7d2c][u32 player_id @0x184]`. Sent every ~10 s while the mined-amount accumulator `0xbe5e10` is non-zero (it's reset after each send), and once just before docking. flag was 1 during mining and 0 in the final pre-dock report. **The client reports its own mined ore**: the server accepted these amounts (0x45 echoed them), so ore is client-authoritative unless our server checks it. [static + capture jgcap2] |
 | 0x44 | 16 | **Bot destroyed** ("who killed me", sent by the bot's controlling client) | `[44][u8][u16 bot spawn#][u32 killer pid][u32 reporter pid][4 zero]`. The server answered with "Received 3000 credits and 320 experience" (3300/350 for the second), "<callsign> destroyed a member of the Conflux", 0x92, 0x45. [capture jgcap2] |
 | 0x32 | 40 | **Missile** create/remove | `[32][u8 missile id][u16 type @2]` (missile index, e.g. 7 = Purgatory; **0xfa = removed**, the same value as a 0x05 ship removal) … `u32 owner pid @0x14`, `@0x18`, `f32×3 position @0x1c`. One create and one remove per missile fired. [capture jgcap2] |
@@ -183,7 +183,7 @@ Client → server in space (also see reversing-map "Weapon hits & damage": C→S
   (mining-amount accumulators live in a local array at `0xbe5e14`), and per-
   asteroid **amount/depletion** is server-authoritative via `0x74`
   (`request/update asteroid amount`). The large empty S→C tables `0x62`(800B)/
-  `0x13`(788B)/`0x78`(151B) are the likely carriers of the per-sector object
+  `0x13`(788B) are the likely carriers (`0x78` turned out to be building sites, 2026-11-18) of the per-sector object
   list — they came through empty only because the capture was a station hub.
 - Not yet positively captured: an asteroid-placement message (none sent in the
   depot area). Decisive test = a capture flown into an actual asteroid field.
@@ -211,7 +211,8 @@ timer in `0x9ce1c0..0x9ce2f6`; all three types go on the **space** connection.
   is why the solo captures never showed them. In a dogfight → ~3 updates/s.
 - `0x9ceb70` forces an immediate 0x05 (sets the counter to 18), called from `0x9d5dde`.
 - After every 100th 0x05 (`0xbe5c10`) with loc < 1000, also sends `0x75`
-  "request asteroid" (4 B, state conn).
+  "request asteroid" (4 B, state conn). The answer is S→C 0x73 (asteroid ore
+  levels), whose handler zeroes `0xbe5c10`.
 - The 0x05/0x33/0x34 share one snapshot block at `0xff2a50..0xff2af0`:
   orientation `0xff2ab8..cc`, **velocity** `0xff2ad0..d8` (copied from the
   velocity cells), position `0xff2aac..b4`,
@@ -288,6 +289,183 @@ Each category has a listing request, a reply type, an item count, and a buy sub-
   A server must use the same formula when buying ore, or the
   client will show one price and pay another.
 
+### Building sites (S→C 0x78)  [static + capture, 2026-11-18]
+
+Every sector has invisible **building-site markers**: world objects with ids
+**950–999** (model `0x153`, type 339 in `extracts/sector_objects_all.csv`, where
+the id is the `object_id` column). Station sectors have 50 sites; space sectors
+have 5 (ids 950–954). Each has a position and orientation in the extract.
+S→C 0x78 says what stands on each site. The server sends it before every 0x08
+(launch, gate jump, `!goto`) for the destination sector.
+
+Layout: `[78]` + 50 entries × 3 bytes (151 B). Entry *i* is for site 950+*i*:
+
+| byte | meaning |
+|---|---|
+| b0 | `type = b0 >> 2`, `stage = b0 & 3`; 0 = empty site |
+| b1 | item category produced (Gun 0, Msl 1, Com 3, Eng 5, Ppt 6, Rdr 7, Ecm 8, Shd 9, Cap 10, Mdx 11) [inferred] |
+| b2 | item index in that category [inferred] |
+
+Handler: the dispatcher case `0x9d7e2f` unpacks the entries into `0x14b4858 + 16*i`
+(`type, stage, cat, item`). If not docked (`0xbe5b08`), it then calls
+`spawn_building_site_object` `0x4b4750(i, type, stage, item, cat)` for each
+nonzero type. That fills **special-object ship slot 300+i**
+(`0x1042118 + slot*0x160c`): active, `+3 = 0xff`, armour 50000, position and
+fwd/up copied from world object 950+i (`0x140ad48 + (950+i)*0xdc + 0x60…`), stage
+@+0x3e, item @+0x44, cat @+0x48.
+
+- **Model = `0x150 + b0`**, i.e. `b{type}s{stage}.x` (the `bNsM.x` building
+  meshes, models `0x154`–`0x17b`; stage 0–3 shows as 15/50/85/100 in the
+  bldginfo dump, so it's probably construction progress).
+- **type 11 (SDS)** doesn't place anything at the site. If contact slot 6 is a
+  `station7a_body` (model `0x17c`: Solrain/Octavius/Quantar Depot), the
+  station's model becomes `0x17c + stage` (`b11s1..3`, the station with
+  defences). Elsewhere it does nothing.
+- **type 15 (CFX)** places model `0x1ae` = `cf_eruption.x` (a conflux
+  eruption; physics.md "repulsor": pushes ships within 2000, destroys
+  missiles), item field = site index.
+- Type names, from the S→C 0x19 handler `0x9c9250` (appends one building record to
+  `bldginfo.txt`): 0 Nothing, 1 TC (Tooling Center), 2 NA (Nano Assembler),
+  3 NY (Naval Yard), 4 SF, 5 OD, 6 CP, 7 RF, 8 RP, 9 RA, 10 ST, 11 SDS,
+  15 CFX. The long names for 4–10 aren't certain. The client's module list
+  `0x457550` gives "Tooling Center", "Nano Assembler", "Naval Yard"…
+- Zero entries don't clear slots. Slots are reset on location change.
+
+Captured (the item names support b1/b2 = what the building makes):
+
+| sector | sites |
+|---|---|
+| 118 Quantar Depot | 0: SDS stage 3 (depot station upgraded) |
+| 249 Tictac's Hook | 0: SF s3, Gun 47 Vantage |
+| 108 TriPoint-Station | 0: NY s3 Gun 8 Straker; 1: CP s3 Com 59 Fiber Optics; 2: CP s3 Com 52 Synthetics; 3: NA s3 Com 43 Helium; 5: NY s3 Gun 15 V.A.P.O.R. |
+| 109 The Corridor-Station | 0/5/10/15: NY s3 Gun 6 Calefactor / 9 Landlord / 11 Rasp / 13 Serializer |
+| 107 Quantar-Core Station | 0: NY Gun 10 Peeler; 1: CP Com 40 Chemicals; 2: CP Msl 20 Glaive; 3: CP Com 97 Quanus Ice; 4: SF Gun 44 RB-2; 5: NY Gun 12 Senator; 10: NY Gun 14 Broker |
+| 241, 253, 254, 257 (space) | none |
+
+(Commodity index = row in `cargo.csv` [inferred].) Naval Yards sit on every
+fifth site with guns, and CPs make commodities. This looks like the
+player/faction production economy. Its server side is unknown: what the
+buildings do (stock a station's market? need inputs?) isn't visible from the
+client.
+
+**For the server:** build 0x78 per destination sector from a per-sector site
+table (default all zero), not the captured template. The current template (the
+first capture's Quantar Depot SDS entry) is harmless elsewhere, because type 11
+needs a `station7a` station, but it is wrong for 116/117. A conflux eruption can
+be shown by putting type 15 on a site.
+
+### Asteroid ore levels (S→C 0x73, C→S 0x74/0x75)  [static + capture, 2026-11-18]
+
+**S→C 0x73** = `[73]` + 250 bytes = 1000 two-bit levels, one per world object
+id (the `object_id` column of `extracts/sector_objects_all.csv`). Object *i*
+is at byte `1 + i/4`, bits `2*(i%4)` (`0x9c7a00`). The handler (`0x9d7b39`)
+copies the bitmap to `0xba79c8` and sets each object's minable ore
+`0xbe5e14[i] = base(type) × f(level)`:
+
+| world-object type (`+0`) | base | | level | f |
+|---|---|---|---|---|
+| 15, 18, 21, 24, 27 (large) | 48 | | 3 | 1 |
+| 16, 19, 22, 25, 28 (medium) | 16 | | 2 | 0.6666 |
+| 17, 20, 23, 26, 29 (small) | 8 | | 1 | 0.3333 |
+| 0x13d–0x13f | 128 | | 0 | 0 (mined out) |
+| anything else | 0 | | | |
+
+The base equals the extract's `mining_divisor`. Checked against all 10
+captured 0x73s: the nonzero entries are exactly that sector's asteroids, plus
+id 948 in space sectors (the object S→C 0x58 positions), and nothing else. All
+were level 3 except one: TriPoint (108) asteroid 108, `ast5a.x`, at level 2,
+i.e. someone had mined it. So the live server keeps per-asteroid depletion
+and reports it in thirds.
+
+**C→S 0x74** is the mining report. Every ≥10 s while mining, it carries the asteroid id,
+loc and the ore mined since the last report (f32). jgcap2 (mining at
+Quantar-Core, 107): asteroid 172 (cap 16) 6.8 over 7 reports, 140 (16) 7.6,
+133 (48) 19.6, 145 (16) 10.0. The ore itself reaches the cargo hold through the
+client's C→S 0x0F cargo report (see above).
+
+**How depletion looks** [static, 2026-11-18]. Nothing in the client animates
+depletion over time. It's gradual because the amount itself changes
+continuously:
+- **Mining** (`0x43ce8b`–`0x43cfac` in `0x43b1b0`, every frame the laser is on a
+  rock): the yield is `rate × remaining/base × multipliers`, where the multipliers
+  come from thresholds 72/48/12/6 on `[0x1440904]` (×2…×3.2, lower for types
+  ≥ 0x1e) and ×1.2 when `esi` is in 90–119 [both inferred: laser grade, ship].
+  It is added to the 0x74 accumulator and **subtracted from `0xbe5e14[i]`
+  locally** (floor 0). Because yield ∝ remaining, the amount decays
+  exponentially. Each tick takes less, and a rock never empties abruptly. The
+  captured 0x74 amounts fall steadily (asteroid 133: 2.5, 1.4, 1.36, 1.32,
+  1.25…).
+- **Rendering** (`render_world`, `0x9f1753`): for asteroid types (and not
+  object 948), `d = |remaining/base − 1|` (fraction mined, 0…1). The rock is
+  drawn with `set_scene_light` (`0x9ddea0`, a D3D directional light):
+  **diffuse = the sector's light colour** (`0xbf00a0 + loc*0xff0`, +0/+4/+8),
+  unchanged, and **ambient = sector ambient (+0xc/+0x10/+0x14) +
+  (−0.5·d, −d, +d)**. The unlit side of a mined rock loses red and green and
+  gains blue, in proportion to what's been taken. The mesh and size don't
+  change.
+- Mining is the only continuous change. Anything else that changes the amount
+  jumps: **a 0x73 overwrites the local amounts** with base × {0, ⅓, ⅔, 1}, so
+  other players' mining shows up only in thirds, at sector entry or the next
+  0x75/0x73 (every 100th 0x05; about 23 min of solo cruising, sooner in
+  combat). A rock you mined from 16 to 12 snaps back to full colour if the
+  server still says level 3.
+
+**Server implications:** cap 0x74 claims with the same `remaining/base`
+diminishing-returns model. Round a rock's level to the nearest third (not up)
+so a refresh doesn't visibly refill rocks people just mined. Send 0x73 only
+on sector entry and in answer to 0x75.
+
+**C→S 0x75** asks for the levels again (every 100th 0x05 in a sector). Answer with
+0x73.
+
+**For the server:** build 0x73 per sector. Set level 3 for every object id with
+a `mining_divisor` (plus 948 where the sector has it), keep a per-asteroid
+remaining amount fed by 0x74 (capped, like 0x0F), send its level (nearest third; see "How depletion looks"), and regrow over time. **Today the server
+sends the captured Quantar Depot bitmap everywhere**, so in other sectors
+asteroids whose ids aren't asteroids at the Depot get level 0 = 0 ore. Mining
+there is probably broken until this is built.
+
+### Mineral vein and artifact (S→C 0x58)  [static + capture, 2026-11-18]
+
+Sent on entering a space sector (loc ≥ 201; the handler `0x9d883f` ignores it
+otherwise). It carries 36 bytes in two records. Coordinates are **obfuscated i32**:
+`0x9c7460` does `float(v ^ 0xc0b55)`, then adds the sector origin
+(`0x1044cec/f0/f4`).
+
+| off | meaning |
+|---|---|
+| 1 | **commodity index** mined from the vein (item 222+n, cat 3) → `0xbe5c2c` |
+| 2 | asteroid type (15–29, as world-object `+0`) → `0xbe5b26`; `0xbe6ce4` = 6/15/30 by type [use unknown] |
+| 3 | pad (`cc`) |
+| 4, 8, 12 | vein position x, y, z (obfuscated) |
+| 0x10 | 1 = first play a particle burst at the old vein, coloured from `0xbe6e8c[old commodity]` (only at high detail `0xff1d80 == 1`) [inferred: depleted/moved] |
+| 0x11 | first argument to `spawn_artifacts` `0x4b4b00` [meaning unknown] |
+| 0x14, 0x18, 0x1c | artifact position (obfuscated) |
+| 0x20 | `spawn_artifacts` flag: clear/explode existing artifacts (slots with models 0x190–0x194, `artifact1–5.x`) |
+
+The vein is **world object 948** (`0x140ad48 + 948*0xdc`): reset, given that
+type and position, mass 100000, active. Everything that handles 948 does so
+specially:
+- **Mining** (`0x43cfd1`): an ordinary rock yields a random ore kind 1–5
+  (cargo item 174+k = 175 Common Metals, 176 Radioactive Metals, 177 Ice,
+  178 Semifluxors, 179 Precious Metals; the roll odds depend on rock type).
+  Object 948 yields **commodity `msg[1]`** directly, and its yield isn't zeroed
+  when the local amount reaches 0.
+- **Rendering** (`0x9f18d1`): no depletion tint. It uses the commodity's colour
+  from `0xbe6e8c + n*12`. The HUD (`0x9e980b`) also handles it separately.
+- It is set in every 0x73 (level 3).
+
+Captured veins (one per space sector): 241 Long Walk = 16 Iron (−759, 6622,
+25663); 249 Tictac's Hook = 18 Magnesium; 257 The Dark Trail = 24 Radium;
+253 Outer Roh-Cloud = 6 Cesium; 254 Inner Roh-Cloud = 11 Gallium. These are
+the refined elements the contract texts describe (`0x9c57d0`). Byte 0x10 was
+0 and byte 0x20 was 0 in all five.
+
+**For the server:** choose a vein element, type and spot per space sector, and
+send 0x58 on sector entry (encode positions as `(int)(pos − origin) ^ 0xc0b55`).
+Today a captured 0x58 goes everywhere, so every space sector gets the same
+vein at another sector's coordinates.
+
 ### Rewards seen (server-side rules, jgcap2)
 
 - Conflux kill: "Received 3000 credits and 320 experience." (the second kill: 3300/350).
@@ -310,9 +488,13 @@ location struct `0xfd9220 + loc*100`:
   type3 (20, 500). Meaning of the two outputs not traced yet.
 
 Effects in the client:
-- **Tint** (`0x9ddea0`, 13 callers, mostly the renderer `0x9ede30`): for type 1,
-  the scene colour is blended with the kind's colour (`0xa1edf0`): 1 red,
-  2 green, 3 blue, 4 yellow, 5 purple, 6 teal, 7 orange, other grey.
+- **Tint** (`0x9ddea0` `set_scene_light`, 13 callers, mostly the renderer
+  `0x9ede30`): it fills a D3D directional light (`D3DLIGHT8` @`0x14e82d4`,
+  diffuse = args 0–2, ambient = args 3–5) and calls SetLight. When the current
+  location's cloud type is 1, the colours are first blended with the kind's
+  colour (`0xa1edf0`): 1 red, 2 green, 3 blue, 4 yellow, 5 purple, 6 teal,
+  7 orange, other grey. Also used for asteroid depletion shading (see
+  "Asteroid ore levels").
 - **Ambient sound on arrival** (0x08 handler `0x9d4106`): if the destination's
   `+0x58` vector is non-zero, `play_ui_sound(0x25, …)` at a volume from I.
 - **Gas harvesting** (`0x439a10`, from the flight code at `0x42a09b`): needs a
