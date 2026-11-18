@@ -184,7 +184,7 @@ addr,name,area,confidence,ref
 0x401280,load_cursor_bitmaps,ui,high,cursor24.bmp c00..
 0x402a40,video_settings_save,settings,med,video.bin writer (10 callers; siblings 0x4028c0-0x402b40)
 0x403010,login_dialog_text,ui-login,med,opt_conerror/opt_username_txt1
-0x407190,log_splash,debug,low,SPLASH24.BMP
+0x407190,check_texture_file,anti-tamper,high,physics.md#9 (in-flight recheck of one texture table entry)
 0x4112c0,init_asteroid_names,world,med,'Flatiron' 'Pod' 'Rocky' ...
 0x426690,init_commodity_abbrevs,items,med,'H2O' 'GRN' 'MED' 'CPU' ...
 0x4406a0,flags_bin_load,settings,high,flags.bin reader
@@ -304,3 +304,6 @@ addr,name,area,confidence,ref
 0x9c7a00,asteroid_level_get,mining,high,message-types.md Asteroid ore levels (2-bit level of world object i from 0x73 bitmap)
 0x43b1b0,flight_devices_tick,devices,low,mining laser tick + 0x74 report (0x43ce8b-0x43d563), teleport/burglar
 0x9c7460,decode_obfuscated_coord,net-msg,high,float(v ^ 0xc0b55); S->C 0x58 vein/artifact positions
+0x407050,game_file_checksum,anti-tamper,high,physics.md#9 (text-mode read; sum sbyte<<16*(i%3))
+0x407130,check_texture_files,anti-tamper,high,physics.md#9 (D3D_ALLOC_ERROR 100%d)
+0x4071f0,check_model_files,anti-tamper,high,physics.md#9 (D3D_ALLOC_ERROR 101%d)

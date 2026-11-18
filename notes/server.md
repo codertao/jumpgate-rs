@@ -95,12 +95,15 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
 
 ## Not done yet / next
 
+The working checklist is `server/TODO.md` (2026-11-18). This section keeps the
+background.
+
 - Live test with the real client (unit, capture-flow and UDP login tests pass;
   the real client hasn't run against it yet).
 - Accounts: any password is accepted and dropped. Add salted slow hashes
   (argon2/bcrypt) before anyone else connects.
-- Sector content: 0xA7 station list and 0x58, per sector. Currently the
-  captured sector's copies are sent everywhere. (0x87 is universe-wide particle
+- Sector content: 0x73 and 0x78 are captured copies replayed in every
+  sector. 0x58 (mineral vein) and 0xA7 (station list) aren't sent at all yet. (0x87 is universe-wide particle
   clouds, so one list for everyone is correct. The server could own the cloud
   list and drift it: see message-types "Particle clouds".)
 - NPCs: first server-simulated ship done (see "NPCs" below). Next: roles and a

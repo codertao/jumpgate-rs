@@ -524,6 +524,47 @@ blend.
    the 0xFE reaches the game dispatcher as well, which logs "Received a packet
    of unknown type 254".
    [inferred: autopilot/cruise or anti-speedhack reaction; not traced].
+5. **Game-file checksums** [static + live, 2026-11-18]. The exe carries
+   two tables of `{char name[0x20] (space padded); u64 sum}` (0x28 bytes):
+   `0xb1e098..0xb232f0`, 527 `.bmp` (textures), and `0xb232f0..0xb296a0`, 638
+   `.x` (models). Both are in `.data`. `0x407050(name)` sums the file like
+   item 4 (`Σ sbyte[i] << 16·(i mod 3)`, 64-bit). Two quirks matter if you
+   want to reproduce it:
+   - The file is opened in MSVC text mode (mode 1, no binary), so CRLF reads
+     as LF and a 0x1A byte ends the file.
+   - The loop reads one byte, adds it, then tests EOF, so the failed read at
+     EOF adds the last byte again at index len.
+
+   `tools/jg_integrity.py` reproduces it and matches 1160 of 1165 stock files.
+   - **At startup** (`0xa24dc8`): `0x407130` checks every texture and logs
+     `D3D_ALLOC_ERROR 100%d` (the table index) for each mismatch.
+     `0x4071f0` does the same for the models with `101%d`. If any file fails,
+     the client logs `D3D_ALLOC_ERROR 100` (or `101`) and calls the shutdown
+     `0xa215e0`. A missing file also fails (the sum stays 0).
+     Live 2026-11-18: replacing ast1–ast5.bmp with the older 128×128 8-bit
+     versions logged `D3D_ALLOC_ERROR 1002`…`1006` (indices 2–6 = AST1–AST5)
+     and the client exited at startup.
+   - **In flight**: on each sector entry (`0xa25b14`) the client picks a random
+     start index 0–29 and arms `0xb2a700`. Every 15 s (f32 `0xaeae68`) the main
+     loop re-checks one texture entry, `0x407190(idx)`, wrapping 30 → 0, until
+     it is back at the start. Only the first 31 texture entries are covered
+     (SPLASH24, AST0–6, AA/BB/CC0x, ALIEN01, CONFLUX1–3, AN01). A mismatch sets
+     `0xb8e288 = 2`, which is the item 3 exit with Last Code 1020. So swapping
+     a file after startup still gets caught.
+
+   To run modified textures or models, the matching table sum has to change.
+   It is not a server matter: the startup check runs before any connection.
+   **Re-seal** (chosen 2026-11-18): `tools/jg_reseal.py <install dir>` writes
+   `Jumpgate_mod.exe`, a copy whose table sums match the files on disk. It
+   changes only the 8-byte sum fields and leaves the check code active, so
+   untouched assets are still verified. The original exe is never modified.
+   Live state 2026-11-18: ast1–5.bmp swapped for the 128×128 8-bit versions,
+   5 entries re-sealed, and `jg_integrity.py --exe Jumpgate_mod.exe` reports 0
+   failures. The client run itself is not yet confirmed. Use the modded copy
+   with our server only. The alternative, an early return
+   (`31 C0 C3` at file offsets 0x7130/0x7190/0x71f0), would disable the check
+   entirely and was not used. Nothing else reads the table or checksums the
+   exe's code.
 4. Velocity does not go into the frequent packets: `0x33` carries
    **velocity × 10 as i16** at `@0x12` (from snapshot `0xff2ad0..d8`, scale
    const `0xb05ac8` = 10.0). Orientation goes as i16 × 10000. So the server
