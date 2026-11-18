@@ -113,8 +113,11 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   space. ID_DISCONNECTION_NOTIFICATION (0x14) also ends a session.
 - RakNet `session` (2026-11-17): reliable packets are resent until acked (3×
   smoothed RTT), duplicates are filtered with a wrap-aware window, and a peer
-  that leaves a reliable packet unacked for 15 s is dropped. Still to do:
-  receive-side ordering and split packets. Send reliability (2026-11-18):
+  that leaves a reliable packet unacked for 15 s is dropped. Received
+  ordered packets are held for gaps and stale sequenced ones dropped
+  (2026-11-18). Live-confirmed: login, launch and relaunch work, so the
+  client's ordered index starts at 0 per connection, as in the reference. Still
+  to do: split packets. Send reliability (2026-11-18):
   0x33/0x34 position updates go UNRELIABLE_SEQUENCED, everything else
   RELIABLE_ORDERED, both on channel 0. This matches the client's
   `SendGameMessage` (`0x9c9c10`), which passes channel 0 and reliability 1 or 3

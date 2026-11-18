@@ -13,8 +13,8 @@
 //! Verification status mirrors the spec: `crypto`, `checksum`, `aes`, `ids`,
 //! `reliability` and the `mitm` handshake are verified against the binary and
 //! the real client. `session` adds retransmission, a wrap-aware duplicate
-//! window and RTT/loss detection; receive-side ordering and split packets are
-//! still missing (notes/differences-from-samp-raknet.md §3).
+//! window, RTT/loss detection and receive-side ordering/sequencing; split
+//! packets are still missing (notes/differences-from-samp-raknet.md §3).
 //!
 //! Scope: this is for inspecting *your own* client and *your own* traffic. The
 //! proxy built on top is an observer and does not intentionally alter content.

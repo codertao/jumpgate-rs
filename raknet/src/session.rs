@@ -11,9 +11,10 @@
 //! packets are acked, and reliable packets we send are resent until acked, with a
 //! timeout of 3× the smoothed round-trip time (30 ms..3 s, backing off), measured
 //! from ack timing. A reliable packet unacked for `ACK_TIMEOUT` marks the
-//! connection lost. Still missing (notes/differences-from-samp-raknet.md §3):
-//! receive-side ordering/sequencing (messages are emitted in arrival order) and
-//! split packets (messages stay under the MTU).
+//! connection lost. On receive, RELIABLE_ORDERED packets are held until the
+//! gap before them fills, and stale sequenced packets are dropped, per channel.
+//! Still missing (notes/differences-from-samp-raknet.md §3): split packets
+//! (messages stay under the MTU).
 
 use crate::crypto::DataBlockEncryptor;
 use crate::game::{self, GameMessage};
@@ -21,7 +22,7 @@ use crate::handshake::{self, COOKIE_LEN, RANDOM_LEN};
 use crate::ids::{MessageId, Reliability};
 use crate::reliability::{AckRange, Datagram, InternalPacket};
 use crate::rsa::KeyPair;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const NUM_CHANNELS: usize = 32;
@@ -32,6 +33,17 @@ const NUM_CHANNELS: usize = 32;
 const MTU: usize = 1500;
 const UDP_HEADER: usize = 28;
 const ENCRYPTION_OVERHEAD: usize = 16;
+
+/// Most ordered packets held per channel waiting for a gap to fill. The peer
+/// resends the missing one, so this only bounds a misbehaving peer.
+const MAX_HELD_PER_CHANNEL: usize = 4096;
+
+/// `idx` is older than `expected` (mod 2^16, within half the range), as the
+/// reference `IsOlderOrderedPacket`.
+fn is_older(idx: u16, expected: u16) -> bool {
+    let behind = expected.wrapping_sub(idx);
+    behind != 0 && behind < 0x8000
+}
 
 /// Resend timing, after the reference reliability layer (`PING_MULTIPLIER_TO_RESEND`
 /// 3.0, `MIN_PING_TO_RESEND` 30 ms). Before the first RTT sample we wait 1 s.
@@ -105,6 +117,11 @@ pub struct Endpoint {
     /// Sequenced types count separately from ordered ones, per channel, as the
     /// reference's `waitingForSequencedPacketWriteIndex`.
     sequenced_index: [u16; NUM_CHANNELS],
+    /// Receive side: next expected ordered index and lowest acceptable
+    /// sequenced index per channel, and ordered packets held for a gap.
+    ordered_read: [u16; NUM_CHANNELS],
+    sequenced_read: [u16; NUM_CHANNELS],
+    held: Vec<BTreeMap<u16, Vec<u8>>>,
     acks_pending: Vec<u16>,
     /// Duplicate window: every number below `recv_base` (mod 2^16, within half
     /// the range) has arrived or been given up on. `recv_window[i]` is `None` if
@@ -153,6 +170,9 @@ impl Endpoint {
             next_message_number: 0,
             ordering_index: [0; NUM_CHANNELS],
             sequenced_index: [0; NUM_CHANNELS],
+            ordered_read: [0; NUM_CHANNELS],
+            sequenced_read: [0; NUM_CHANNELS],
+            held: vec![BTreeMap::new(); NUM_CHANNELS],
             acks_pending: Vec::new(),
             recv_base: 0,
             recv_window: VecDeque::new(),
@@ -583,9 +603,57 @@ impl Endpoint {
             if self.is_duplicate(pkt.message_number) {
                 continue;
             }
-            self.handle_packet(pkt.data, &mut events);
+            for data in self.release_in_order(pkt) {
+                self.handle_packet(data, &mut events);
+            }
         }
         events
+    }
+
+    /// Apply ordering and sequencing (reference `ReliabilityLayer`): returns the
+    /// payloads that may be handled now, in order.
+    fn release_in_order(&mut self, pkt: InternalPacket) -> Vec<Vec<u8>> {
+        let ch = pkt.ordering_channel as usize;
+        let idx = pkt.ordering_index;
+        match pkt.reliability {
+            Reliability::UnreliableSequenced | Reliability::ReliableSequenced => {
+                if is_older(idx, self.sequenced_read[ch]) {
+                    return vec![]; // superseded by a newer one already handled
+                }
+                self.sequenced_read[ch] = idx.wrapping_add(1);
+                vec![pkt.data]
+            }
+            Reliability::ReliableOrdered => {
+                let expected = self.ordered_read[ch];
+                if idx != expected {
+                    if !is_older(idx, expected) {
+                        let held = &mut self.held[ch];
+                        if held.len() < MAX_HELD_PER_CHANNEL {
+                            held.insert(idx.wrapping_sub(expected), pkt.data);
+                        } else if self.trace {
+                            eprintln!("[raknet:{:?}] channel {ch}: hold queue full, dropping", self.role);
+                        }
+                    }
+                    return vec![];
+                }
+                // Deliver this one plus any held packets that now follow on.
+                // Held keys are offsets from `expected`, so they sort correctly
+                // across the u16 wrap; rebase them after releasing.
+                let mut out = vec![pkt.data];
+                let mut next = 1u16;
+                while let Some(d) = self.held[ch].remove(&next) {
+                    out.push(d);
+                    next += 1;
+                }
+                self.ordered_read[ch] = expected.wrapping_add(next);
+                if !self.held[ch].is_empty() {
+                    let old = std::mem::take(&mut self.held[ch]);
+                    self.held[ch] = old.into_iter().map(|(k, v)| (k - next, v)).collect();
+                }
+                out
+            }
+            _ => vec![pkt.data],
+        }
     }
 
     fn handle_packet(&mut self, data: Vec<u8>, events: &mut Vec<Event>) {
@@ -998,10 +1066,47 @@ mod tests {
         }
         assert!(!server.is_lost());
         assert_eq!(server.unacked_count(), 0, "everything acked eventually");
-        let mut sorted = got.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), got.len(), "no duplicates delivered");
-        assert_eq!(sorted, { let mut s = sent.clone(); s.sort(); s });
+        assert_eq!(got, sent, "every message exactly once, in order");
+    }
+
+    fn pkt(n: u16, rel: Reliability, idx: u16, data: u8) -> InternalPacket {
+        InternalPacket {
+            message_number: n,
+            reliability: rel,
+            ordering_channel: 0,
+            ordering_index: idx,
+            split: None,
+            data: vec![data],
+        }
+    }
+
+    #[test]
+    fn ordered_packets_are_held_until_the_gap_fills() {
+        let mut e = Endpoint::client();
+        let ro = Reliability::ReliableOrdered;
+        e.ordered_read[0] = 65534; // across the wrap
+        assert!(e.release_in_order(pkt(0, ro, 0, 3)).is_empty());
+        assert!(e.release_in_order(pkt(1, ro, 2, 5)).is_empty());
+        assert!(e.release_in_order(pkt(2, ro, 65535, 2)).is_empty());
+        assert_eq!(e.release_in_order(pkt(3, ro, 65534, 1)), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(e.ordered_read[0], 1);
+        assert_eq!(e.release_in_order(pkt(4, ro, 1, 4)), vec![vec![4], vec![5]]);
+        assert_eq!(e.ordered_read[0], 3);
+        assert!(e.held[0].is_empty());
+        // An old ordered index is dropped, not held forever.
+        assert!(e.release_in_order(pkt(5, ro, 0, 9)).is_empty());
+        assert!(e.held[0].is_empty());
+    }
+
+    #[test]
+    fn stale_sequenced_packets_are_dropped_without_blocking_ordered() {
+        let mut e = Endpoint::client();
+        let us = Reliability::UnreliableSequenced;
+        let ro = Reliability::ReliableOrdered;
+        assert_eq!(e.release_in_order(pkt(0, us, 5, 1)), vec![vec![1]]);
+        assert!(e.release_in_order(pkt(1, us, 3, 2)).is_empty(), "older than 5");
+        assert_eq!(e.release_in_order(pkt(2, us, 9, 3)), vec![vec![3]], "gaps are fine");
+        // Same channel, separate counter: ordered index 0 is still expected.
+        assert_eq!(e.release_in_order(pkt(3, ro, 0, 4)), vec![vec![4]]);
     }
 }
