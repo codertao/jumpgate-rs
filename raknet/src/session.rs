@@ -4,13 +4,16 @@
 //! 0x51-framed game messages. Feature `mitm` (needs the RSA handshake).
 //!
 //! This is what a mock server (replaying a capture) and a from-scratch client
-//! both need. It is intentionally simple: no retransmission (we rely on a clean
-//! local path or the peer's retries); lenient receive (messages are emitted in
-//! arrival order, reliable ones de-duplicated and acked); and no split-packet
-//! reassembly (messages stay under the MTU).
-//! These are fine for a loopback verification and an initial test against a real
-//! client; a production client would tighten them. The handshake carries the two
-//! live-calibration unknowns from the spec (RSA byte order, framing details).
+//! both need.
+//!
+//! Reliability: every packet's 16-bit message number goes through a wrap-aware
+//! duplicate window (as the reference `receivedPacketsBaseIndex`); reliable
+//! packets are acked, and reliable packets we send are resent until acked, with a
+//! timeout of 3× the smoothed round-trip time (30 ms..3 s, backing off), measured
+//! from ack timing. A reliable packet unacked for `ACK_TIMEOUT` marks the
+//! connection lost. Still missing (notes/differences-from-samp-raknet.md §3):
+//! receive-side ordering/sequencing (messages are emitted in arrival order) and
+//! split packets (messages stay under the MTU).
 
 use crate::crypto::DataBlockEncryptor;
 use crate::game::{self, GameMessage};
@@ -18,7 +21,8 @@ use crate::handshake::{self, COOKIE_LEN, RANDOM_LEN};
 use crate::ids::{MessageId, Reliability};
 use crate::reliability::{AckRange, Datagram, InternalPacket};
 use crate::rsa::KeyPair;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 const NUM_CHANNELS: usize = 32;
 
@@ -28,6 +32,31 @@ const NUM_CHANNELS: usize = 32;
 const MTU: usize = 1500;
 const UDP_HEADER: usize = 28;
 const ENCRYPTION_OVERHEAD: usize = 16;
+
+/// Resend timing, after the reference reliability layer (`PING_MULTIPLIER_TO_RESEND`
+/// 3.0, `MIN_PING_TO_RESEND` 30 ms). Before the first RTT sample we wait 1 s.
+const RTT_MULTIPLIER: f64 = 3.0;
+const RTO_MIN: Duration = Duration::from_millis(30);
+const RTO_INITIAL: Duration = Duration::from_millis(1000);
+const RTO_MAX: Duration = Duration::from_secs(3);
+/// A reliable packet still unacked this long after first sending: connection lost.
+/// The reference default is 10 s; we allow more so a client stalled on a sector
+/// load isn't dropped.
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A reliable packet we sent and haven't seen acked.
+struct Unacked {
+    pkt: InternalPacket,
+    /// Sent under AES (false only for handshake packets before the key is live).
+    encrypt: bool,
+    first_sent: Instant,
+    last_sent: Instant,
+    sends: u32,
+}
+
+fn is_reliable(r: Reliability) -> bool {
+    matches!(r, Reliability::Reliable | Reliability::ReliableOrdered | Reliability::ReliableSequenced)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -73,8 +102,23 @@ pub struct Endpoint {
     // Reliability bookkeeping.
     next_message_number: u16,
     ordering_index: [u16; NUM_CHANNELS],
+    /// Sequenced types count separately from ordered ones, per channel, as the
+    /// reference's `waitingForSequencedPacketWriteIndex`.
+    sequenced_index: [u16; NUM_CHANNELS],
     acks_pending: Vec<u16>,
-    seen_reliable: HashSet<u16>,
+    /// Duplicate window: every number below `recv_base` (mod 2^16, within half
+    /// the range) has arrived or been given up on. `recv_window[i]` is `None` if
+    /// `recv_base + i` has arrived, else the time we stop waiting for it. Holes
+    /// expire as in the reference, since lost unreliable packets never come.
+    recv_base: u16,
+    recv_window: VecDeque<Option<Instant>>,
+    /// Reliable packets awaiting an ack, by message number.
+    unacked: HashMap<u16, Unacked>,
+    /// Smoothed round-trip time (seconds), from acks of packets sent once.
+    srtt: Option<f64>,
+    lost: bool,
+    /// Test hook: a fixed "now" instead of the system clock.
+    fake_now: Option<Instant>,
 
     out_queue: VecDeque<OutMsg>,
     raw_out: Vec<Vec<u8>>, // fully-formed datagrams ready to send
@@ -108,8 +152,14 @@ impl Endpoint {
             client_random: None,
             next_message_number: 0,
             ordering_index: [0; NUM_CHANNELS],
+            sequenced_index: [0; NUM_CHANNELS],
             acks_pending: Vec::new(),
-            seen_reliable: HashSet::new(),
+            recv_base: 0,
+            recv_window: VecDeque::new(),
+            unacked: HashMap::new(),
+            srtt: None,
+            lost: false,
+            fake_now: None,
             out_queue: VecDeque::new(),
             raw_out: Vec::new(),
             salt: 0,
@@ -120,6 +170,104 @@ impl Endpoint {
 
     pub fn is_connected(&self) -> bool {
         self.connected
+    }
+
+    /// A reliable packet went unacked for [`ACK_TIMEOUT`]: the peer is gone.
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Smoothed round-trip time, once an ack has been timed.
+    pub fn rtt(&self) -> Option<Duration> {
+        self.srtt.map(Duration::from_secs_f64)
+    }
+
+    /// Reliable packets sent and not yet acked.
+    pub fn unacked_count(&self) -> usize {
+        self.unacked.len()
+    }
+
+    /// Test hook: freeze the clock at `t` (resend timers read it).
+    #[doc(hidden)]
+    pub fn set_time(&mut self, t: Instant) {
+        self.fake_now = Some(t);
+    }
+
+    fn now(&self) -> Instant {
+        self.fake_now.unwrap_or_else(Instant::now)
+    }
+
+    /// Resend timeout for a packet already sent `sends` times.
+    fn rto(&self, sends: u32) -> Duration {
+        let base = match self.srtt {
+            Some(rtt) => Duration::from_secs_f64(rtt * RTT_MULTIPLIER).clamp(RTO_MIN, RTO_MAX),
+            None => RTO_INITIAL,
+        };
+        (base * (1u32 << sends.saturating_sub(1).min(4))).min(RTO_MAX * 2)
+    }
+
+    /// Record a reliable packet as sent, for resending until acked.
+    fn track(&mut self, pkt: &InternalPacket, encrypt: bool) {
+        if is_reliable(pkt.reliability) {
+            let now = self.now();
+            self.unacked.insert(
+                pkt.message_number,
+                Unacked { pkt: pkt.clone(), encrypt, first_sent: now, last_sent: now, sends: 1 },
+            );
+        }
+    }
+
+    /// The peer acked `min..=max` (wrapping).
+    fn on_acks(&mut self, ranges: &[AckRange]) {
+        let now = self.now();
+        for r in ranges {
+            let mut n = r.min;
+            loop {
+                if let Some(u) = self.unacked.remove(&n) {
+                    // Karn: only time packets sent once (no ambiguity about which copy).
+                    if u.sends == 1 {
+                        let sample = now.duration_since(u.first_sent).as_secs_f64();
+                        self.srtt = Some(match self.srtt {
+                            Some(s) => s * 0.875 + sample * 0.125,
+                            None => sample,
+                        });
+                    }
+                }
+                if n == r.max {
+                    break;
+                }
+                n = n.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Duplicate check for message number `n`, marking it received. Wrap-aware:
+    /// numbers up to half the range behind the window count as already seen.
+    fn is_duplicate(&mut self, n: u16) -> bool {
+        let hole = n.wrapping_sub(self.recv_base);
+        if hole >= 0x8000 {
+            return true;
+        }
+        let hole = hole as usize;
+        let now = self.now();
+        if hole < self.recv_window.len() {
+            if self.recv_window[hole].is_none() {
+                return true;
+            }
+            self.recv_window[hole] = None;
+        } else {
+            self.recv_window.resize(hole, Some(now + ACK_TIMEOUT));
+            self.recv_window.push_back(None);
+        }
+        // Advance past arrivals and holes we've stopped waiting for.
+        while let Some(&front) = self.recv_window.front() {
+            if front.is_some_and(|give_up| give_up > now) {
+                break;
+            }
+            self.recv_window.pop_front();
+            self.recv_base = self.recv_base.wrapping_add(1);
+        }
+        false
     }
 
     /// A bare offline ID_OPEN_CONNECTION_REQUEST `[0A 00]`: the first datagram of
@@ -192,13 +340,18 @@ impl Endpoint {
 
     fn make_packet(&mut self, data: Vec<u8>, reliability: Reliability, channel: u8) -> InternalPacket {
         let message_number = self.take_message_number();
-        let ordering_index = if reliability.has_ordering() {
-            let i = self.ordering_index[channel as usize];
-            self.ordering_index[channel as usize] = i.wrapping_add(1);
-            i
-        } else {
-            0
+        let counter = match reliability {
+            Reliability::UnreliableSequenced | Reliability::ReliableSequenced => {
+                Some(&mut self.sequenced_index[channel as usize])
+            }
+            Reliability::ReliableOrdered => Some(&mut self.ordering_index[channel as usize]),
+            _ => None,
         };
+        let ordering_index = counter.map_or(0, |c| {
+            let i = *c;
+            *c = i.wrapping_add(1);
+            i
+        });
         InternalPacket {
             message_number,
             reliability,
@@ -213,6 +366,7 @@ impl Endpoint {
     /// any pending acks along with it so they share its encryption state.
     fn emit_transport(&mut self, data: Vec<u8>, encrypt: bool) {
         let pkt = self.make_packet(data, Reliability::Reliable, 0);
+        self.track(&pkt, encrypt);
         let mut pending = std::mem::take(&mut self.acks_pending);
         let acks = Self::ack_ranges(&mut pending);
         let dg = Datagram { acks, packets: vec![pkt] };
@@ -248,38 +402,76 @@ impl Endpoint {
         ranges
     }
 
-    /// Produce datagrams to send now: handshake replies, plus (once connected) a
-    /// datagram carrying pending acks and queued messages.
+    /// Produce datagrams to send now: handshake replies, resends that are due,
+    /// and (once connected) a datagram carrying pending acks and queued messages.
+    /// Call it regularly even with nothing queued: resend timers run from here.
     pub fn flush(&mut self) -> Vec<Vec<u8>> {
         let mut out = std::mem::take(&mut self.raw_out);
-        // Before the connection is up only acks go out (queued game messages wait).
-        if !self.connected && self.acks_pending.is_empty() {
-            return out;
+        let now = self.now();
+
+        // Handshake packets sent in the clear are moot once the key is live:
+        // the peer only switches to AES after receiving them.
+        if self.crypto.is_some() {
+            self.unacked.retain(|_, u| u.encrypt);
         }
-        let have_acks = !self.acks_pending.is_empty();
-        if !have_acks && self.out_queue.is_empty() {
-            return out;
+        if self.unacked.values().any(|u| now.duration_since(u.first_sent) >= ACK_TIMEOUT) {
+            if !self.lost {
+                self.tr("reliable packet unacked past ACK_TIMEOUT -> connection lost");
+            }
+            self.lost = true;
+        }
+
+        // Resends that are due, oldest first.
+        let mut due: Vec<(Instant, u16)> = self
+            .unacked
+            .iter()
+            .filter(|(_, u)| !self.lost && now.duration_since(u.last_sent) >= self.rto(u.sends))
+            .map(|(n, u)| (u.first_sent, *n))
+            .collect();
+        due.sort();
+        let mut resend = Vec::new();
+        for (_, n) in due {
+            let u = self.unacked.get_mut(&n).unwrap();
+            u.last_sent = now;
+            u.sends += 1;
+            if u.encrypt {
+                resend.push(u.pkt.clone());
+            } else {
+                // Pre-key handshake packet: resend alone, in the clear.
+                let dg = Datagram { acks: vec![], packets: vec![u.pkt.clone()] };
+                out.push(dg.serialize());
+            }
+        }
+        if self.trace && !resend.is_empty() {
+            eprintln!("[raknet:{:?}] resending {} packet(s)", self.role, resend.len());
+        }
+
+        // New messages wait for the connection; acks and resends don't.
+        let mut packets = resend;
+        while self.connected {
+            let Some(m) = self.out_queue.pop_front() else { break };
+            let pkt = self.make_packet(m.data, m.reliability, m.channel);
+            self.track(&pkt, true);
+            packets.push(pkt);
         }
         let mut acks_pending = std::mem::take(&mut self.acks_pending);
         let acks = Self::ack_ranges(&mut acks_pending);
+        if acks.is_empty() && packets.is_empty() {
+            return out;
+        }
         if self.trace && !self.connected {
             eprintln!("[raknet:{:?}] -> ack-only datagram ({} range(s))", self.role, acks.len());
         }
         let budget = MTU - UDP_HEADER - if self.crypto.is_some() { ENCRYPTION_OVERHEAD } else { 0 };
 
-        // Pack queued messages into as few datagrams as fit the budget; acks ride
-        // in the first one.
+        // Pack into as few datagrams as fit the budget; acks ride in the first.
         let mut dg = Datagram { acks, packets: Vec::new() };
-        while self.connected {
-            let Some(m) = self.out_queue.pop_front() else { break };
-            let pkt = self.make_packet(m.data, m.reliability, m.channel);
+        for pkt in packets {
             dg.packets.push(pkt);
-            let fits = dg.serialize().len() <= budget;
-            let lone = dg.packets.len() == 1 && dg.acks.is_empty();
-            if fits {
+            if dg.serialize().len() <= budget {
                 continue;
             }
-            if lone {
+            if dg.packets.len() == 1 && dg.acks.is_empty() {
                 // No split-packet support yet; real server messages stay <= 896 B.
                 eprintln!(
                     "[raknet:{:?}] warning: {}-byte packet exceeds the {budget}-byte budget (no split support)",
@@ -380,17 +572,16 @@ impl Endpoint {
             );
         }
 
+        self.on_acks(&dg.acks);
         for pkt in dg.packets {
-            // De-dupe reliable retransmissions and schedule an ack.
-            if pkt.reliability != Reliability::Unreliable
-                && pkt.reliability != Reliability::UnreliableSequenced
-            {
-                // Ack every reliable packet, handshake included, as the stock
-                // reliability layer does — otherwise the peer keeps resending.
+            // Ack every reliable packet, handshake and duplicates included, as the
+            // stock reliability layer does: otherwise the peer keeps resending.
+            if is_reliable(pkt.reliability) {
                 self.acks_pending.push(pkt.message_number);
-                if !self.seen_reliable.insert(pkt.message_number) {
-                    continue; // already handled
-                }
+            }
+            // Every packet carries a message number, so all are de-duplicated.
+            if self.is_duplicate(pkt.message_number) {
+                continue;
             }
             self.handle_packet(pkt.data, &mut events);
         }
@@ -630,5 +821,187 @@ mod tests {
         let evs: Vec<Event> = client.flush().iter().flat_map(|d| server.recv(d)).collect();
         assert!(evs.contains(&Event::Disconnected));
         assert!(!server.is_connected());
+    }
+
+    fn messages(evs: Vec<Event>) -> Vec<Vec<u8>> {
+        evs.into_iter()
+            .filter_map(|e| if let Event::Message(m) = e { Some(m.body) } else { None })
+            .collect()
+    }
+
+    /// The window must survive many wraps of the 16-bit message number and
+    /// still reject recent repeats (the old HashSet dropped everything after
+    /// the first wrap).
+    #[test]
+    fn duplicate_window_survives_message_number_wrap() {
+        let mut e = Endpoint::client();
+        for i in 0u32..200_000 {
+            let n = i as u16;
+            assert!(!e.is_duplicate(n), "fresh #{i} flagged as duplicate");
+            assert!(e.is_duplicate(n), "repeat #{i} not caught");
+        }
+        // Out of order within the window: a gap, then the gap filled.
+        let base = e.recv_base;
+        assert!(!e.is_duplicate(base.wrapping_add(5)));
+        assert!(!e.is_duplicate(base.wrapping_add(2)));
+        assert!(!e.is_duplicate(base));
+        assert!(e.is_duplicate(base.wrapping_add(5)));
+        assert!(e.is_duplicate(base.wrapping_sub(1000)), "far behind = old");
+    }
+
+    /// Lost unreliable packets leave holes that never fill. They must expire,
+    /// or the window stops advancing and, 32768 numbers later, every new
+    /// packet looks like a duplicate.
+    #[test]
+    fn duplicate_window_gives_up_on_holes() {
+        let mut e = Endpoint::client();
+        let mut t = Instant::now();
+        e.set_time(t);
+        let mut n = 0u16;
+        for _ in 0..100_000u32 {
+            n = n.wrapping_add(2); // every other packet lost
+            t += Duration::from_millis(1);
+            e.set_time(t);
+            assert!(!e.is_duplicate(n), "fresh {n} flagged");
+        }
+        // Only the last ACK_TIMEOUT of holes is kept (2 numbers per ms here).
+        let bound = 2 * ACK_TIMEOUT.as_millis() as usize + 2;
+        assert!(e.recv_window.len() <= bound, "window grew to {}", e.recv_window.len());
+        // A hole filled before it expires is still accepted once.
+        assert!(!e.is_duplicate(n.wrapping_sub(1)));
+        assert!(e.is_duplicate(n.wrapping_sub(1)));
+    }
+
+    #[test]
+    fn sequenced_and_ordered_count_separately() {
+        let mut e = Endpoint::client();
+        let a = e.make_packet(vec![1], Reliability::ReliableOrdered, 0);
+        let b = e.make_packet(vec![2], Reliability::UnreliableSequenced, 0);
+        let c = e.make_packet(vec![3], Reliability::UnreliableSequenced, 0);
+        let d = e.make_packet(vec![4], Reliability::ReliableOrdered, 0);
+        assert_eq!(
+            [a.ordering_index, b.ordering_index, c.ordering_index, d.ordering_index],
+            [0, 0, 1, 1]
+        );
+        assert_eq!([a.message_number, b.message_number, c.message_number, d.message_number], [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn lost_datagram_is_resent_and_rtt_is_measured() {
+        let (mut server, mut client, _) = connected_pair();
+        let t0 = Instant::now();
+        server.set_time(t0);
+        client.set_time(t0);
+        // Settle handshake acks so only our message is outstanding.
+        for _ in 0..3 {
+            for d in client.flush() {
+                server.recv(&d);
+            }
+            for d in server.flush() {
+                client.recv(&d);
+            }
+        }
+        server.unacked.clear();
+        server.srtt = None; // the handshake was timed at ~0 ms; start from the initial RTO
+
+        server.queue_message(&[0x8f, 1]);
+        let lost = server.flush();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(server.unacked_count(), 1);
+        // Dropped. Nothing is due before the initial timeout...
+        server.set_time(t0 + Duration::from_millis(500));
+        assert!(server.flush().is_empty());
+        // ...and after it the same packet goes again.
+        server.set_time(t0 + Duration::from_millis(1100));
+        let again = server.flush();
+        assert_eq!(again.len(), 1);
+        let got: Vec<Vec<u8>> = again.iter().flat_map(|d| messages(client.recv(d))).collect();
+        assert_eq!(got, vec![vec![0x8f, 1]]);
+        // A second copy arriving late is suppressed.
+        let got: Vec<Vec<u8>> = lost.iter().flat_map(|d| messages(client.recv(d))).collect();
+        assert!(got.is_empty(), "duplicate delivered");
+        for d in client.flush() {
+            server.recv(&d);
+        }
+        assert_eq!(server.unacked_count(), 0);
+        assert_eq!(server.rtt(), None, "resent packets aren't timed (Karn)");
+
+        // A packet acked after 40 ms gives an RTT sample and a 120 ms timeout.
+        let t1 = t0 + Duration::from_secs(2);
+        server.set_time(t1);
+        server.queue_message(&[0x8f, 2]);
+        let d = server.flush();
+        client.set_time(t1 + Duration::from_millis(40));
+        server.set_time(t1 + Duration::from_millis(40));
+        for x in &d {
+            client.recv(x);
+        }
+        for x in client.flush() {
+            server.recv(&x);
+        }
+        let rtt = server.rtt().unwrap();
+        assert!((rtt.as_secs_f64() - 0.040).abs() < 1e-6, "{rtt:?}");
+        assert_eq!(server.rto(1), Duration::from_millis(120));
+        assert_eq!(server.rto(2), Duration::from_millis(240), "backs off");
+    }
+
+    #[test]
+    fn unacked_past_timeout_means_connection_lost() {
+        let (mut server, _client, _) = connected_pair();
+        let t0 = Instant::now();
+        server.set_time(t0);
+        server.unacked.clear();
+        server.queue_message(&[0x8f]);
+        server.flush();
+        server.set_time(t0 + ACK_TIMEOUT - Duration::from_millis(1));
+        server.flush();
+        assert!(!server.is_lost());
+        server.set_time(t0 + ACK_TIMEOUT);
+        server.flush();
+        assert!(server.is_lost());
+    }
+
+    /// 30% loss both ways, acks included: every message still arrives exactly once.
+    #[test]
+    fn lossy_link_delivers_everything_once() {
+        let (mut server, mut client, _) = connected_pair();
+        let mut seed = 0x2545F491u32;
+        let mut drop = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % 10 < 3
+        };
+        let mut t = Instant::now();
+        let sent: Vec<Vec<u8>> = (0..300u16).map(|i| vec![0x8f, (i >> 8) as u8, i as u8]).collect();
+        for m in &sent {
+            server.queue_message(m);
+        }
+        let mut got = Vec::new();
+        for _ in 0..400 {
+            t += Duration::from_millis(50);
+            server.set_time(t);
+            client.set_time(t);
+            for d in server.flush() {
+                if !drop() {
+                    got.extend(messages(client.recv(&d)));
+                }
+            }
+            for d in client.flush() {
+                if !drop() {
+                    server.recv(&d);
+                }
+            }
+            if server.unacked_count() == 0 && got.len() == sent.len() {
+                break;
+            }
+        }
+        assert!(!server.is_lost());
+        assert_eq!(server.unacked_count(), 0, "everything acked eventually");
+        let mut sorted = got.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), got.len(), "no duplicates delivered");
+        assert_eq!(sorted, { let mut s = sent.clone(); s.sort(); s });
     }
 }

@@ -10,11 +10,11 @@
 //!          └─ (game) 0x1A timestamp, 0x51 frame, obfusc.  [game]
 //! ```
 //!
-//! Verification status mirrors the spec: `crypto`, `checksum`, `aes` and `ids`
-//! are byte-verified against the binary; `reliability` follows the archived
-//! RakNet 2.x source (round-trip tested here, flagged where unconfirmed on the
-//! wire); the `mitm` feature's `rsa`/`handshake` interop with the live server
-//! still needs calibrating against a real capture (RSA byte order).
+//! Verification status mirrors the spec: `crypto`, `checksum`, `aes`, `ids`,
+//! `reliability` and the `mitm` handshake are verified against the binary and
+//! the real client. `session` adds retransmission, a wrap-aware duplicate
+//! window and RTT/loss detection; receive-side ordering and split packets are
+//! still missing (notes/differences-from-samp-raknet.md §3).
 //!
 //! Scope: this is for inspecting *your own* client and *your own* traffic. The
 //! proxy built on top is an observer and does not intentionally alter content.

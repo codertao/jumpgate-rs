@@ -1,5 +1,7 @@
 //! One UDP port, many clients: a RakNet server [`Endpoint`] per peer address.
 
+use crate::proto;
+use raknet::Reliability;
 use raknet::session::{Endpoint, Event};
 use std::collections::HashMap;
 use std::io;
@@ -86,11 +88,12 @@ impl Listener {
         let stale: Vec<SocketAddr> = self
             .peers
             .iter()
-            .filter(|(_, p)| now.duration_since(p.last_heard) > PEER_TIMEOUT)
+            .filter(|(_, p)| now.duration_since(p.last_heard) > PEER_TIMEOUT || p.endpoint.is_lost())
             .map(|(a, _)| *a)
             .collect();
         for a in stale {
-            eprintln!("[{}] peer {a} timed out", self.tag);
+            let why = if self.peers[&a].endpoint.is_lost() { "stopped acking" } else { "timed out" };
+            eprintln!("[{}] peer {a} {why}", self.tag);
             self.peers.remove(&a);
             events.push(NetEvent::Disconnected(a));
         }
@@ -100,7 +103,13 @@ impl Listener {
     pub fn queue(&mut self, to: SocketAddr, msg: &[u8]) -> bool {
         match self.peers.get_mut(&to) {
             Some(p) if p.endpoint.is_connected() => {
-                p.endpoint.queue_message(msg);
+                if proto::is_position_update(msg) {
+                    // As the client sends them: a lost one is superseded by the
+                    // next, so it mustn't hold up ordered traffic behind it.
+                    p.endpoint.queue_message_rel(msg, Reliability::UnreliableSequenced, 0);
+                } else {
+                    p.endpoint.queue_message(msg);
+                }
                 true
             }
             _ => false,

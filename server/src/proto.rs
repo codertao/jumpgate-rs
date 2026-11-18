@@ -239,6 +239,14 @@ pub fn empty_table(msg_type: u8, len: usize) -> Vec<u8> {
 
 pub const SMALL_LOC_LEN: usize = 56;
 
+/// Fast location updates (0x33 small, 0x34), ours and relayed. The client sends
+/// these UNRELIABLE_SEQUENCED and drops any whose clock isn't newer, so the
+/// server sends them the same way. Full 0x05 reports stay reliable: they create
+/// the contact and carry the callsign and hull.
+pub fn is_position_update(msg: &[u8]) -> bool {
+    matches!(msg.first(), Some(0x33 | 0x34))
+}
+
 /// Unit vector → i16 ×10000 (client scales by 1e-4 @0xb06918).
 fn put_unit(b: &mut [u8], o: usize, v: Vec3) {
     for (k, x) in v.iter().enumerate() {

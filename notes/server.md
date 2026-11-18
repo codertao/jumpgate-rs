@@ -111,8 +111,15 @@ host with no space session. A later 0x05 report (pid @0x5c) can correct it.
   endpoint (old AES key, old message numbers) and emits a disconnect first.
   Before this fix (2026-11-17), a second launch hung the client waiting for
   space. ID_DISCONNECTION_NOTIFICATION (0x14) also ends a session.
-- RakNet `session` has no retransmission, which is fine on a LAN but needs adding
-  for real networks.
+- RakNet `session` (2026-11-17): reliable packets are resent until acked (3×
+  smoothed RTT), duplicates are filtered with a wrap-aware window, and a peer
+  that leaves a reliable packet unacked for 15 s is dropped. Still to do:
+  receive-side ordering and split packets. Send reliability (2026-11-18):
+  0x33/0x34 position updates go UNRELIABLE_SEQUENCED, everything else
+  RELIABLE_ORDERED, both on channel 0. This matches the client's
+  `SendGameMessage` (`0x9c9c10`), which passes channel 0 and reliability 1 or 3
+  [bin]. Live-confirmed 2026-11-18: NPC motion stays smooth with 0x33 sent
+  sequenced, so the client accepts server-sent sequenced packets.
 - Unhandled types are logged once each. Use `--verbose` sessions to grow the table.
 
 ## NPCs  [2026-11-17, first ship; live-tested with the real client]
