@@ -28,7 +28,7 @@ Common sub-fields seen across many messages:
 | 0x09 | 16 | **Command: market listing, buy, sell, misc** | `[09][cmd][u16 loc][u32 index @4][u32 player_id @8][f32 quantity @12]`. Listing requests, buys and sells: see "Station market" below. Other cmds are slash commands (slash-commands.md). [capture jgcap2, 2026-11-18] |
 | 0x08 | 8 | **Change ship** (sends `0x47932a`, `0x47a708`) | `[08][u8 ship_type][2 bytes uninitialised][u32 player_id]`. Seen switching to type 94 (Hurricane) while docked. The server answered with 13 × 0x45 (the old ship's fittings moved to the item list) and a 0x06. [capture jgcap2] |
 | 0x4B | 60 | **Contract board** | `[4b][3 junk][u32 player_id @4][u8 job @8][u8 op @9]`, rest zero except u8 @0x18 = the board (7 = trade/mining board, 0x0e = the courier/patrol board; echoed in the reply). op 1–3 = view offer n, 0x65 = accept, 0x96+n = close offer n. Answered by S→C 0x4B. [capture jgcap2] |
-| 0x0E | 16 | Consumables update | `[0E]...` |
+| 0x0E | 16 | **Consumables used** | `[0E][3 junk][f32 fuel_used @4][f32 hull_used @8][f32 magazines_used @0xc]`. Sent once per dock, after the S→C 0x08 to a station; no reply was seen. See "Consumables and servicing". [static + 4 captures] |
 | 0x04 | 27 | Chat line | `[04][05][u16 loc][u32 player_id][callsign\0][text...]` |
 | 0x65 | 36 | Join chat channel ("chat") | `[65][u16 loc?][u32 player_id]["chat"\0]...` |
 | 0x6A | 8 | Player-list / player request | `[6A][...][u32 player_id]` |
@@ -101,9 +101,9 @@ The message is first copied to `0xba8e20`.
 | +0x90 | +0x1c | f32 ×3 | +0x15c8 | position |
 | +0x9c | +0x2c | f32 | +0x15f8 | armour-ish (capture 24e6 = Thunder armour 24000 ×1000) [inferred] |
 | +0xa0 | | f32 | +0x15fc | same, max [inferred] |
-| +0xa4 | | f32 | +0x1600 | ? (capture 72e6 = 3× the above) |
+| +0xa4 | | f32 | +0x1600 | **hull** (`0xff2ae4`, the copy of the hull cell); the server echoes it in S→C 0xB3 @0xc. jgcap2: 14 490 000 in 0x05 and in 0xB3 [static + capture 2026-11-18] |
 | +0xa8 | +0x28 | f32 | +0x1608 | **effective thrust** (thrust × throttle) used by dead reckoning; capture 7.2e6 with drag 44 → √(7.2e6/44) = 404 u/s = measured |v| |
-| +0xac | | f32 | | ? (100.0) |
+| +0xac | | f32 | | **fuel**, rounded to a whole number (`send_location_tick` `0x9cdfb4`): 100.0 → 99.0 → … The server echoes it in S→C 0xB3 @0x18 [static + capture 2026-11-18] |
 
 Server-driven ships use the same two messages: the client can't tell an NPC
 from a remote player. **Runtime-confirmed 2026-11-17:** a server-built 0x05
@@ -138,7 +138,7 @@ client sends `0x05`(176)+`0x17`(10); server answers a batch of `0xa7`(56)×~10 +
 | 0x86 | 36? | S→C | Single particle-cloud update (handler `0x9d80c1`) | `[86][slot<8]..` + one 32-byte record @4 → `0xff1b18 + slot*32` [static] |
 | 0x73 | 251 | S→C | **Asteroid ore levels** for the sector (reply to 0x75, and on sector entry) | `[73]` + 1000 × 2-bit level, one per world object; see "Asteroid ore levels" [static + capture] |
 | 0x78 | 151 | S→C | **Building sites** of the destination sector, sent before every 0x08 (launch, jump) | 50 × `[b0][cat][item]`; see "Building sites" [static + capture] |
-| 0xB3 | 44 | S→C | Own-ship physics echo (per heartbeat) | `[B3][3 pad]` + floats (one @12 ~7.2e7, one @26 =100.0) [inferred] |
+| 0xB3 | 44 | S→C | **Own-ship state** (reply to every C→S 0x17, about every 13 s; handler `0x9d94ea`) | Fully decoded, every byte: `[B3][3 pad]`; **i32 ammo** for gun slots 0–7 @4, @8, @0x10, @0x14, @0x1c, @0x20, @0x24, @0x28 (into cells `0x140ac2c + 0xc·slot`); **f32 hull @0xc**; **f32 fuel @0x18**. All three are server-authoritative and overwrite the client's values: fuel and ammo always, hull unless the client's hull is exactly 1000.0 (`0xaeadbc`, purpose unknown). Live captures: fuel 100 on the first 0xB3 after each launch, then the client's own 0x05 fuel (@0xac); hull = full (ship-type armour × 3000: Thunder 72e6, Typhoon 14.49e6, Hurricane 14.1e6); ammo 0 (energy guns only). This is how a launch refuels and repairs. See "Consumables and servicing". [static + capture 2026-11-18] |
 | 0x42 | 1 | S→C | Heartbeat ack (pairs with 0x17) | `[42]` |
 | 0x62 | 800 | S→C | Large table, empty in capture (sector contacts?) | zeros [inferred] |
 | 0x13 | 788 | S→C | Large table (world/sector state?) | [inferred] |
@@ -465,6 +465,110 @@ the refined elements the contract texts describe (`0x9c57d0`). Byte 0x10 was
 send 0x58 on sector entry (encode positions as `(int)(pos − origin) ^ 0xc0b55`).
 Today a captured 0x58 goes everywhere, so every space sector gets the same
 vein at another sector's coordinates.
+
+### Consumables and servicing (C→S 0x0E; S→C 0xA9, 0x79, 0x9E)  [static + capture, 2026-11-18]
+
+**C→S 0x0E, 16 B** (sender `0x9cabc0`). It reports what the ship used up
+since it was last full. Each value is "1 − fraction left":
+
+| off | type | meaning |
+|---|---|---|
+| 0 | u8 | 0x0E; bytes 1–3 are stack junk |
+| 4 | f32 | fuel used = 1 − fuel/100 (the fuel cell `0x14408b0`; 100.0 is full) |
+| 8 | f32 | hull used = 1 − `0xff2ae4` / (ship-type armour `+0x150` × 3000). `0xff2ae4` is a copy of the hull cell |
+| 0xc | f32 | magazines used = Σ over gun slots 0–7 with ammo (`gun+0x64` ≠ 0) of (1 − ammo/max). Energy guns don't count |
+
+How it's produced:
+- `snapshot_consumables` (`0x9c74c0`) fills three globals
+  (`0xff2708/0c/10`). It runs in two places:
+  - in the docking code (`0x40e2a2`), just before the client sends 0x0F
+    cargo and the 0x07 dock request;
+  - in `player_death` (`0x9cf141`), after it sets `0xbe5af4 = 2`. With that
+    flag set it reports a total loss: fuel 1, hull 1, and one magazine per
+    ammo gun.
+- It is sent from the station branch of the S→C 0x08 handler (new loc @0x2c
+  < 101, `0x9d4223`), right after C→S 0x6A and 0xC1. The globals are then
+  zeroed. So a death followed by a respawn at a station also sends it,
+  with the total-loss values.
+
+Captured 2026-11-10, 2026-11-18 and jgcap2: fuel 0.06, 0.45, 0.17, 0.13;
+hull and magazines 0 every time. The live server sent nothing back, and
+credits did not change around it. Whether it charges a fee later can't be
+told from the captures (a contract payout landed in the same window).
+
+**The client never refills itself on a plain dock.** The only writers of the
+fuel cell are listed below; hull and ammo have the same set.
+- startup (`0xa25215`): fuel = 100;
+- a ship change (jgcap2: fuel used dropped from 0.45 to 0.17 only after a
+  0x08 change-ship);
+- one missile-slot item with id 0x121 (`fire_missile`): fuel = 100
+  [inferred: a fuel-cell consumable];
+- these server messages (0xB3 is the one the live server actually uses):
+  - **S→C 0xA9 service** (≥ 5 B, handler `0x9d9a31`) [static only, never captured]:
+    - msg[4] ≠ 0: repair, hull cell = max hull (`0x14e86bc`); sets flag `0xbe5ade`.
+    - msg[2] ≠ 0: refuel, fuel = 100; sets flag `0xbe5adf`.
+    - msg[3] ≠ 0: rearm, every gun slot (up to ship-type `+0x154` slots) gets
+      ammo = `gun+0x64`.
+    - msg[1] is not read here.
+    - This is the natural reply to 0x0E.
+  - **S→C 0x79 service pad** (handler `0x9d7f33`): msg[1] is a contact slot
+    whose model chooses the service: 0x16f refuel (fuel = 100), 0x173
+    repair (hull = max), 0x177 rearm (all guns full). Each also shows a
+    message (`0x9c3ca0` ids 0x23 / 0x24 / 0x1a). This answers the in-space
+    service beam (C→S 0x79, physics.md §6).
+  - **S→C 0x9E enter space** (`enter_space_handler` `0x9cc750`) [static only,
+    never captured]: loads hull @+8, fuel @+0x70, @+0x6c (→ `0x14e86c0`)
+    and more cells @+0x80..0x98 from the message. Layout not decoded yet.
+
+  - **S→C 0xB3 own-ship state** (correction, 2026-11-18): this is how the live
+    server refuels **and repairs** on launch. 0xB3 answers every C→S 0x17
+    (about every 13 s in space). Layout, 44 B, every byte accounted for:
+
+    | off | type | into | meaning |
+    |---|---|---|---|
+    | 0 | u8 | | 0xB3; bytes 1–3 are padding (0xcc on the live server) |
+    | 4, 8 | i32 | `0x140ac2c`, `0x140ac38` | ammo, gun slots 0, 1 |
+    | 0xc | f32 | hull cell `0x14e86c4` | hull; skipped if the client's hull is exactly 1000.0 |
+    | 0x10, 0x14 | i32 | `0x140ac44`, `0x140ac50` | ammo, gun slots 2, 3 |
+    | 0x18 | f32 | fuel cell `0x14408b0` | fuel (100 = full) |
+    | 0x1c–0x28 | i32 ×4 | `0x140ac5c` … `0x140ac80` | ammo, gun slots 4–7 |
+
+    - Ammo: the cell for gun slot i is the one `snapshot_consumables` pairs
+      with `0xff7d00+i`. A full magazine is `gun+0x64` (items.md); energy
+      guns have 0.
+    - The hull test is `fucompp; test ah,0x44; jnp skip`, i.e.
+      `if (hull != 1000.0f) hull = msg.hull`. I first read it backwards. Why
+      1000 is exempt is unknown; no ship type has armour 1/3.
+    - Live captures:
+      - Fuel: 100.00 in the first 0xB3 after every launch. After that it
+        follows the fuel the client reports in 0x05 @0xac (jgcap2 went down
+        to 55 at the dock, matching 0x0E "fuel used 0.45").
+      - Hull: always exactly full, ship-type armour × 3000. jgcap Thunder
+        24000 → 72e6; jgcap2 Typhoon 4830 → 14.49e6, then Hurricane 4700 →
+        14.1e6 after the ship change. No damage was taken in these sessions,
+        so whether the server echoes damage mid-flight (0x05 @0xa4) is
+        unconfirmed.
+      - Ammo: always 0 (energy guns only).
+    - The 0x05 report carries fuel and hull but **no ammo**, so the server
+      has to track ammo itself (or just send full magazines on launch). How
+      the live server tracks ammo is unknown.
+    - This matches the user's report that every live launch is fully fuelled
+      and repaired. Neither comes from the startup reset: `0xa25215` and
+      `cells_alloc` run once, from WinMain (`0xa241e0`, called by the CRT at
+      `0xaac6d0`).
+    - Related: S→C 0xA1 `[a1][3 pad][f32 hull @4]` sets hull (clamped to max;
+      handler `0x9d94b2`). It never appears in the captures.
+
+Our server: it replays the first captured 0xB3 as the reply to every 0x17.
+That means fuel is reset to 100 about every 13 s (infinite fuel), and **every
+ammo-gun slot is set to 0** (the template's ammo is all zero). Build 0xB3 from
+server state instead:
+- after a launch, fuel 100 and full magazines;
+- afterwards, echo the client's 0x05 fuel/hull, or the server's own figure;
+- charge for the refill on launch, if prices are wanted.
+
+0xA9 stays available for station services. Treat the 0x0E values as a report,
+not as truth (they're computed by the client).
 
 ### Rewards seen (server-side rules, jgcap2)
 

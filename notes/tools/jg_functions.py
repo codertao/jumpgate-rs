@@ -23,7 +23,7 @@ DISPATCH_IDX, DISPATCH_TBL, DISPATCH_BASE, DISPATCH_N = 0x9da24c, 0x9da0f0, 3, 0
 DISPATCH_DEFAULT = 0x9d9f3e
 TEXT = (0x401000, 0xac2000)
 # known S->C message names for dispatcher cases (see message-types.md)
-MSG_NAMES = {0x03: 'damage', 0x04: 'chat', 0x06: 'char_record', 0x08: 'location_change',
+MSG_NAMES = {0x03: 'damage', 0x79: 'service_pad', 0x9e: 'enter_space', 0xa9: 'service', 0xb3: 'own_ship_state', 0xa1: 'set_hull', 0x04: 'chat', 0x06: 'char_record', 0x08: 'location_change',
              0x0a: 'listing_guns', 0x0b: 'listing_missiles', 0x0d: 'listing_commodities',
              0x13: 'sector_table', 0x58: 'mineral_vein', 0x14: 'conflux_swarm', 0x15: 'force_location',
              0x33: 'smallloc_relay', 0x34: 'miniloc_relay', 0x42: 'heartbeat_ack',

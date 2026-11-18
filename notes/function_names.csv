@@ -307,3 +307,5 @@ addr,name,area,confidence,ref
 0x407050,game_file_checksum,anti-tamper,high,physics.md#9 (text-mode read; sum sbyte<<16*(i%3))
 0x407130,check_texture_files,anti-tamper,high,physics.md#9 (D3D_ALLOC_ERROR 100%d)
 0x4071f0,check_model_files,anti-tamper,high,physics.md#9 (D3D_ALLOC_ERROR 101%d)
+0x9cabc0,send_consumables_used_0x0e,net-send,high,message-types.md#consumables-and-servicing
+0x9c74c0,snapshot_consumables,game,high,message-types.md#consumables-and-servicing (fuel/hull/ammo used; total loss when 0xbe5af4==2)

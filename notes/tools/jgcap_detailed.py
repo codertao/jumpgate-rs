@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 C2S = {
     0x04: 'CHAT', 0x05: 'LOGIN / LOC_REPORT', 0x07: 'TRAVEL', 0x08: 'CHANGE_SHIP', 0x09: 'COMMAND',
-    0x0C: 'IMPACT', 0x0E: 'CONSUMABLES_UPDATE', 0x0F: 'CARGO_REPORT', 0x10: 'PRODBOOST',
+    0x0C: 'IMPACT', 0x0E: 'CONSUMABLES_USED', 0x0F: 'CARGO_REPORT', 0x10: 'PRODBOOST',
     0x16: 'REJECT_SPAWN', 0x17: 'LOC_COMPANION', 0x1A: 'MKILL', 0x1B: 'INSURANCE_UPDATE_REQ',
     0x1D: 'HIT_QUEUE', 0x2C: 'BOT_HANDOFF', 0x2E: 'CHKBLDG', 0x32: 'MISSILE', 0x33: 'SMALL_LOC', 0x34: 'MINI_LOC',
     0x36: 'WINGMAN', 0x37: 'PACKET_55', 0x3D: 'PACKET_61', 0x3F: 'PACKET_63', 0x40: 'PACKET_64',
@@ -45,7 +45,7 @@ S2C = {
     0x58: 'MINERAL_VEIN', 0x61: 'BEACON_UPDATE', 0x62: 'TABLE_0x62', 0x65: 'CHANNEL_ACK', 0x70: 'BOT_SPAWN',
     0x71: 'BOT_ASSIGN', 0x77: 'MEDAL', 0x73: 'ASTEROID_LEVELS', 0x76: 'MISSION_INFO?', 0x78: 'BUILDING_SITES',
     0x81: 'MOTD', 0x86: 'CLOUD_UPDATE', 0x87: 'PARTICLE_CLOUDS', 0x8C: 'STATUS_0x8C', 0x8F: 'KEEPALIVE', 0x91: 'AVAILABLE_MISSIONS',
-    0x92: 'EXPERIENCE', 0xA7: 'SECTOR_STATION', 0xB3: 'OWN_SHIP_ECHO', 0xBA: 'UPDPR',
+    0x92: 'EXPERIENCE', 0xA7: 'SECTOR_STATION', 0xB3: 'OWN_SHIP_STATE', 0xBA: 'UPDPR',
     0xC2: 'JOB_LIST', 0xFE: 'MEMORY_PATCH',
 }
 
@@ -324,6 +324,20 @@ def d_mining_report(m):
     return 'asteroid %d loc %s mined %.3f pid=%d' % (u16(m, 2), loc(u16(m, 4)), f32(m, 8), u32(m, 12))
 
 
+def d_consumables(m):
+    """C->S 0x0E: fractions used since full (1 - left): fuel, hull, magazines."""
+    if len(m) < 16: return short_hex(m)
+    return 'used: fuel %.3f hull %.3f magazines %.3f' % (f32(m, 4), f32(m, 8), f32(m, 12))
+
+
+def d_own_ship_state(m):
+    """S->C 0xB3 (handler 0x9d94ea): i32 ammo for gun slots 0..7 @4,8,0x10,0x14,0x1c,0x20,0x24,0x28;
+    f32 hull @0xc (applied unless the client's hull == 1000.0); f32 fuel @0x18. All server-authoritative."""
+    if len(m) < 0x2c: return short_hex(m)
+    ammo = [struct.unpack_from('<i', m, o)[0] for o in (4, 8, 0x10, 0x14, 0x1c, 0x20, 0x24, 0x28)]
+    return 'fuel %.2f hull %.0f ammo %s' % (f32(m, 0x18), f32(m, 0xc), ammo)
+
+
 def d_mineral_vein(m):
     """S->C 0x58: vein (world object 948) commodity/type/pos + artifact; coords are i32 ^ 0xc0b55."""
     if len(m) < 0x21: return short_hex(m)
@@ -399,7 +413,7 @@ DECODERS = {
         {0: 'unfit', 1: 'fit', 2: 'missile fired'}.get(u8(m, 4), 'op%d' % u8(m, 4)),
         CATEGORY_CSV.get(u8(m, 2), 'cat%d' % u8(m, 2)), u8(m, 1), u8(m, 3)),
     ('S', 0x14): lambda m: 'swarm %d now %s (from %s)' % (u32(m, 4), loc(u32(m, 8)), loc(u32(m, 12)) if u32(m, 12) else '-'),
-    ('S', 0x45): d_credits_items, ('S', 0x4B): d_contract, ('S', 0x70): d_bot_spawn, ('S', 0x78): d_building_sites, ('S', 0x58): d_mineral_vein, ('S', 0x73): d_asteroid_levels, ('C', 0x74): d_mining_report,
+    ('S', 0x45): d_credits_items, ('S', 0x4B): d_contract, ('S', 0x70): d_bot_spawn, ('S', 0x78): d_building_sites, ('S', 0x58): d_mineral_vein, ('S', 0x73): d_asteroid_levels, ('C', 0x74): d_mining_report, ('C', 0x0E): d_consumables, ('S', 0xB3): d_own_ship_state,
     ('S', 0x77): lambda m: 'medal id=%d' % u8(m, 1), ('S', 0x92): lambda m: 'experience=%d' % u32(m, 4),
     ('S', 0x05): d_loc_report, ('S', 0x06): d_char_record, ('S', 0x08): d_location_change,
     ('S', 0x81): d_motd, ('S', 0x04): d_s_chat, ('S', 0xFE): d_mem_patch, ('S', 0x61): d_beacon,
