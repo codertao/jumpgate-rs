@@ -84,6 +84,8 @@ pub struct Server {
     seen_in_sector: HashSet<PlayerId>,
     /// What each player has been shown of the server-driven ships.
     feed: Feed,
+    /// Next spawn# for `!ai` (the bot id in botloc and 0x44).
+    next_spawn: u16,
     pub log: Vec<String>,
 }
 
@@ -118,6 +120,7 @@ impl Server {
             missing_tpl: HashSet::new(),
             seen_in_sector: HashSet::new(),
             feed: Feed::new(),
+            next_spawn: 0,
             log: Vec::new(),
         }
     }
@@ -153,16 +156,22 @@ impl Server {
                 None => Vec::new(),
             },
             Conn::Space => {
-                if let Some(pid) = self.by_space.remove(&addr) {
-                    let mut out = self.despawn(pid);
-                    if let Some(p) = self.players.get_mut(&pid) {
-                        p.space_addr = None;
-                    }
-                    out.retain(|o| o.to != pid);
-                    out
-                } else {
-                    Vec::new()
+                let Some(pid) = self.by_space.remove(&addr) else { return Vec::new() };
+                // Only the player's current space session counts. An older one
+                // (left over from before a dock and relaunch) timing out must
+                // not unbind the new one: that left the client's space
+                // keepalives unanswered until it gave up ("Disconnected from
+                // space server", 2026-11-19).
+                if self.players.get(&pid).and_then(|p| p.space_addr) != Some(addr) {
+                    self.note(format!("player {pid}: old space session {addr} closed"));
+                    return Vec::new();
                 }
+                let mut out = self.despawn(pid);
+                if let Some(p) = self.players.get_mut(&pid) {
+                    p.space_addr = None;
+                }
+                out.retain(|o| o.to != pid);
+                out
             }
         }
     }
@@ -183,6 +192,10 @@ impl Server {
     }
 
     fn bind_space(&mut self, pid: PlayerId, addr: SocketAddr) {
+        // A player has one space session: forget the previous one's address.
+        if let Some(prev) = self.players.get(&pid).and_then(|p| p.space_addr).filter(|a| *a != addr) {
+            self.by_space.remove(&prev);
+        }
         if let Some(old) = self.by_space.insert(addr, pid) {
             if old != pid {
                 if let Some(p) = self.players.get_mut(&old) {
@@ -241,7 +254,19 @@ impl Server {
             }
             (Conn::Space, 0x05) => self.location_report(pid, msg),
             (Conn::Space, 0x33) | (Conn::Space, 0x34) => self.relay_fast(pid, msg),
-            (Conn::Space, 0x71) | (Conn::Space, 0x2c) => Vec::new(), // bots: not yet
+            (Conn::Space, 0x71) => self.relay_botloc(pid, msg),
+            (Conn::Space, 0x2c) => Vec::new(), // bot handoff request: not yet
+            (_, 0x16) if msg.len() >= 4 => {
+                // RejectSpawn: our 0x70 bounced (queue or pbotloc full, or a sector change).
+                let (t, n) = (msg[1], proto::u16_at(msg, 2));
+                self.note(format!("player {pid} rejected bot spawn ai_type {t} (ship {}) #{n}", t as u16 + 219));
+                Vec::new()
+            }
+            (_, 0x44) if msg.len() >= 12 => {
+                let (n, killer) = (proto::u16_at(msg, 2), proto::u32_at(msg, 4));
+                self.note(format!("player {pid}: bot #{n} destroyed by {killer}"));
+                Vec::new()
+            }
             _ => {
                 if self.unhandled.insert((conn, ty)) {
                     self.note(format!("unhandled {conn:?} 0x{ty:02x} ({}B) — first seen", msg.len()));
@@ -424,7 +449,12 @@ impl Server {
                 let station = station_of_sector(cur).unwrap_or(self.cfg.home_station);
                 let mut out = self.despawn(pid);
                 {
+                    // Dock drops the client's space connection (0x08 "none"); the
+                    // next launch opens a new one, which space_connected binds.
                     let p = self.players.get_mut(&pid).unwrap();
+                    if let Some(a) = p.space_addr.take() {
+                        self.by_space.remove(&a);
+                    }
                     p.docked = true;
                     p.loc = station;
                     p.last_report = None;
@@ -483,8 +513,74 @@ impl Server {
                 }
                 Err(e) => reply(e),
             },
-            "!help" => reply("!goto <sector id or name> [gate 1-4]: jump straight there (in space only).".into()),
+            "!ai" => match self.parse_ai(pid, &args) {
+                Ok(ship) => {
+                    let n = self.next_spawn;
+                    self.next_spawn = self.next_spawn.wrapping_add(1);
+                    let name = self.world.hulls.get(&ship).map_or("?".to_string(), |h| h.name.clone());
+                    self.note(format!("player {pid} !ai {name} (ship {ship}) #{n} in {loc}"));
+                    let m = proto::bot_spawn(ship, n).expect("parse_ai returns bot types");
+                    let mut out = reply(format!("Spawning {name} (#{n}) in about 5 s."));
+                    out.insert(0, Out { to: pid, conn: Conn::State, msg: m });
+                    out
+                }
+                Err(e) => reply(e),
+            },
+            "!help" => reply(
+                "!goto <sector id or name> [gate 1-4]: jump straight there (in space only). \
+                 !ai <0-27 | jelly | def [1|2] [sol|oct|quan] | 220-257>: spawn a conflux (C-number) or defender, owned by you."
+                    .into(),
+            ),
             _ => reply(format!("Unknown command {cmd}. Try !help.")),
+        }
+    }
+
+    /// `!ai <what>` → bot ship type. `<n>` 0–27 is the conflux C-number (C0 = Jellyfish = 230,
+    /// C1 'Squid' = 231 … C27 'Great Prawn' = 257), `jelly` = 230, a raw ship
+    /// type 220–257 is taken as is. `def [1|2] [sol|oct|quan]` is a faction
+    /// defender (220–225), by default for the sector's faction. Turrets (258,
+    /// 259) are left out: their spawn# must name a player structure.
+    fn parse_ai(&self, pid: PlayerId, args: &[&str]) -> Result<u16, String> {
+        const USAGE: &str = "Usage: !ai <0-27 | jelly | def [1|2] [sol|oct|quan] | 220-257>";
+        let p = &self.players[&pid];
+        if p.docked {
+            return Err("Launch first: !ai works in space.".into());
+        }
+        let loc = p.loc;
+        let words: Vec<String> = args.iter().map(|a| a.to_ascii_lowercase()).collect();
+        let Some(first) = words.first() else { return Err(USAGE.into()) };
+        match first.as_str() {
+            "def" | "defender" => {
+                // spawn_bot refuses ai_type < 11 (defenders) in locations > 200.
+                if loc > 200 {
+                    return Err("Defenders only spawn in station sectors (101-200); the client refuses them here.".into());
+                }
+                let mut level = 1u16;
+                let mut faction = self.world.factions.get(&loc).copied().filter(|f| (1..=3).contains(f));
+                for w in &words[1..] {
+                    match w.as_str() {
+                        "1" | "2" => level = w.parse().unwrap(),
+                        "sol" | "solrain" => faction = Some(1),
+                        "oct" | "octavius" => faction = Some(2),
+                        "quan" | "quantar" => faction = Some(3),
+                        _ => return Err(USAGE.into()),
+                    }
+                }
+                let f = faction.ok_or_else(|| "This sector has no Solrain, Octavius or Quantar faction; add sol, oct or quan.".to_string())?;
+                Ok(220 + 2 * (f as u16 - 1) + (level - 1))
+            }
+            "jelly" | "jellyfish" => Ok(230),
+            w => {
+                let n: u16 = w.trim_start_matches('c').parse().map_err(|_| USAGE.to_string())?;
+                match n {
+                    0..=27 => Ok(230 + n),
+                    220..=225 if loc > 200 => {
+                        Err("Defenders only spawn in station sectors (101-200); the client refuses them here.".into())
+                    }
+                    220..=225 | 230..=257 => Ok(n),
+                    _ => Err(format!("No conflux C{n}: they run C0 (Jellyfish) to C27, ships 230-257.")),
+                }
+            }
         }
     }
 
@@ -578,6 +674,22 @@ impl Server {
     fn relay_fast(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
         if proto::fast_loc_pid(msg) != Some(pid) {
             return Vec::new(); // must describe the sender's own ship
+        }
+        self.to_sector(pid, Conn::State, msg)
+    }
+
+    /// C→S 0x71 botloc from a bot's controller → S→C 0x71 (same layout) to the
+    /// rest of the sector, which creates or updates the bot there (handler
+    /// `0x9d6f25`, ai.md "Spawning"). Dropped unless it is a real bot (ship
+    /// type 219–259, or 0xffff which the handler also accepts; the "no bots"
+    /// botloc has type 0), the sender is the controller (@0x20), and the loc
+    /// (@0xa) is the sender's current sector (the receiving handler drops
+    /// other locs anyway).
+    fn relay_botloc(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        let Some(b) = proto::parse_botloc(msg) else { return Vec::new() };
+        let loc = self.players[&pid].loc;
+        if !b.is_bot() || b.controller != pid || b.loc != loc {
+            return Vec::new();
         }
         self.to_sector(pid, Conn::State, msg)
     }
@@ -956,5 +1068,96 @@ mod tests {
         s.handle(Conn::State, st, &travel(ACT_DOCK, 118, 0, a));
         let out = s.handle(Conn::State, st, &chat_line(a, "!goto 241"));
         assert!(sent_redirect(&out).is_none());
+    }
+
+    #[test]
+    fn ai_spawns_a_bot_for_the_caller() {
+        let mut w = goto_world();
+        w.factions.insert(118, 3);
+        let mut s = Server::new(Config::default(), Templates::default(), w);
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let st = addr("10.0.0.1:1000");
+        let spawn = |out: &[Out]| out.iter().find(|o| o.msg[0] == 0x70).map(|o| (o.to, o.conn, o.msg.clone()));
+        // C3 'Squid' = ship 233 = ai_type 0x0e, as in the capture.
+        let out = s.handle(Conn::State, st, &chat_line(a, "!ai 3"));
+        assert_eq!(spawn(&out), Some((a, Conn::State, vec![0x70, 0x0e, 0, 0, 0xcc, 0xcc])));
+        assert!(out.iter().all(|o| o.to != b));
+        // Next spawn# and the C prefix.
+        let out = s.handle(Conn::State, st, &chat_line(a, "!ai C27"));
+        assert_eq!(spawn(&out).unwrap().2, vec![0x70, 38, 1, 0, 0xcc, 0xcc]);
+        assert_eq!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai jelly"))).unwrap().2[1], 11);
+        assert_eq!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai c0"))).unwrap().2[1], 11);
+        // Defender: sector faction (Quantar → Quan Def 1 = 224), level and faction overrides.
+        assert_eq!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai def"))).unwrap().2[1], 224 - 219);
+        assert_eq!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai def 2 sol"))).unwrap().2[1], 221 - 219);
+        // Errors: no 0x70, one private line.
+        for bad in ["!ai", "!ai 29", "!ai 258", "!ai def 3", "!ai squid"] {
+            let out = s.handle(Conn::State, st, &chat_line(a, bad));
+            assert!(spawn(&out).is_none(), "{bad}");
+            assert_eq!(out.len(), 1, "{bad}");
+        }
+        // Defenders are refused outside station sectors (the client would drop them).
+        s.handle(Conn::State, st, &chat_line(a, "!goto 241"));
+        assert!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai def quan"))).is_none());
+        assert!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai 222"))).is_none());
+        assert!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai 12"))).is_some());
+        // Docked: refused.
+        s.handle(Conn::State, st, &travel(ACT_DOCK, 241, 0, a));
+        assert!(spawn(&s.handle(Conn::State, st, &chat_line(a, "!ai 3"))).is_none());
+    }
+
+    #[test]
+    fn botloc_is_relayed_to_the_sector_from_its_controller_only() {
+        let mut s = Server::new(Config::default(), Templates::default(), goto_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let sp = addr("10.0.0.1:2000");
+        s.handle(Conn::Space, sp, &report(a, 1));
+        let botloc = |id: u16, loc: u16, ty: u16, ctl: u32| {
+            let mut m = vec![0u8; proto::BOTLOC_LEN];
+            m[0] = 0x71;
+            proto::put_u16(&mut m, 8, id);
+            proto::put_u16(&mut m, 0xa, loc);
+            proto::put_u16(&mut m, 0xc, ty);
+            proto::put_u32(&mut m, 0x20, ctl);
+            proto::put_u32(&mut m, 0x24, ctl);
+            m
+        };
+        let m = botloc(0, 118, 233, a);
+        let out = s.handle(Conn::Space, sp, &m);
+        assert_eq!(out, vec![Out { to: b, conn: Conn::State, msg: m }]);
+        // The empty "no bots" report, someone else's bot, a stale loc: dropped.
+        assert!(s.handle(Conn::Space, sp, &botloc(1000, 118, 0, a)).is_empty());
+        assert!(s.handle(Conn::Space, sp, &botloc(0, 118, 233, b)).is_empty());
+        assert!(s.handle(Conn::Space, sp, &botloc(0, 241, 233, a)).is_empty());
+        // Not relayed to other sectors.
+        s.handle(Conn::State, addr("10.0.0.2:1000"), &chat_line(b, "!goto 241"));
+        assert!(s.handle(Conn::Space, sp, &botloc(0, 118, 233, a)).is_empty());
+    }
+
+    /// Dock, relaunch on a new space port, then the old space session times
+    /// out: the new one must stay bound and keep getting keepalive answers.
+    #[test]
+    fn stale_space_session_does_not_unbind_the_new_one() {
+        let mut s = server();
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let (st, old, new) = (addr("10.0.0.1:1000"), addr("10.0.0.1:2000"), addr("10.0.0.1:2001"));
+        assert_eq!(s.space_addr(a), Some(old));
+        s.handle(Conn::State, st, &travel(ACT_DOCK, 118, 0, a));
+        assert_eq!(s.space_addr(a), None, "dock drops space");
+        s.handle(Conn::State, st, &travel(proto::ACT_LAUNCH, 18, 0, a));
+        s.space_connected(new);
+        assert_eq!(s.space_addr(a), Some(new));
+        s.disconnected(Conn::Space, old);
+        assert_eq!(s.space_addr(a), Some(new));
+        let out = s.handle(Conn::Space, new, &[0x8f]);
+        assert_eq!(out, vec![Out { to: a, conn: Conn::Space, msg: vec![0x8f] }]);
+        // Even if the old address was never forgotten (no dock: e.g. a
+        // reconnect from a new port), rebinding drops it.
+        s.handle(Conn::Space, addr("10.0.0.1:2002"), &report(a, 1));
+        assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2002")));
+        assert!(s.disconnected(Conn::Space, new).is_empty());
+        assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2002")));
     }
 }

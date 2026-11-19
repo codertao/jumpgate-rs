@@ -205,6 +205,56 @@ pub fn system_chat(loc: u16, sender: &str, text: &str) -> Vec<u8> {
     m
 }
 
+/// S→C 0x70 bot spawn order (6 B): `[70][u8 ai_type][u16 spawn#][cc cc]`,
+/// handler `0x9cbac0`. ai_type = bot ship type − 219 (spawn_bot `0x9cbb60`
+/// indexes `0xbeb63c + t·64` = the AI table row 219 + t; capture jgcap2:
+/// ai_type 0x0e came back in botloc as ship type 233). spawn# becomes the bot
+/// id in botloc @8 and C→S 0x44. No position or target: the receiving client
+/// owns the bot, targets itself and picks the spawn point ~5 s later
+/// (ai.md "Spawning"). The trailing two bytes were `cc cc` in every capture.
+pub const BOT_SHIP_TYPES: std::ops::RangeInclusive<u16> = 220..=259;
+
+pub fn bot_spawn(ship_type: u16, spawn_no: u16) -> Option<Vec<u8>> {
+    if !BOT_SHIP_TYPES.contains(&ship_type) {
+        return None;
+    }
+    let mut m = vec![0x70, (ship_type - 219) as u8];
+    m.extend_from_slice(&spawn_no.to_le_bytes());
+    m.extend_from_slice(&[0xcc, 0xcc]);
+    Some(m)
+}
+
+/// Botloc 0x71 (52 B, same layout both ways): `@8` u16 bot id (spawn#),
+/// `@0xa` u16 loc, `@0xc` u16 ship type, `@0x20` u32 controller player id,
+/// `@0x24` u32 target player id, `@0x28` f32×3 position (ai.md "Spawning").
+pub const BOTLOC_LEN: usize = 52;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Botloc {
+    pub id: u16,
+    pub loc: u16,
+    pub ship_type: u16,
+    pub controller: u32,
+    pub target: u32,
+}
+
+impl Botloc {
+    /// A bot entry rather than the all-zero "I control none" report.
+    pub fn is_bot(&self) -> bool {
+        (219..=259).contains(&self.ship_type) || self.ship_type == 0xffff
+    }
+}
+
+pub fn parse_botloc(m: &[u8]) -> Option<Botloc> {
+    (m.len() == BOTLOC_LEN && m[0] == 0x71).then(|| Botloc {
+        id: u16_at(m, 8),
+        loc: u16_at(m, 0xa),
+        ship_type: u16_at(m, 0xc),
+        controller: u32_at(m, 0x20),
+        target: u32_at(m, 0x24),
+    })
+}
+
 /// 0x61 beacon update (4 B): `[61][state][u16 loc]`. Handler `0x9d67d5` accepts
 /// only loc 201..=999 (open-space sectors) and only if contact slot 5 holds the
 /// beacon (model 2). Otherwise it prints "Received invalid beacon packet".

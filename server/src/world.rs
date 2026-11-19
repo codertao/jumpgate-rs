@@ -25,6 +25,8 @@ pub struct GateLink {
 #[derive(Default)]
 pub struct World {
     pub names: HashMap<u16, String>,
+    /// Location id → faction (`faction` column: 1 Solrain, 2 Octavius, 3 Quantar, …).
+    pub factions: HashMap<u16, u8>,
     /// (loc, gate_number) → link.
     pub gates: HashMap<(u16, u8), GateLink>,
     /// Ship type id → hull stats.
@@ -40,6 +42,9 @@ impl World {
             if let (Some(id), Some(name)) = (row.get("loc_id"), row.get("name")) {
                 if let Ok(id) = id.parse() {
                     w.names.insert(id, name.to_string());
+                    if let Some(f) = row.get("faction").and_then(|f| f.parse().ok()) {
+                        w.factions.insert(id, f);
+                    }
                 }
             }
         }
