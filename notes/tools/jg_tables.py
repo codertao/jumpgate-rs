@@ -395,5 +395,67 @@ locations = [dict(loc_id=l, name=lname.get(l, ''), flag28=lget(l, 0x28, 'i'),
 with open(os.path.join(OUT, 'locations.csv'), 'w', newline='') as f:
     w = csv.DictWriter(f, locations[0].keys()); w.writeheader(); w.writerows(locations)
 
-print('%d engines, %d missiles, %d guns, %d AI types, %d ship types, %d locations; %s' % (len(engines), len(missiles), len(guns), len(ai), len(ships), len(locations),
+# ---------------- station docking / launch points ----------------
+# The model loaders (0xa27b30 .. ~0xa72400, generated region-init code) load a
+# model pointer from the table 0x14ff690 + id*4 and store float immediates into
+# it, the same way as the collision volumes (physics.md section 6). Docking tube:
+# +0x7f4 -> +0x814. Guide points: +0x834 + k*0x20 (k = 0..3). Launch: +0x8b4.
+# Components never written are 0 (validated against captured launches/docks).
+MODEL_TABLE = 0x14ff690
+R_ = r'(e[a-d]x|e[sd]i|ebp)'
+regs, mptr, pts = {}, {}, {}
+for a, op, args in disasm(0xa27b30, 0xa72400):
+    m = re.match(R_ + r',DWORD PTR ds:0x([0-9a-f]+)$', args)
+    if op == 'mov' and m:
+        r, v = m.group(1), int(m.group(2), 16)
+        regs.pop(r, None); mptr.pop(r, None)
+        if MODEL_TABLE <= v < MODEL_TABLE + 0x1000 and (v - MODEL_TABLE) % 4 == 0:
+            mptr[r] = (v - MODEL_TABLE) // 4
+        continue
+    m = re.match(R_ + r',0x([0-9a-f]+)$', args)
+    if op == 'mov' and m:
+        regs[m.group(1)] = int(m.group(2), 16); mptr.pop(m.group(1), None); continue
+    m = re.match(R_ + ',' + R_ + '$', args)
+    if op == 'xor' and m and m.group(1) == m.group(2):
+        regs[m.group(1)] = 0; mptr.pop(m.group(1), None); continue
+    if op == 'mov' and m:
+        d, s_ = m.group(1), m.group(2)
+        regs.pop(d, None); mptr.pop(d, None)
+        if s_ in regs: regs[d] = regs[s_]
+        if s_ in mptr: mptr[d] = mptr[s_]
+        continue
+    m = re.match(r'DWORD PTR \[' + R_ + r'\+0x([0-9a-f]+)\],(\S+)$', args)
+    if op == 'mov' and m:
+        off = int(m.group(2), 16)
+        if m.group(1) in mptr and 0x7f4 <= off < 0x8c0:
+            v = m.group(3)
+            val = int(v, 16) if v.startswith('0x') else regs.get(v)
+            if val is not None:
+                pts.setdefault(mptr[m.group(1)], {})[off] = struct.unpack('<f', struct.pack('<I', val))[0]
+        continue
+    if op.startswith('call'):
+        for r in ('eax', 'ecx', 'edx'):
+            regs.pop(r, None); mptr.pop(r, None)
+        continue
+    m = re.match(R_ + ',', args)
+    if m and not op.startswith(('cmp', 'test', 'push')):
+        regs.pop(m.group(1), None); mptr.pop(m.group(1), None)
+    m = re.match('^' + R_ + '$', args)
+    if m and op in ('pop', 'inc', 'dec', 'neg', 'not'):
+        regs.pop(m.group(1), None); mptr.pop(m.group(1), None)
+station_points = []
+PT_FIELDS = [('dock_start', 0x7f4), ('dock_end', 0x814)] + [('guide%d' % k, 0x834 + 0x20 * k) for k in range(4)] + [('launch', 0x8b4)]
+for mid in sorted(pts):
+    d = pts[mid]
+    if 0x7f4 not in d and 0x814 not in d:
+        continue
+    row = {'model': mid}
+    for name, off in PT_FIELDS:
+        for j, ax in enumerate('xyz'):
+            row['%s_%s' % (name, ax)] = round(d.get(off + 4 * j, 0.0), 3)
+    station_points.append(row)
+with open(os.path.join(OUT, 'station_points.csv'), 'w', newline='') as f:
+    w = csv.DictWriter(f, station_points[0].keys()); w.writeheader(); w.writerows(station_points)
+
+print('%d engines, %d missiles, %d guns, %d AI types, %d ship types, %d locations, %d station models; %s' % (len(engines), len(missiles), len(guns), len(ai), len(ships), len(locations), len(station_points),
       ', '.join('%s %d' % (k, len(v)) for k, v in tables.items())))

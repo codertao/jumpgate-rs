@@ -12,6 +12,14 @@ traffic.
 > beyond observing your own traffic. Captures could contain a cleartext login —
 > keep them out of the repo (`.gitignore` covers `*.bin`/`*.jgcap`/`*.pcap`).
 
+## Documentation
+
+- **`notes/`** — Jumpgate Classic as it is: the client, protocol, crypto,
+  flight model, AI, item tables, captures, extracts and RE tools. Start at
+  [`notes/README.md`](notes/README.md).
+- **`docs/`** — what we build: the server, NPC agents, our RakNet crate and the
+  design decisions. Start at [`docs/README.md`](docs/README.md).
+
 ## Crates
 
 - **`raknet`** — the transport library. Zero external dependencies in its default
@@ -35,7 +43,14 @@ traffic.
 - **`server`** (`jumpgate-server`) — the reactive fan server: answers each client
   request (login, listings, launch/jump/dock, chat) and relays players' positions
   within a sector. Responses not yet built from scratch come from a local capture
-  (`--templates jgcap.bin`). See [`notes/server.md`](notes/server.md).
+  (`--templates jgcap.bin`). See [`docs/server.md`](docs/server.md).
+
+- **`agent`** (`jumpgate-agent`) — NPC pilots as independent client processes:
+  log in over the wire, fly with the client's flight model, patrol and dock.
+  See [`docs/agents.md`](docs/agents.md).
+
+- **`common`** (`jumpgate-common`) — shared by server and agents: wire layouts,
+  the pilot model and the extract loader (`notes/extracts`).
 
 - **`proxy`** (`jumpgate-proxy`) — the UDP relay / MitM. Default build is the
   transparent relay (no crypto, no external deps).

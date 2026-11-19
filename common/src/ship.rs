@@ -6,7 +6,7 @@
 pub type Vec3 = [f32; 3];
 
 /// Static stats for a hull, from `notes/extracts/ship_types.csv`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct Hull {
     /// Ship-type id as the client knows it (0x05 @0x46).
     pub type_id: u16,
@@ -16,6 +16,13 @@ pub struct Hull {
     pub drag: f32,
     /// Hull armour points (ship_types.csv `armour`).
     pub armour: f32,
+    /// Turn-rate coefficients (ship_types.csv `pitch`/`yaw`/`roll`). At full
+    /// stick the client turns at about 1000 × rate rad/s (physics.md §4).
+    pub pitch: f32,
+    pub yaw: f32,
+    pub roll: f32,
+    /// Number of engine mounts: thrust = engines × engine thrust (physics.md §5).
+    pub engines: u8,
 }
 
 impl Hull {

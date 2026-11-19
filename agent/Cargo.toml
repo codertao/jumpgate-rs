@@ -1,0 +1,15 @@
+[package]
+name = "jumpgate-agent"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NPC agents for jumpgate-server: each logs in and flies like a stock client (own server only)."
+
+[[bin]]
+name = "jumpgate-agent"
+path = "src/main.rs"
+
+[dependencies]
+raknet = { path = "../raknet", features = ["mitm"] }
+jumpgate-common = { path = "../common" }

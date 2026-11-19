@@ -39,7 +39,7 @@ mod tests {
     use crate::ship::length;
 
     fn hull() -> Hull {
-        Hull { type_id: 104, name: "Chinook".into(), mass: 515000.0, drag: 115.0, armour: 62500.0 }
+        Hull { type_id: 104, name: "Chinook".into(), mass: 515000.0, drag: 115.0, armour: 62500.0, ..Default::default() }
     }
 
     fn view() -> ShipView {

@@ -8,8 +8,13 @@
 //!   `0x146d7a0`, filled by `0x4a7460`. Verified 2026-11-17 against all three
 //!   jumps in the capture: dest loc and the 0x08 sub byte (= arrival gate) match.
 //! - `ship_types.csv`: hull stats (from `init_ship_types` `0xa08440`).
+//! - `sector_objects_all.csv` also gives each sector's station (the object in
+//!   contact slot 6) with its model, position and orientation.
+//! - `station_points.csv`: per station model, the docking tube (`+0x7f4` →
+//!   `+0x814`), guide points and launch point (`+0x8b4`), in model space.
+//! - `engines.csv`: engine thrust by index.
 
-use crate::ship::Hull;
+use crate::ship::{Hull, Vec3};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -31,6 +36,50 @@ pub struct World {
     pub gates: HashMap<(u16, u8), GateLink>,
     /// Ship type id → hull stats.
     pub hulls: HashMap<u16, Hull>,
+    /// Location id → the sector's station (station sectors only).
+    pub stations: HashMap<u16, Station>,
+    /// Station model id → docking and launch points (model space).
+    pub station_points: HashMap<u16, StationPoints>,
+    /// Engine index → thrust per engine.
+    pub engine_thrust: Vec<f32>,
+}
+
+/// A station placed in a sector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Station {
+    pub model: u16,
+    pub pos: Vec3,
+    pub fwd: Vec3,
+    pub up: Vec3,
+}
+
+/// Points hard-coded per station model in the client's model loaders.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct StationPoints {
+    /// Docking tube, from `+0x7f4` to `+0x814`. A docking ship comes in from
+    /// beyond `dock_end` (captured dock at Quantar Core: just past the end).
+    pub dock_start: Vec3,
+    pub dock_end: Vec3,
+    pub guides: [Vec3; 4],
+    /// `+0x8b4`: where a launching ship appears (captured launches match in
+    /// x and y).
+    pub launch: Vec3,
+}
+
+impl Station {
+    /// Model-space point → sector coordinates (right = up × fwd).
+    pub fn to_world(&self, p: Vec3) -> Vec3 {
+        let r = cross(self.up, self.fwd);
+        [
+            self.pos[0] + r[0] * p[0] + self.up[0] * p[1] + self.fwd[0] * p[2],
+            self.pos[1] + r[1] * p[0] + self.up[1] * p[1] + self.fwd[1] * p[2],
+            self.pos[2] + r[2] * p[0] + self.up[2] * p[1] + self.fwd[2] * p[2],
+        ]
+    }
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 }
 
 impl World {
@@ -50,8 +99,27 @@ impl World {
         }
         let objs = std::fs::read_to_string(dir.join("sector_objects_all.csv"))?;
         w.load_gates(&objs);
+        w.load_stations(&objs);
         let ships = std::fs::read_to_string(dir.join("ship_types.csv"))?;
         w.load_hulls(&ships);
+        // Optional for older extract sets.
+        if let Ok(t) = std::fs::read_to_string(dir.join("station_points.csv")) {
+            w.load_station_points(&t);
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("engines.csv")) {
+            let mut csv = Csv::new(&t);
+            while let Some(row) = csv.next_row() {
+                if let (Some(i), Some(th)) = (
+                    row.get("idx").and_then(|v| v.parse::<usize>().ok()),
+                    row.get("thrust").and_then(|v| v.parse::<f32>().ok()),
+                ) {
+                    if w.engine_thrust.len() <= i {
+                        w.engine_thrust.resize(i + 1, 0.0);
+                    }
+                    w.engine_thrust[i] = th;
+                }
+            }
+        }
         Ok(w)
     }
 
@@ -70,6 +138,53 @@ impl World {
         }
     }
 
+    fn load_stations(&mut self, text: &str) {
+        let mut csv = Csv::new(text);
+        while let Some(row) = csv.next_row() {
+            if row.get("category") != Some("station") || row.get("object_id") != Some("6") {
+                continue;
+            }
+            let f = |k: &str| row.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+            if let (Some(loc), Some(model)) = (
+                row.get("loc_id").and_then(|v| v.parse::<u16>().ok()),
+                row.get("type").and_then(|v| v.parse::<u16>().ok()),
+            ) {
+                let st = Station {
+                    model,
+                    pos: [f("x"), f("y"), f("z")],
+                    fwd: [f("fwd_x"), f("fwd_y"), f("fwd_z")],
+                    up: [f("up_x"), f("up_y"), f("up_z")],
+                };
+                self.stations.insert(loc, st);
+            }
+        }
+    }
+
+    fn load_station_points(&mut self, text: &str) {
+        let mut csv = Csv::new(text);
+        while let Some(row) = csv.next_row() {
+            let v = |p: &str| {
+                let f = |a: &str| row.get(&format!("{p}_{a}")).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                [f("x"), f("y"), f("z")]
+            };
+            if let Some(model) = row.get("model").and_then(|v| v.parse::<u16>().ok()) {
+                let sp = StationPoints {
+                    dock_start: v("dock_start"),
+                    dock_end: v("dock_end"),
+                    guides: [v("guide0"), v("guide1"), v("guide2"), v("guide3")],
+                    launch: v("launch"),
+                };
+                self.station_points.insert(model, sp);
+            }
+        }
+    }
+
+    /// The station in `loc` and its model's points, if both are known.
+    pub fn station(&self, loc: u16) -> Option<(&Station, &StationPoints)> {
+        let st = self.stations.get(&loc)?;
+        Some((st, self.station_points.get(&st.model)?))
+    }
+
     fn load_hulls(&mut self, text: &str) {
         let mut csv = Csv::new(text);
         while let Some(row) = csv.next_row() {
@@ -78,7 +193,18 @@ impl World {
                 (row.get("type").and_then(|v| v.parse().ok()), f("mass"), f("drag"), f("armour"))
             {
                 let name = row.get("name").unwrap_or("?").to_string();
-                self.hulls.insert(id, Hull { type_id: id, name, mass, drag, armour });
+                let hull = Hull {
+                    type_id: id,
+                    name,
+                    mass,
+                    drag,
+                    armour,
+                    pitch: f("pitch").unwrap_or(0.001),
+                    yaw: f("yaw").unwrap_or(0.001),
+                    roll: f("roll").unwrap_or(0.001),
+                    engines: row.get("engines").and_then(|v| v.parse().ok()).unwrap_or(1),
+                };
+                self.hulls.insert(id, hull);
             }
         }
     }
@@ -178,6 +304,22 @@ mod tests {
         assert_eq!(w.gate(118, 2), Some(GateLink { dest_loc: 241, dest_gate: 2 }));
         assert_eq!(w.gate(241, 3), Some(GateLink { dest_loc: 249, dest_gate: 3 }));
         assert_eq!(w.gates.len(), 2);
+    }
+
+    /// Quantar Core: station model 323 at (−23.37, 0, 0), identity orientation.
+    /// Its launch point must land where the captured launch did in x and y
+    /// (jgcap2: (−537.7, 155.3, −1461.1)).
+    #[test]
+    fn real_extract_station_points() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"));
+        let w = World::load(dir).unwrap();
+        let (st, sp) = w.station(107).expect("Quantar Core station");
+        assert_eq!(st.model, 323);
+        let l = st.to_world(sp.launch);
+        assert!((l[0] - -537.7).abs() < 1.0 && (l[1] - 155.3).abs() < 1.0, "{l:?}");
+        let storm = w.hull(90).unwrap();
+        assert_eq!((storm.name.as_str(), storm.engines), ("Storm", 2));
+        assert_eq!(w.engine_thrust[0], 758000.0);
     }
 
     /// The real extract: the flown route from the capture must resolve.

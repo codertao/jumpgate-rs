@@ -6,3 +6,6 @@ Cargo.lock
 *.bin
 *.pcap
 *.log
+# Pilot snapshots (password hashes, player state).
+accounts.json
+accounts.json.tmp

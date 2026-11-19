@@ -2,6 +2,7 @@
 //! `notes/message-types.md`, the 2026-11-10 capture and the client handlers
 //! named below. Anything marked [inferred] still needs live confirmation.
 
+use crate::character::{Character, Fittings, ITEM_SLOTS};
 use crate::ship::{ShipView, Vec3};
 use raknet::game;
 
@@ -418,6 +419,283 @@ fn put_cstr(dst: &mut [u8], s: &str) {
     dst[n] = 0;
 }
 
+// ---- client side (agents): C→S builders, S→C parsers ----
+
+/// C→S 0x05 login (33 B): callsign\0 @1, password\0 after it, version @0x16.
+/// The server must never log this message.
+pub const LOGIN_LEN: usize = 33;
+pub const CLIENT_VERSION: &str = "2.0127";
+
+pub fn login(callsign: &str, password: &str) -> Vec<u8> {
+    let mut m = vec![0u8; LOGIN_LEN];
+    m[0] = 0x05;
+    let cs = &callsign.as_bytes()[..callsign.len().min(CALLSIGN_MAX)];
+    m[1..1 + cs.len()].copy_from_slice(cs);
+    let p = 1 + cs.len() + 1;
+    let room = LOGIN_VERSION_OFF.saturating_sub(p + 1);
+    let pw = &password.as_bytes()[..password.len().min(room)];
+    m[p..p + pw.len()].copy_from_slice(pw);
+    let v = CLIENT_VERSION.as_bytes();
+    m[LOGIN_VERSION_OFF..LOGIN_VERSION_OFF + v.len()].copy_from_slice(v);
+    m
+}
+
+/// C→S 0x07 launch/dock/jump (12 B).
+pub fn travel(action: u8, from_loc: u16, arg: u32, pid: u32) -> Vec<u8> {
+    let mut m = vec![0x07, action];
+    m.extend_from_slice(&from_loc.to_le_bytes());
+    m.extend_from_slice(&arg.to_le_bytes());
+    m.extend_from_slice(&pid.to_le_bytes());
+    m
+}
+
+pub const KEEPALIVE: [u8; 1] = [0x8f];
+
+/// What a client needs from the 0x06 character record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CharSummary {
+    pub pid: u32,
+    pub loc: u16,
+    pub faction: u8,
+    pub ship_type: u8,
+    pub credits: u64,
+    pub fittings: [u8; Fittings::LEN],
+}
+
+pub fn parse_char_record(m: &[u8]) -> Option<CharSummary> {
+    if m.len() < CHAR_LEN || m[0] != 0x06 {
+        return None;
+    }
+    let mut fittings = [0u8; Fittings::LEN];
+    fittings.copy_from_slice(&m[CHAR_FIT_OFF..CHAR_FIT_OFF + Fittings::LEN]);
+    Some(CharSummary {
+        pid: u32_at(m, CHAR_PID_OFF),
+        loc: u16_at(m, CHAR_LOC_OFF),
+        faction: m[CHAR_FACTION_OFF],
+        ship_type: m[CHAR_SHIP_OFF],
+        credits: u64::from_le_bytes(m[CHAR_CREDITS_OFF..CHAR_CREDITS_OFF + 8].try_into().unwrap()),
+        fittings,
+    })
+}
+
+/// S→C 0x08 as a client reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocationChange {
+    /// Contact slot to appear at: gate 1–4, 6 = station launch point, 0xcc = docked.
+    pub sub: u8,
+    pub loc: u16,
+    /// Space server to use; None = "none" (docked: drop space).
+    pub space_ip: Option<String>,
+}
+
+pub fn parse_location_change(m: &[u8]) -> Option<LocationChange> {
+    if m.len() < LOCCHG_LEN || m[0] != 0x08 {
+        return None;
+    }
+    let off = game::space_ip_offset(0x08)?;
+    let space_ip = if game::is_space_ip_none(m, off) {
+        None
+    } else {
+        game::read_wstr(m, off, game::SPACE_IP_FIELD_BYTES).filter(|s| !s.is_empty())
+    };
+    Some(LocationChange { sub: m[1], loc: u16_at(m, LOCCHG_LOC_OFF), space_ip })
+}
+
+/// C→S 0x0F cargo report (392 B, sender `0x439f16`): `[0f][u8 flag][cc cc]`,
+/// then 48 item-list slots @4 and the u32 player id @0x184. A client sends one with
+/// flag 0 just before docking.
+pub const CARGO_REPORT_LEN: usize = 392;
+
+pub fn cargo_report(c: &Character, pid: u32, flag: u8) -> Vec<u8> {
+    let mut m = vec![0xcc; CARGO_REPORT_LEN];
+    m[0] = 0x0f;
+    m[1] = flag;
+    put_items(&mut m, 4, c);
+    put_u32(&mut m, 0x184, pid);
+    m
+}
+
+/// C→S 0x17 companion report (10 B, state conn, 1:1 with each 0x05). The nine
+/// bytes after the type aren't decoded [inferred: compact heading/input];
+/// the server only uses it as a heartbeat (answers 0x42 + 0xB3).
+pub fn companion_report() -> Vec<u8> {
+    let mut m = vec![0u8; 10];
+    m[0] = 0x17;
+    m
+}
+
+// ---- economy ----
+
+/// C→S 0x09 market command: `[09][cmd][u16 loc][u32 index @4][u32 pid @8][f32 qty @12]`.
+pub struct MarketCmd {
+    pub cmd: u8,
+    pub index: u32,
+    pub qty: f32,
+}
+
+pub fn parse_market_cmd(m: &[u8]) -> Option<MarketCmd> {
+    (m.len() >= 16 && m[0] == 0x09).then(|| MarketCmd {
+        cmd: m[1],
+        index: u32_at(m, 4),
+        qty: f32::from_le_bytes(m[12..16].try_into().unwrap()),
+    })
+}
+
+/// 0x09 sell: index = slot in the 0x45 item list.
+pub const CMD_SELL: u8 = 0x08;
+
+/// Item category bought by a 0x09 buy sub-op (message-types "Station market").
+pub fn buy_category(cmd: u8) -> Option<u8> {
+    match cmd {
+        0x04 => Some(0),
+        0x05 => Some(1),
+        0x07 => Some(3),
+        0x0a..=0x10 => Some(5 + (cmd - 0x0a)),
+        _ => None,
+    }
+}
+
+/// Listing reply type and entry count per category.
+pub fn listing_for_category(cat: u8) -> Option<(u8, usize)> {
+    match cat {
+        0 => Some((0x0a, 60)),
+        1 => Some((0x0b, 24)),
+        3 => Some((0x0d, 99)),
+        5 => Some((0x50, 27)),
+        6 => Some((0x51, 27)),
+        7 => Some((0x52, 20)),
+        8 => Some((0x53, 8)),
+        9 => Some((0x54, 25)),
+        10 => Some((0x55, 21)),
+        11 => Some((0x56, 70)),
+        _ => None,
+    }
+}
+
+/// Category asked for by a 0x09 listing command.
+pub fn listing_category(cmd: u8) -> Option<u8> {
+    match cmd {
+        0x00 => Some(0),
+        0x01 => Some(1),
+        0x03 => Some(3),
+        0x5a..=0x60 => Some(5 + (cmd - 0x5a)),
+        _ => None,
+    }
+}
+
+/// Market listing (896 B): `[type][3 pad]` + N × (u32 stock, u32 price), and N
+/// flag bytes at 0x31C (1 = no 2% surcharge; the commodity handler zeroes them).
+pub const LISTING_FLAGS_OFF: usize = 0x31c;
+
+pub fn listing(cat: u8, stock: u32, price: u32) -> Option<Vec<u8>> {
+    let (ty, n) = listing_for_category(cat)?;
+    let mut m = vec![0u8; LISTING_LEN];
+    m[0] = ty;
+    for i in 0..n {
+        put_u32(&mut m, 4 + 8 * i, stock);
+        put_u32(&mut m, 8 + 8 * i, price);
+        m[LISTING_FLAGS_OFF + i] = 1;
+    }
+    Some(m)
+}
+
+/// C→S 0x66 fitting change: `[66][u8 item-list slot][u8 category][u8 ship slot][u8 op]`.
+pub const FIT_UNFIT: u8 = 0;
+pub const FIT_FIT: u8 = 1;
+pub const FIT_MISSILE_FIRED: u8 = 2;
+
+pub struct FitChange {
+    pub list_slot: u8,
+    pub cat: u8,
+    pub ship_slot: u8,
+    pub op: u8,
+}
+
+pub fn parse_fit_change(m: &[u8]) -> Option<FitChange> {
+    (m.len() >= 5 && m[0] == 0x66).then(|| FitChange { list_slot: m[1], cat: m[2], ship_slot: m[3], op: m[4] })
+}
+
+/// C→S 0x08 change ship (8 B, docked): `[08][u8 ship type][2 junk][u32 pid]`.
+pub fn parse_change_ship(m: &[u8]) -> Option<u8> {
+    (m.len() >= 2 && m[0] == 0x08).then(|| m[1])
+}
+
+/// S→C 0x45 credits and item list (400 B): `[45][7 pad][u64 credits @8]` +
+/// 48 × `[cat][idx][cc cc][f32 qty]` @0x10.
+pub const CREDITS_ITEMS_LEN: usize = 400;
+
+fn put_items(m: &mut [u8], off: usize, c: &Character) {
+    for (k, it) in c.item_slots().iter().enumerate() {
+        let o = off + 8 * k;
+        if it.is_empty() {
+            m[o..o + 8].copy_from_slice(&[0xfe, 0xfe, 0xcc, 0xcc, 0, 0, 0, 0]);
+        } else {
+            m[o..o + 4].copy_from_slice(&[it.cat, it.idx, 0xcc, 0xcc]);
+            put_f32(m, o + 4, it.qty);
+        }
+    }
+}
+
+pub fn credits_items(c: &Character) -> Vec<u8> {
+    let mut m = vec![0xcc; CREDITS_ITEMS_LEN];
+    m[0] = 0x45;
+    m[8..16].copy_from_slice(&c.credits.to_le_bytes());
+    put_items(&mut m, 0x10, c);
+    m
+}
+
+/// S→C 0x92 experience total (8 B).
+pub fn experience(exp: u32) -> Vec<u8> {
+    let mut m = vec![0x92, 0xcc, 0xcc, 0xcc];
+    m.extend_from_slice(&exp.to_le_bytes());
+    m
+}
+
+// 0x06 fields decoded from the handler `0x9d205f` [static 2026-11-19].
+pub const CHAR_FACTION_OFF: usize = 1;
+pub const CHAR_RANK_OFF: usize = 2;
+pub const CHAR_SHIP_OFF: usize = 0x42;
+pub const CHAR_PRICE_FACTOR_OFF: usize = 0x52; // i16; market factor 1 + v/10000
+pub const CHAR_EXP_OFF: usize = 0x5c;
+pub const CHAR_CREDITS_OFF: usize = 0x68;
+pub const CHAR_FIT_OFF: usize = 0x70;
+pub const CHAR_SHIPNAME_OFF: usize = 0x8f;
+pub const CHAR_ITEMS_OFF: usize = 0x9c;
+
+/// Build the 0x06 for `c`. Bytes not modelled are taken from `template` (a
+/// captured record) when given, else from constants seen in the captures.
+pub fn char_record(template: Option<&[u8]>, c: &Character, pid: u32, loc: u16) -> Vec<u8> {
+    let mut m = match template {
+        Some(t) if t.len() == CHAR_LEN && t[0] == 0x06 => t.to_vec(),
+        _ => {
+            let mut m = vec![0xcc; CHAR_LEN];
+            m[0] = 0x06;
+            m[0x0e..0x14].copy_from_slice(&[0x04, 0x00, 0x7d, 0x05, 0x0d, 0x00]);
+            m[0x22..0x24].fill(0);
+            m[0x43..0x4f].copy_from_slice(&[0xfe, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            m[0x56..0x68].fill(0);
+            put_f32(&mut m, 0x60, 1.0);
+            m[0x6c..0x70].fill(0);
+            m[0x21c..0x220].fill(0);
+            m
+        }
+    };
+    patch_char_record(&mut m, &c.callsign, pid, loc);
+    m[CHAR_FACTION_OFF] = c.faction;
+    m[CHAR_RANK_OFF] = c.rank;
+    m[CHAR_SHIP_OFF] = c.ship_type;
+    put_u16(&mut m, CHAR_PRICE_FACTOR_OFF, 0);
+    put_u32(&mut m, CHAR_EXP_OFF, c.experience);
+    m[CHAR_CREDITS_OFF..CHAR_CREDITS_OFF + 8].copy_from_slice(&c.credits.to_le_bytes());
+    m[CHAR_FIT_OFF..CHAR_FIT_OFF + Fittings::LEN].copy_from_slice(&c.fittings.to_bytes());
+    let name = &mut m[CHAR_SHIPNAME_OFF..CHAR_ITEMS_OFF];
+    name.fill(0xcc);
+    put_cstr(name, "My Ship");
+    put_items(&mut m, CHAR_ITEMS_OFF, c);
+    debug_assert_eq!(CHAR_ITEMS_OFF + 8 * ITEM_SLOTS, 0x21c);
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,4 +838,69 @@ mod tests {
         // Same slot field as 0x05 @0x9c, so the two must agree.
         assert_eq!(f1(&m, 0x2c), f32s(&ship_report(&s, 1, 0.0), 0x9c)[0]);
     }
+
+    #[test]
+    fn login_builder_round_trips() {
+        let m = login("agent01", "pw");
+        assert_eq!(m.len(), LOGIN_LEN);
+        let l = parse_login(&m).unwrap();
+        assert_eq!((l.callsign.as_str(), l.password.as_slice(), l.version.as_str()), ("agent01", &b"pw"[..], "2.0127"));
+    }
+
+    fn pilot() -> Character {
+        let mut c = Character {
+            callsign: "Newbie".into(),
+            faction: 3,
+            rank: 0,
+            ship_type: 90,
+            fittings: Fittings::default(),
+            items: Vec::new(),
+            credits: 200_000,
+            experience: 12,
+        };
+        c.fittings.engine = 0;
+        c.add_item(3, 37, 2.5);
+        c
+    }
+
+    #[test]
+    fn char_record_fields() {
+        let c = pilot();
+        let m = char_record(None, &c, 1001, 7);
+        assert_eq!(m.len(), CHAR_LEN);
+        let s = parse_char_record(&m).unwrap();
+        assert_eq!((s.pid, s.loc, s.faction, s.ship_type, s.credits), (1001, 7, 3, 90, 200_000));
+        assert_eq!(s.fittings[24], 0);
+        assert_eq!(&m[3..10], b"Newbie\0");
+        assert_eq!(u32_at(&m, CHAR_EXP_OFF), 12);
+        assert_eq!(&m[CHAR_ITEMS_OFF..CHAR_ITEMS_OFF + 4], &[3, 37, 0xcc, 0xcc]);
+        assert_eq!(&m[CHAR_SHIPNAME_OFF..CHAR_SHIPNAME_OFF + 8], b"My Ship\0");
+        assert_eq!((m[0x44], m[CHAR_MODE_OFF]), (1, 0), "as captured; mode 0 = no space connect");
+        // 0x45 carries the same list.
+        let ci = credits_items(&c);
+        assert_eq!(ci.len(), CREDITS_ITEMS_LEN);
+        assert_eq!(&ci[0x10..0x14], &[3, 37, 0xcc, 0xcc]);
+        assert_eq!(&ci[0x18..0x1a], &[0xfe, 0xfe]);
+    }
+
+    #[test]
+    fn listings_and_commands() {
+        let m = listing(3, 99, 99).unwrap();
+        assert_eq!((m[0], m.len(), u32_at(&m, 4), u32_at(&m, 8 + 8 * 98), m[LISTING_FLAGS_OFF + 98]), (0x0d, 896, 99, 99, 1));
+        assert_eq!(m[LISTING_FLAGS_OFF + 99], 0);
+        for cmd in [0x00, 0x01, 0x03, 0x5a, 0x60] {
+            let cat = listing_category(cmd).unwrap();
+            assert_eq!(listing_for_category(cat).map(|l| l.0), listing_for_command(cmd));
+        }
+        assert_eq!((buy_category(0x07), buy_category(0x0a), buy_category(0x10), buy_category(0x08)), (Some(3), Some(5), Some(11), None));
+    }
+
+    #[test]
+    fn location_change_round_trips() {
+        let m = location_change(None, 6, 107, SpaceTarget::Ip("127.0.0.1"));
+        assert_eq!(parse_location_change(&m), Some(LocationChange { sub: 6, loc: 107, space_ip: Some("127.0.0.1".into()) }));
+        let m = location_change(None, 0xcc, 7, SpaceTarget::None);
+        assert_eq!(parse_location_change(&m).unwrap().space_ip, None);
+    }
 }
+

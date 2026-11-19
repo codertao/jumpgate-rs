@@ -59,7 +59,7 @@ jg_tables.py  Jumpgate.exe [outdir]
     Needs objdump. Build-specific (checks SHA-256). See items.md, physics.md 5.
 
 jg_functions.py — function inventory / naming coverage
-  python3 tools/jg_functions.py ../Jumpgate.exe        (from notes/; ~5 s)
+  python3 tools/jg_functions.py ../../Jumpgate.exe        (from notes/; ~5 s)
   Reads function_names.csv (hand-curated: addr,name,area,confidence,ref),
   enumerates ~3,360 functions (call targets + pointer-table starts), auto-adds
   the 30 region-init functions and the 86 game-dispatcher cases, and writes

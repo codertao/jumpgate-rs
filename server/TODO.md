@@ -1,15 +1,17 @@
 # jumpgate-server TODO
 
-Parked 2026-11-18 while we explore the client further. `notes/server.md` holds
+Parked 2026-11-18 while we explore the client further. `docs/server.md` holds
 the design and the request → response table. `notes/message-types.md` holds the
 wire layouts. Tags: [bin] = static from the client, [cap] = seen in a capture,
 [inferred] = needs confirming.
 
 ## Before anyone else connects
 
-- [ ] **Accounts.** Today any password is accepted and dropped. Store argon2id
-      (or bcrypt) salted hashes, never log the password, and warn players not to
-      reuse one. Gate the `!` dev commands behind GM rights once accounts exist.
+- [x] **Accounts** (2026-11-19). argon2id hashes, password never logged,
+      reuse warning for new pilots, auto-provisioning (server.md "Accounts
+      and economy").
+- [ ] Gate the `!` dev commands behind GM rights (an account flag).
+- [ ] Check what the stock client shows for a refused login.
 - [ ] **Server identity.** Make sure the MOTD (0x81) and the login text say
       clearly that this is the preservation server, not tri.
 - [ ] **Live test pass with the real client.** Cover what's still untested:
@@ -52,10 +54,11 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
 
 ## Economy
 
-- [ ] Station listings (0x09) from the extracts, with the server's own stock and
-      prices instead of the captured table. Prices are a design question.
-- [ ] Buy/sell applied to a per-player 0x45 (credits + items), 0x92 experience,
-      and 0x4B contracts (trade and mining).
+- [x] Listings, buy/sell, fitting (0x66) and ship change (0x08) on the account,
+      flat 99/99 (2026-11-19). Not yet tried with the real client.
+- [ ] Real per-station stock and prices (design), stock depletion.
+- [ ] Check the starter Storm loadout in the client's fitting screen.
+- [ ] 0x4B contracts (trade and mining); award experience (0x92).
 - [ ] Ore sale prices must follow the client's mineral-composition formula
       (`compute_ore_prices` 0x449690; message-types "Station market").
 - [ ] **Don't trust cargo reports.** C→S 0x0F cargo and 0x74 mining amounts are
@@ -82,19 +85,21 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
 
 ## Persistence
 
-- [ ] Player state (ship, cargo, credits, location, experience) saved across
-      logins. Today everything is per process.
+- [x] Player state (ship, fittings, items, credits, exp, loc, last base) in
+      `accounts.json`, snapshot once a minute and on logout (2026-11-19).
 - [ ] World state (asteroid levels, building sites, veins) saved too, if it is
       meant to evolve.
 
-## NPCs (see CLAUDE.md "Design facts" and server.md "NPCs")
+## NPCs (see docs/agents.md)
 
-- [ ] Choose the mix, which is open and the user's call: (a) server-simulated
-      ships presented as remote players, (b) stock client-owned bots via
-      0x70/0x71/0x2C, or a hybrid.
-- [ ] Behaviours beyond `Orbit`: traders on gate routes, miners, patrols,
-      pirates. Keep updates physics-consistent (physics.md) so dead reckoning
-      stays smooth.
+- [x] Direction chosen 2026-11-19: NPCs are client-impersonating agents
+      (`jumpgate-agent`), decoupled from the server. First behaviour: station
+      patrol + dock.
+- [ ] Live check with the real client: agents visible, smooth, removed on dock.
+- [ ] Agent roadmap: weapons and combat, collisions, gate travel, traders,
+      miners, pirates (agents.md "Next").
+- [ ] Remove the in-server `npc/` + `feed.rs` sim (now behind `--npcs`) once
+      agents cover it.
 - [ ] Interest management in `feed.rs`: the 190 remote-slot budget (10–199) is
       shared by players, bots and missiles.
 - [ ] `!ai` (dev spawn via 0x70) and the 0x71 botloc relay are in but untested
@@ -119,4 +124,4 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
       `--templates` to become optional and then go away.
 - [ ] Grow the request table from the `--verbose` "unhandled … first seen"
       log lines.
-- [ ] Keep `notes/server.md` in sync as items close.
+- [ ] Keep `docs/server.md` in sync as items close.

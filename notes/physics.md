@@ -486,6 +486,28 @@ axis; four guide segments at `+0x834 + k*0x20`):
   (3.3 for player stations, whose thresholds are 1250 / 1761 within a 1500
   range).
 
+**Station points extract** [static + capture check, 2026-11-19]. The dock
+and launch points are float immediates in the same model loaders as the
+collision volumes. `tools/jg_tables.py` tracks register immediates
+(`mov`/`xor`), maps a register to a model through `mov reg, ds:[0x14ff690 +
+id·4]`, and collects stores to `+0x7f4..+0x8bc`. It writes
+**`extracts/station_points.csv`**: 24 station models, each with `dock_start`
+(`+0x7f4`), `dock_end` (`+0x814`), `guide0..3` (`+0x834 + 0x20k`) and `launch`
+(`+0x8b4`), in model space. Components that are never stored are written as 0
+[inferred: the object is zeroed beforehand]. Placement: the sector's contact
+slot 6 (station row, `object_id` 6, in `sector_objects_all.csv`). World point =
+pos + x·right + y·up + z·fwd, with right = up × fwd. Checks against the captures:
+- Quantar Core (107, model 323, station at (−23.37, 0, 0), identity
+  orientation): launch → (−537.7, 155.3, −1570.4). The captured launch was at
+  (−537.7, 155.3, −1461.1): x and y match, and z is 109 units further in
+  (spawned between guide0 and the launch point, or pushed back along the
+  guide). The last report before docking, (−23.0, 146.8, 10.5), is 59 units
+  past `dock_end` (−20.2, 143.5, −48.5) on the tube axis. So "within 60
+  along the axis" is measured from `dock_end`, and ships come in from outside
+  along `dock_start → dock_end`.
+- Quantar Depot (118, model 380): the captured launch y (611.3) equals the
+  model's guide y.
+
 **Service beam `0x40cb50`** (refuel / repair / rearm / transaction pads, models
 `0x157..0x177`): it freezes the ship (v = 0, sticks = 0) and shows "Hold
 position to complete transaction". The transaction packet `0x79` goes out.
@@ -683,17 +705,10 @@ not traced here.
 
    To run modified textures or models, the matching table sum has to change.
    It is not a server matter: the startup check runs before any connection.
-   **Re-seal** (chosen 2026-11-18): `tools/jg_reseal.py <install dir>` writes
-   `Jumpgate_mod.exe`, a copy whose table sums match the files on disk. It
-   changes only the 8-byte sum fields and leaves the check code active, so
-   untouched assets are still verified. The original exe is never modified.
-   Live state 2026-11-18: ast1–5.bmp swapped for the 128×128 8-bit versions,
-   5 entries re-sealed, and `jg_integrity.py --exe Jumpgate_mod.exe` reports 0
-   failures. The client run itself is not yet confirmed. Use the modded copy
-   with our server only. The alternative, an early return
-   (`31 C0 C3` at file offsets 0x7130/0x7190/0x71f0), would disable the check
-   entirely and was not used. Nothing else reads the table or checksums the
-   exe's code.
+   (A patch is to return early, `31 C0 C3` at file offsets 0x7130/0x7190/0x71f0,
+   which disables the check; nothing else reads the table or checksums the
+   exe's code. Our approach to modded assets: ../docs/client-mods.md.)
+
 6. **Loadout seal** [static, 2026-11-19]. `0x9cb650` loadout_seal sums the
    fitted-item id bytes into `0xba79c0` (a plain byte sum, not the shifted
    one):

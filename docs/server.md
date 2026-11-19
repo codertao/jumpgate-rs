@@ -1,5 +1,8 @@
 # jumpgate-server — the reactive fan server
 
+> Bare references to classic-game notes (message-types, physics.md, ai.md,
+> slash-commands.md, `extracts/`, …) mean the files in `../notes/`.
+
 Crate `server/` (binary `jumpgate-server`), started 2026-11-17. It replaces the
 open-loop `jumpgate-proxy replay` with a server that answers each client
 request. Scope is as in CLAUDE.md: our own server, players opt in through
@@ -14,8 +17,14 @@ SERVER_IP=<server host> Jumpgate.exe
 Options: `--listen ip`, `--advertise ip` (the address put in 0x08 space
 redirects; defaults to `--listen`, else 127.0.0.1), `--state-port 5150`,
 `--space-port 5151` (the client always uses 5151 for space, so change it only
-for tests), `--home-station 18`, `--verbose` (types and hex prefixes; the login
-is never printed).
+for tests), `--home-station 7` (where new pilots are provisioned),
+`--accounts accounts.json` (pilot snapshot, gitignored), `--npcs` (the old
+in-server demo NPC, now off by default), `--verbose` (types and hex prefixes;
+the login is never printed).
+
+Shared code lives in the `common` crate (`jumpgate-common`): wire layouts
+(`proto.rs`), the pilot model (`character.rs`), `ship.rs` and the extract
+loader (`world.rs`). The server and `jumpgate-agent` (agents.md) both use it.
 
 ## Layout
 
@@ -23,9 +32,10 @@ is never printed).
 |---|---|
 | `net.rs` | One UDP socket per port, one RakNet `Endpoint::server()` per peer address, 60 s idle timeout |
 | `game.rs` | Session state and handlers. Pure: `(conn, peer, msg) → Vec<Out>`, so it's unit-tested without sockets |
-| `proto.rs` | Layouts the server reads/writes: login, 0x07, 0x05 report, 0x06 patcher, 0x08/0x81/0x04/0x61 builders |
+| `accounts.rs` | Pilot accounts: argon2id hash + `Character` + loc/last base, JSON snapshot |
 | `templates.rs` | Captured S→C messages used as response bodies until each has a builder |
-| `world.rs` | Static world from `notes/extracts/` (`--data`, default the workspace copy): location names, gate graph |
+| `common/proto.rs` | Layouts both sides read/write: login, 0x07, 0x05 report, 0x06 builder, 0x08/0x45/0x92/listings/0x81/0x04/0x61 |
+| `common/world.rs` | Static world from `notes/extracts/` (`--data`, default the workspace copy): names, gates, hulls, stations, station points, engines |
 
 ## Templates (temporary)
 
@@ -67,18 +77,23 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 
 | C→S | conn | Server does | Source |
 |---|---|---|---|
-| 0x05 (33 B) login | state | new player id; 0x06 (template, patched callsign/loc/pid, space IP cleared), 0x8c, our 0x81, 0x18 | capture |
-| 0x09 cmd | state | the listing for that cmd (template, else zero table 896 B) | capture order |
+| 0x05 (33 B) login | state | verify or provision the account (see "Accounts"); new player id; **built 0x06** from the account, docked at its last base; 0x8c, our 0x81, 0x18; a password-reuse warning (0x04) for new pilots. Wrong password: one 0x04 line, no session | capture + built |
+| 0x09 listing cmd | state | built listing: every entry stock 99, price 99, flag 1 (no surcharge) | built |
+| 0x09 buy (04/05/07/0a–10) | state | docked, index in range, 0 < qty ≤ stock, credits ≥ ⌈99·qty⌉, free slot → add to item list, charge; always answers 0x45 | built |
+| 0x09 sell (08) | state | index = item-list slot; +⌊99·qty⌋; 0x45 | built |
+| 0x66 fitting | state | op 0 unfit (ship slot → list slot), op 1 fit, op 2 missile fired (rack emptied, no reply); 0x45 | built |
+| 0x08 change ship | state | docked, known hull, 99 credits → set ship type, anything still fitted goes to the item list; 0x45 + 0x06 | built |
 | 0xc1 | state | 0xc2 | capture |
 | 0x65 | state | 0x65 ack | capture |
 | 0x04 chat | state | relayed verbatim to every other player [inferred] | — |
 | 0x63 / 0xc3 / 0x8a | state | 0x62 / 3×0x14 / weather: docked 0x87, in space 0x73+0x87 (0x73 is the captured Depot asteroid bitmap; build per sector, see message-types "Asteroid ore levels"), plus 0x61 beacon only in sectors 201–999 | capture, pairing [inferred] |
 | 0x91 / 0x4b | state | 0x91+2×0x76 / 0x4b | capture |
 | 0x17 | state | 0x42 + 0xb3 | capture |
-| 0x07 launch | state | loc = station+100; 0x06, 0x78, **0x08 → our IP**, dest sector | capture |
+| 0x07 launch | state | loc = station+100 (saved to the account); 0x06, 0x78, **0x08 → our IP**, dest sector | capture |
 | 0x07 jump | state | gate = arg + 1 → extract link → 0x78, 0x08 (our IP, dest loc, sub = arrival gate). Built, no template | extract; byte-identical to captured jumps |
-| 0x07 dock | state | loc = sector−100; 0x45, 0x92, 0xba (pid patched), 0x4b, 0x06, 0x8c, **0x08 "none"** | capture |
-| 0xc8 | state | logout | — |
+| 0x07 dock | state | loc = sector−100, saved as the account's last base; built 0x45 and 0x92, 0xba (pid patched), 0x4b, 0x06, 0x8c, **0x08 "none"** | capture + built |
+| 0xc8 | state | logout; snapshot saved | — |
+| 0x0F cargo report | state | ignored (never trust it for credit; TODO.md) | — |
 | 0x8f | both | 0x8f on the same connection (the client's dispatcher ignores it, `0x9d3006`). **The answer on the space connection is required**: the client sends one per connection every ~16 s, and when the space ones went unanswered it dropped space ("Disconnected from space server") about 55–65 s after connecting [capture 2026-11-19; the timeout constant isn't located in the binary yet] | capture |
 | 0x05 (176 B) report | space | stored and relayed to sector-mates as S→C 0x05 (handler `0x9cf7c8` creates/updates that ship). Newcomers are sent everyone's last report | static |
 | 0x33 / 0x34 | space | relayed to sector-mates if the id field is the sender's | static |
@@ -102,14 +117,12 @@ background.
 
 - Live test with the real client (unit, capture-flow and UDP login tests pass;
   the real client hasn't run against it yet).
-- Accounts: any password is accepted and dropped. Add salted slow hashes
-  (argon2/bcrypt) before anyone else connects.
 - Sector content: 0x73 and 0x78 are captured copies replayed in every
   sector. 0x58 (mineral vein) and 0xA7 (station list) aren't sent at all yet. (0x87 is universe-wide particle
   clouds, so one list for everyone is correct. The server could own the cloud
   list and drift it: see message-types "Particle clouds".)
-- NPCs: first server-simulated ship done (see "NPCs" below). Next: roles and a
-  population, interest management within the slot budget.
+- NPCs: now separate client processes (agents.md). The in-server demo NPC
+  (below) is kept behind `--npcs` for comparison.
 - Reconnects: the client drops its space connection on dock and opens a new one
   from the **same UDP port** on the next launch. The listener therefore treats an
   offline `[0A 00]` from a connected peer as a new session: it drops the old
@@ -128,13 +141,10 @@ background.
   `SendGameMessage` (`0x9c9c10`), which passes channel 0 and reliability 1 or 3
   [bin]. Live-confirmed 2026-11-18: NPC motion stays smooth with 0x33 sent
   sequenced, so the client accepts server-sent sequenced packets.
-- Economy (from jgcap2, 2026-11-18; see message-types "Station market"): the
-  listings, buy/sell (0x09), credits and item list (0x45), experience (0x92) and
-  contracts (0x4B) are now decoded well enough to build. The server could
-  answer listings from the extracts with its own stock and prices instead of
-  the captured template, apply buys and sells to a per-player 0x45, and offer
-  contracts. Prices are a design question: the captured ones are a reference
-  only.
+- Economy: listings, buy/sell, fitting and ship changes are built (flat
+  99/99, 2026-11-19; "Accounts and economy" below). Still to design: real
+  stock and prices per station, and contracts (0x4B). The captured prices are
+  a reference only.
   Ore sale prices must follow the client's mineral-composition formula
   (message-types "Station market"), and mined amounts arrive in C→S 0x0F
   cargo reports, which the client controls: cap them by mining time and
@@ -144,7 +154,45 @@ background.
   the stock-bot path (approach b in CLAUDE.md), seen working in solo play.
 - Unhandled types are logged once each. Use `--verbose` sessions to grow the table.
 
+## Accounts and economy  [2026-11-19; unit-tested, not yet tried with the real client]
+
+`accounts.rs`. One account per callsign, case-insensitive.
+- **Password:** only an argon2id PHC string (random salt, default parameters)
+  is stored. The login message's password is hashed (new account) or verified,
+  then dropped. It is never logged, and `--verbose` doesn't print the login.
+  A wrong password gets a single 0x04 "Wrong password" line addressed by a
+  one-shot id (`REJECTED_BASE`), and no session. What the stock client shows
+  for that is untested (it probably waits at the login screen).
+- **Provisioning** on the first login of an unknown callsign: Quantar
+  (faction 3), docked at Quantar-Core Station (7; `--home-station`), a Storm
+  (type 90), 200,000 credits, 0 exp, and a starter loadout of engine 0,
+  powerplant 0, radar 1, shield 1 and capacitor 0. That loadout is picked to fit
+  a Storm's size-1 mounts and the power budget; it's unchecked in the client's
+  fitting screen. New pilots also get a chat line saying not to reuse a
+  password, since the game sends it in cleartext.
+- **State kept:** callsign, faction, rank, ship type, fittings (30 bytes as in
+  0x06 @0x70), 48 item slots, credits, exp, current loc, last base. Logins
+  start docked at the last base. Launch, jump and dock update `loc`, and dock
+  sets `last_base`.
+- **Snapshot:** `--accounts` (default `accounts.json`, gitignored). Written at
+  most once a minute when something changed, and on every logout, via a temp
+  file and a rename.
+- **One session per account:** a second login with the same callsign drops
+  the first session.
+- **Messages built from the account:** 0x06 (`proto::char_record`; bytes we
+  don't model come from the captured template when one is loaded, else from
+  captured constants), 0x45, 0x92, and the listings. See message-types "0x06
+  character record".
+- **Economy rules:** every listing shows stock 99 and price 99 (`Config::price`
+  / `stock`). Buying more than 99 or more than you can afford is refused, with
+  a reason in chat; every buy and sell answers with the current 0x45. Stock
+  isn't depleted. Ship changes cost 99. Item indices are the listing entry
+  numbers, as in the 0x45 item list.
+
 ## NPCs  [2026-11-17, first ship; live-tested with the real client]
+
+> Superseded 2026-11-19 by client-side agents (agents.md). This in-server sim
+> now runs only with `--npcs`.
 
 Layers, each knowing only the one below it:
 
@@ -163,7 +211,7 @@ Layers, each knowing only the one below it:
   bound, and has sent a 0x05 from this sector, so the client has arrived) and
   maps sim ids to wire pids `0x4000_0000 + id`.
 - `main.rs`: ticks the sim and calls `present_ships` at 5 Hz with a monotonic
-  clock (seconds since start). `--no-npcs` turns it off.
+  clock (seconds since start). Off unless `--npcs`.
 
 Demo: one Chinook (type 104) "Hauler" circling Quantar Depot station (sector
 118) at radius 2500, y 400, 80 u/s.

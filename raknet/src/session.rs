@@ -13,7 +13,7 @@
 //! from ack timing. A reliable packet unacked for `ACK_TIMEOUT` marks the
 //! connection lost. On receive, RELIABLE_ORDERED packets are held until the
 //! gap before them fills, and stale sequenced packets are dropped, per channel.
-//! Still missing (notes/differences-from-samp-raknet.md §3): split packets
+//! Still missing (docs/raknet.md): split packets
 //! (messages stay under the MTU).
 
 use crate::crypto::DataBlockEncryptor;

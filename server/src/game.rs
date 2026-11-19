@@ -5,13 +5,15 @@
 //!
 //! Request → response pairs are from the 2026-11-10 capture
 //! (`notes/captures/`). Responses we can't build yet come from [`Templates`],
-//! patched with this player's fields. Each is marked in `notes/server.md`.
+//! patched with this player's fields. Each is marked in `docs/server.md`.
 
+use crate::accounts::{Accounts, LoginResult};
 use crate::feed::Feed;
 use crate::proto::{self, SpaceTarget, ACT_DOCK, ACT_JUMP, ACT_LAUNCH};
 use crate::ship::ShipView;
 use crate::templates::Templates;
 use crate::world::World;
+use jumpgate_common::character::Character;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 
@@ -20,6 +22,8 @@ pub type PlayerId = u32;
 /// Wire ids for server-driven ships start here, clear of player ids (1000+).
 /// The client only needs them unique among ships in its sector.
 pub const SHIP_PID_BASE: u32 = 0x4000_0000;
+/// One-shot ids for replies to refused logins (see `Server::rejected`).
+pub const REJECTED_BASE: u32 = 0x7000_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Conn {
@@ -38,8 +42,12 @@ pub struct Out {
 pub struct Config {
     /// IPv4 address written into 0x08 so the client's space connection comes here.
     pub advertise: String,
-    /// Station a new pilot starts docked at (18 = Quantar Depot station).
+    /// Station a new pilot is provisioned at (7 = Quantar-Core Station).
+    /// Returning pilots start at their account's last base.
     pub home_station: u16,
+    /// Flat market price and stock for every item (no economy yet).
+    pub price: u32,
+    pub stock: u32,
     pub motd: (String, String),
 }
 
@@ -47,7 +55,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             advertise: "127.0.0.1".into(),
-            home_station: 18,
+            home_station: crate::accounts::START_BASE,
+            price: 99,
+            stock: 99,
             motd: (
                 "Welcome to a Jumpgate preservation server.".into(),
                 "This is a fan-run test server, not jumpgate-tri.org.".into(),
@@ -72,6 +82,8 @@ pub struct Server {
     pub tpl: Templates,
     pub world: World,
     pub players: BTreeMap<PlayerId, Player>,
+    /// Persistent pilots, keyed by callsign. `Player::callsign` is the key.
+    pub accounts: Accounts,
     by_state: HashMap<SocketAddr, PlayerId>,
     by_space: HashMap<SocketAddr, PlayerId>,
     next_id: PlayerId,
@@ -86,6 +98,9 @@ pub struct Server {
     feed: Feed,
     /// Next spawn# for `!ai` (the bot id in botloc and 0x44).
     next_spawn: u16,
+    /// Refused logins awaiting their reply: one-shot id → state address.
+    /// Cleared by `tick`, after the network loop has sent the replies.
+    rejected: HashMap<PlayerId, SocketAddr>,
     pub log: Vec<String>,
 }
 
@@ -112,6 +127,7 @@ impl Server {
             tpl,
             world,
             players: BTreeMap::new(),
+            accounts: Accounts::in_memory(),
             by_state: HashMap::new(),
             by_space: HashMap::new(),
             next_id: 1000,
@@ -121,6 +137,7 @@ impl Server {
             seen_in_sector: HashSet::new(),
             feed: Feed::new(),
             next_spawn: 0,
+            rejected: HashMap::new(),
             log: Vec::new(),
         }
     }
@@ -248,6 +265,8 @@ impl Server {
             (Conn::State, 0x4b) => self.reply_tpl(pid, &[0x4b]),
             (Conn::State, 0x17) => self.reply_tpl(pid, &[0x42, 0xb3]),
             (Conn::State, 0x07) => self.travel(pid, msg),
+            (Conn::State, 0x66) => self.fitting(pid, msg),
+            (Conn::State, 0x08) => self.change_ship(pid, msg),
             (Conn::State, 0xc8) => self.logout(pid),
             (Conn::State, 0x0e) | (Conn::State, 0x0f) | (Conn::State, 0x74) | (Conn::State, 0x75) => {
                 Vec::new() // consumables / building / asteroid: no reply seen
@@ -299,20 +318,40 @@ impl Server {
             self.note(format!("malformed login from {addr}"));
             return Vec::new();
         };
-        // No accounts yet: any password is accepted and immediately dropped.
-        // When accounts land, check a salted slow hash here (CLAUDE.md).
+        // The password is only hashed (new account) or verified, then dropped.
+        // Never log it (CLAUDE.md "Credentials").
+        let result = self.accounts.login(&login.callsign, &login.password, self.cfg.home_station);
         drop(login.password);
+        if let LoginResult::WrongPassword = result {
+            self.note(format!("login {} from {addr}: wrong password", login.callsign));
+            // No player exists: address the reply by a one-shot id.
+            let to = REJECTED_BASE + (self.rejected.len() as u32);
+            self.rejected.insert(to, addr);
+            let text = "Wrong password for that callsign.";
+            return vec![Out { to, conn: Conn::State, msg: proto::system_chat(0, "Server", text) }];
+        }
         if let Some(old) = self.by_state.get(&addr).copied() {
             self.logout(old);
         }
+        // One session per account: a new login replaces the old one.
+        let key = login.callsign.to_ascii_lowercase();
+        if let Some(old) = self.players.values().find(|p| p.callsign.to_ascii_lowercase() == key).map(|p| p.id) {
+            self.note(format!("{} logged in again; dropping session {old}", login.callsign));
+            self.logout(old);
+        }
+        let acct = self.accounts.get(&login.callsign).expect("account exists after login");
+        let callsign = acct.pilot.callsign.clone();
+        let loc = acct.last_base;
         let pid = self.next_id;
         self.next_id += 1;
-        let loc = self.cfg.home_station;
+        if let Some(a) = self.accounts.get_mut(&callsign) {
+            a.loc = loc;
+        }
         self.players.insert(
             pid,
             Player {
                 id: pid,
-                callsign: login.callsign.clone(),
+                callsign: callsign.clone(),
                 loc,
                 docked: true,
                 state_addr: addr,
@@ -321,9 +360,11 @@ impl Server {
             },
         );
         self.by_state.insert(addr, pid);
+        let new = matches!(result, LoginResult::Provisioned);
         self.note(format!(
-            "login {} → player {pid} at station {loc} (client {})",
-            login.callsign, login.version
+            "login {callsign} → player {pid} at station {loc} (client {}){}",
+            login.version,
+            if new { ", new account" } else { "" }
         ));
 
         let mut out = vec![self.char_record(pid)];
@@ -331,38 +372,177 @@ impl Server {
         let (a, b) = self.cfg.motd.clone();
         out.push(Out { to: pid, conn: Conn::State, msg: proto::motd(&a, &b) });
         out.extend(self.reply_tpl(pid, &[0x18]));
+        if new {
+            let text = "New pilot created. This server stores only a salted hash of your password, \
+                        but the game sends it unencrypted: don't reuse a password from anywhere else.";
+            out.push(Out { to: pid, conn: Conn::State, msg: proto::system_chat(loc, "Server", text) });
+        }
         out
     }
 
+    /// The pilot behind a session (every logged-in player has one).
+    fn pilot(&self, pid: PlayerId) -> &Character {
+        &self.accounts.get(&self.players[&pid].callsign).expect("account").pilot
+    }
+
+    fn pilot_mut(&mut self, pid: PlayerId) -> &mut Character {
+        let cs = &self.players[&pid].callsign;
+        &mut self.accounts.get_mut(cs).expect("account").pilot
+    }
+
+    /// Record where a player is, and their last base when docked.
+    fn set_account_loc(&mut self, pid: PlayerId, loc: u16, docked: bool) {
+        let cs = self.players[&pid].callsign.clone();
+        if let Some(a) = self.accounts.get_mut(&cs) {
+            a.loc = loc;
+            if docked {
+                a.last_base = loc;
+            }
+        }
+    }
+
     fn char_record(&self, pid: PlayerId) -> Out {
-        let p = &self.players[&pid];
-        let mut rec = self
-            .tpl
-            .first(0x06)
-            .map(|t| t.to_vec())
-            .unwrap_or_else(|| proto::empty_table(0x06, proto::CHAR_LEN));
-        proto::patch_char_record(&mut rec, &p.callsign, pid, p.loc);
+        let loc = self.players[&pid].loc;
+        let rec = proto::char_record(self.tpl.first(0x06), self.pilot(pid), pid, loc);
         Out { to: pid, conn: Conn::State, msg: rec }
     }
 
+    fn credits_items(&self, pid: PlayerId) -> Out {
+        Out { to: pid, conn: Conn::State, msg: proto::credits_items(self.pilot(pid)) }
+    }
+
+    fn experience(&self, pid: PlayerId) -> Out {
+        Out { to: pid, conn: Conn::State, msg: proto::experience(self.pilot(pid).experience) }
+    }
+
+    fn tell(&self, pid: PlayerId, text: &str) -> Out {
+        Out { to: pid, conn: Conn::State, msg: proto::system_chat(self.players[&pid].loc, "Server", text) }
+    }
+
+    /// Periodic work: the account snapshot (once a minute when changed).
+    pub fn tick(&mut self, now: std::time::Instant) {
+        self.rejected.clear();
+        if let Err(e) = self.accounts.save_if_due(now) {
+            self.note(format!("account snapshot failed: {e}"));
+        }
+    }
+
+    /// 0x09 station market: listings (flat price/stock), buy and sell. Buys
+    /// and sells answer with the updated 0x45.
     fn command(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
         let cmd = msg.get(1).copied().unwrap_or(0xff);
-        match proto::listing_for_command(cmd) {
-            Some(ty) => {
-                let m = self
-                    .tpl
-                    .first(ty)
-                    .map(|t| t.to_vec())
-                    .unwrap_or_else(|| proto::empty_table(ty, proto::LISTING_LEN));
-                vec![Out { to: pid, conn: Conn::State, msg: m }]
-            }
-            None => {
-                if self.unhandled_cmds.insert(cmd) {
-                    self.note(format!("0x09 command 0x{cmd:02x} not handled yet"));
+        if let Some(cat) = proto::listing_category(cmd) {
+            let m = proto::listing(cat, self.cfg.stock, self.cfg.price).expect("listing category");
+            return vec![Out { to: pid, conn: Conn::State, msg: m }];
+        }
+        let Some(mc) = proto::parse_market_cmd(msg) else { return Vec::new() };
+        if let Some(cat) = proto::buy_category(cmd) {
+            return self.buy(pid, cat, mc.index, mc.qty);
+        }
+        if cmd == proto::CMD_SELL {
+            return self.sell(pid, mc.index as usize, mc.qty);
+        }
+        if self.unhandled_cmds.insert(cmd) {
+            self.note(format!("0x09 command 0x{cmd:02x} not handled yet"));
+        }
+        Vec::new()
+    }
+
+    fn valid_qty(&self, qty: f32) -> bool {
+        qty.is_finite() && qty > 0.0 && qty <= self.cfg.stock as f32
+    }
+
+    fn cost(&self, qty: f32) -> u64 {
+        (qty * self.cfg.price as f32).ceil() as u64
+    }
+
+    fn buy(&mut self, pid: PlayerId, cat: u8, index: u32, qty: f32) -> Vec<Out> {
+        let in_range = proto::listing_for_category(cat).is_some_and(|(_, n)| (index as usize) < n);
+        if !self.players[&pid].docked || !in_range || !self.valid_qty(qty) {
+            self.note(format!("player {pid}: bad buy cat {cat} #{index} ×{qty}"));
+            return vec![self.credits_items(pid)];
+        }
+        let cost = self.cost(qty);
+        let c = self.pilot_mut(pid);
+        if c.credits < cost {
+            let out = self.tell(pid, &format!("You need {cost} credits for that."));
+            return vec![out, self.credits_items(pid)];
+        }
+        if !c.add_item(cat, index as u8, qty) {
+            let out = self.tell(pid, "Your hold has no free slot.");
+            return vec![out, self.credits_items(pid)];
+        }
+        c.credits -= cost;
+        self.note(format!("player {pid} bought cat {cat} #{index} ×{qty} for {cost}"));
+        vec![self.credits_items(pid)]
+    }
+
+    fn sell(&mut self, pid: PlayerId, slot: usize, qty: f32) -> Vec<Out> {
+        if !self.players[&pid].docked || !self.valid_qty(qty) {
+            return vec![self.credits_items(pid)];
+        }
+        let price = self.cfg.price as f32;
+        let c = self.pilot_mut(pid);
+        if let Some((item, took)) = c.take_item(slot, qty) {
+            let gain = (took * price).floor() as u64;
+            c.credits += gain;
+            self.note(format!("player {pid} sold cat {} #{} ×{took} for {gain}", item.cat, item.idx));
+        }
+        vec![self.credits_items(pid)]
+    }
+
+    /// C→S 0x66 fitting change. Op 2 (missile fired, in space) uses up the
+    /// rack's missile [inferred: the rack empties; partial racks not modelled].
+    fn fitting(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        let Some(f) = proto::parse_fit_change(msg) else { return Vec::new() };
+        let c = self.pilot_mut(pid);
+        let ok = match f.op {
+            proto::FIT_UNFIT => c.unfit(f.list_slot as usize, f.cat, f.ship_slot),
+            proto::FIT_FIT => c.fit(f.list_slot as usize, f.cat, f.ship_slot),
+            proto::FIT_MISSILE_FIRED => {
+                if let Some(s) = c.fittings.slot_mut(f.cat, f.ship_slot) {
+                    *s = jumpgate_common::character::EMPTY;
                 }
-                Vec::new()
+                return Vec::new();
+            }
+            _ => false,
+        };
+        if !ok {
+            self.note(format!(
+                "player {pid}: fitting op {} slot {} cat {} ship slot {} refused",
+                f.op, f.list_slot, f.cat, f.ship_slot
+            ));
+        }
+        vec![self.credits_items(pid)]
+    }
+
+    /// C→S 0x08 change ship (docked). The client unfits everything first; any
+    /// equipment still fitted goes back to the item list.
+    fn change_ship(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        let Some(ty) = proto::parse_change_ship(msg) else { return Vec::new() };
+        if !self.players[&pid].docked || self.world.hull(ty as u16).is_none() && !self.world.hulls.is_empty() {
+            self.note(format!("player {pid}: ship change to {ty} refused"));
+            return vec![self.credits_items(pid), self.char_record(pid)];
+        }
+        let cost = self.cfg.price as u64;
+        let c = self.pilot_mut(pid);
+        if c.credits < cost {
+            let out = self.tell(pid, &format!("You need {cost} credits for that ship."));
+            return vec![out, self.credits_items(pid), self.char_record(pid)];
+        }
+        c.credits -= cost;
+        let fitted = c.fittings.to_bytes();
+        // Category of each fittings byte (layout in `Fittings::to_bytes`).
+        let cats = [0u8; 8].into_iter().chain([1; 8]).chain([11; 8]).chain([5, 6, 7, 8, 9, 10]);
+        for (cat, idx) in cats.zip(fitted) {
+            if idx != jumpgate_common::character::EMPTY {
+                c.add_item(cat, idx, 1.0);
             }
         }
+        c.fittings = Default::default();
+        c.ship_type = ty;
+        self.note(format!("player {pid} changed ship to {ty}"));
+        vec![self.credits_items(pid), self.char_record(pid)]
     }
 
     /// Relay a player's chat line to every other logged-in player. [inferred:
@@ -411,6 +591,7 @@ impl Server {
                     p.docked = false;
                     p.loc = sector;
                 }
+                self.set_account_loc(pid, sector, false);
                 self.note(format!("player {pid} launch {cur} → sector {sector}"));
                 out.push(self.char_record(pid));
                 out.extend(self.reply_tpl(pid, &[0x78]));
@@ -459,8 +640,10 @@ impl Server {
                     p.loc = station;
                     p.last_report = None;
                 }
+                self.set_account_loc(pid, station, true);
                 self.note(format!("player {pid} dock {cur} → station {station}"));
-                out.extend(self.reply_tpl(pid, &[0x45, 0x92]));
+                out.push(self.credits_items(pid));
+                out.push(self.experience(pid));
                 if let Some(t) = self.tpl.first(0xba) {
                     let mut m = t.to_vec();
                     if m.len() >= 8 {
@@ -489,6 +672,7 @@ impl Server {
         let advertise = self.cfg.advertise.clone();
         let mut out = self.despawn(pid);
         self.players.get_mut(&pid).unwrap().loc = dest;
+        self.set_account_loc(pid, dest, false);
         out.extend(self.reply_tpl(pid, &[0x78]));
         // sub = arrival slot: the client spawns the ship at that contact slot.
         let m = proto::location_change(None, sub, dest, SpaceTarget::Ip(&advertise));
@@ -715,6 +899,9 @@ impl Server {
                 self.by_space.remove(&a);
             }
             self.note(format!("logout {} ({pid})", p.callsign));
+            if let Err(e) = self.accounts.save_now() {
+                self.note(format!("account snapshot failed: {e}"));
+            }
         }
         out
     }
@@ -752,7 +939,7 @@ impl Server {
     }
 
     pub fn state_addr(&self, pid: PlayerId) -> Option<SocketAddr> {
-        self.players.get(&pid).map(|p| p.state_addr)
+        self.players.get(&pid).map(|p| p.state_addr).or_else(|| self.rejected.get(&pid).copied())
     }
     pub fn space_addr(&self, pid: PlayerId) -> Option<SocketAddr> {
         self.players.get(&pid).and_then(|p| p.space_addr)
@@ -799,13 +986,16 @@ mod tests {
         w
     }
 
+    /// Tests start new pilots at Quantar Depot (18 → sector 118), where the
+    /// capture was taken.
     fn server() -> Server {
-        Server::new(Config::default(), Templates::default(), test_world())
+        Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), test_world())
     }
 
     /// Log in and launch; returns the player id.
     fn into_space(s: &mut Server, state: &str, space: &str) -> PlayerId {
-        let out = s.handle(Conn::State, addr(state), &login_msg("pilot"));
+        let cs = format!("pilot{}", s.players.len());
+        let out = s.handle(Conn::State, addr(state), &login_msg(&cs));
         let pid = out[0].to;
         s.handle(Conn::State, addr(state), &travel(proto::ACT_LAUNCH, 18, 0, pid));
         s.space_connected(addr(space));
@@ -916,7 +1106,7 @@ mod tests {
             return;
         };
         let world = World::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"))).unwrap();
-        let mut s = Server::new(Config::default(), Templates::from_capture_bytes(&bytes), world);
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::from_capture_bytes(&bytes), world);
         let st = addr("10.0.0.5:4000");
         let mut all = s.handle(Conn::State, st, &login_msg("pilot"));
         let pid = all[0].to;
@@ -1032,7 +1222,7 @@ mod tests {
 
     #[test]
     fn goto_moves_a_player_in_space_and_is_not_relayed() {
-        let mut s = Server::new(Config::default(), Templates::default(), goto_world());
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
         let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
         let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
         let st = addr("10.0.0.1:1000");
@@ -1055,7 +1245,7 @@ mod tests {
 
     #[test]
     fn goto_errors_are_private_messages() {
-        let mut s = Server::new(Config::default(), Templates::default(), goto_world());
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
         let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
         let st = addr("10.0.0.1:1000");
         for bad in ["!goto", "!goto nowhere", "!goto quantar core", "!goto 241 4", "!goto 18", "!bogus"] {
@@ -1074,7 +1264,7 @@ mod tests {
     fn ai_spawns_a_bot_for_the_caller() {
         let mut w = goto_world();
         w.factions.insert(118, 3);
-        let mut s = Server::new(Config::default(), Templates::default(), w);
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), w);
         let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
         let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
         let st = addr("10.0.0.1:1000");
@@ -1109,7 +1299,7 @@ mod tests {
 
     #[test]
     fn botloc_is_relayed_to_the_sector_from_its_controller_only() {
-        let mut s = Server::new(Config::default(), Templates::default(), goto_world());
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
         let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
         let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
         let sp = addr("10.0.0.1:2000");
@@ -1160,4 +1350,111 @@ mod tests {
         assert!(s.disconnected(Conn::Space, new).is_empty());
         assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2002")));
     }
+
+    fn login_pw(cs: &str, pw: &str) -> Vec<u8> {
+        proto::login(cs, pw)
+    }
+
+    fn market(cmd: u8, index: u32, pid: PlayerId, qty: f32) -> Vec<u8> {
+        let mut m = vec![0x09, cmd, 7, 0];
+        m.extend_from_slice(&index.to_le_bytes());
+        m.extend_from_slice(&pid.to_le_bytes());
+        m.extend_from_slice(&qty.to_le_bytes());
+        m
+    }
+
+    fn credits_of(out: &[Out]) -> u64 {
+        let m = &out.iter().rev().find(|o| o.msg[0] == 0x45).expect("0x45").msg;
+        u64::from_le_bytes(m[8..16].try_into().unwrap())
+    }
+
+    #[test]
+    fn new_pilot_is_provisioned_at_quantar_core_in_a_storm() {
+        let mut s = Server::new(Config::default(), Templates::default(), test_world());
+        let out = s.handle(Conn::State, addr("10.0.0.5:4000"), &login_pw("Newbie", "pw"));
+        let c = proto::parse_char_record(&out[0].msg).unwrap();
+        assert_eq!((c.loc, c.faction, c.ship_type, c.credits), (7, 3, 90, 200_000));
+        assert_eq!(c.fittings[24], 0, "starter engine fitted");
+        assert!(out.iter().any(|o| o.msg[0] == 0x04), "password-reuse warning");
+    }
+
+    #[test]
+    fn wrong_password_is_refused_without_a_session() {
+        let mut s = server();
+        let st = addr("10.0.0.5:4000");
+        let pid = s.handle(Conn::State, st, &login_pw("Pilot", "right"))[0].to;
+        s.handle(Conn::State, st, &[0xc8]); // logout
+        assert!(s.players.is_empty());
+        let other = addr("10.0.0.9:4000");
+        let out = s.handle(Conn::State, other, &login_pw("pilot", "wrong"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].msg[0], 0x04);
+        assert!(s.players.is_empty());
+        assert_eq!(s.state_addr(out[0].to), Some(other), "reply reaches the refused peer");
+        s.tick(std::time::Instant::now());
+        assert_eq!(s.state_addr(out[0].to), None);
+        let again = s.handle(Conn::State, st, &login_pw("PILOT", "right"));
+        assert_eq!(again[0].msg[0], 0x06);
+        assert_ne!(again[0].to, pid, "a fresh session id");
+    }
+
+    #[test]
+    fn buy_sell_fit_and_change_ship() {
+        let mut s = server();
+        let st = addr("10.0.0.5:4000");
+        let pid = s.handle(Conn::State, st, &login_pw("Trader", "pw"))[0].to;
+        // Listings: flat 99/99.
+        let out = s.handle(Conn::State, st, &market(0x03, 0, pid, 0.0));
+        assert_eq!((out[0].msg[0], proto::u32_at(&out[0].msg, 4), proto::u32_at(&out[0].msg, 8)), (0x0d, 99, 99));
+        // Buy 10 of commodity #37: 990 credits.
+        let out = s.handle(Conn::State, st, &market(0x07, 37, pid, 10.0));
+        assert_eq!(credits_of(&out), 200_000 - 990);
+        assert_eq!(&out[0].msg[0x10..0x12], &[3, 37]);
+        // Sell 4 back from slot 0.
+        let out = s.handle(Conn::State, st, &market(proto::CMD_SELL, 0, pid, 4.0));
+        assert_eq!(credits_of(&out), 200_000 - 990 + 396);
+        assert_eq!(s.pilot(pid).items[0].qty, 6.0);
+        // A full stock of 99 guns #2.
+        let out = s.handle(Conn::State, st, &market(0x04, 2, pid, 99.0));
+        assert_eq!(credits_of(&out), 200_000 - 990 + 396 - 99 * 99);
+        // Buy a gun and fit it in gun slot 0.
+        s.handle(Conn::State, st, &market(0x04, 5, pid, 1.0));
+        let slot = s.pilot(pid).items.iter().position(|i| i.cat == 0 && i.idx == 5).unwrap() as u8;
+        // More than the stock, or more than we can afford: refused.
+        let c0 = s.pilot(pid).credits;
+        assert_eq!(credits_of(&s.handle(Conn::State, st, &market(0x04, 5, pid, 100.0))), c0);
+        s.pilot_mut(pid).credits = 50;
+        let out = s.handle(Conn::State, st, &market(0x04, 5, pid, 1.0));
+        assert_eq!(credits_of(&out), 50);
+        assert!(out.iter().any(|o| o.msg[0] == 0x04), "told why");
+        s.pilot_mut(pid).credits = c0;
+        s.handle(Conn::State, st, &[0x66, slot, 0, 0, proto::FIT_FIT]);
+        assert_eq!(s.pilot(pid).fittings.guns[0], 5);
+        // Change ship: anything still fitted goes back to the list.
+        let before = s.pilot(pid).credits;
+        let out = s.handle(Conn::State, st, &[0x08, 91, 2, 0, 0, 0, 0, 0]);
+        let c = proto::parse_char_record(&out.iter().find(|o| o.msg[0] == 0x06).unwrap().msg).unwrap();
+        assert_eq!((c.ship_type, c.credits), (91, before - 99));
+        assert!(c.fittings.iter().all(|&b| b == 0xfe));
+        assert!(s.pilot(pid).items.iter().any(|i| i.cat == 0 && i.idx == 5 && i.qty == 1.0));
+        assert!(s.pilot(pid).items.iter().any(|i| i.cat == 5 && i.idx == 0), "starter engine kept");
+    }
+
+    #[test]
+    fn relogin_starts_at_last_base() {
+        let mut s = server();
+        s.world.gates.insert((241, 1), crate::world::GateLink { dest_loc: 117, dest_gate: 1 });
+        let st = addr("10.0.0.5:4000");
+        let pid = s.handle(Conn::State, st, &login_pw("Roamer", "pw"))[0].to;
+        s.handle(Conn::State, st, &travel(ACT_LAUNCH, 18, 0, pid));
+        s.handle(Conn::State, st, &travel(ACT_JUMP, 118, 1, pid));
+        s.handle(Conn::State, st, &travel(ACT_JUMP, 241, 0, pid));
+        s.handle(Conn::State, st, &travel(ACT_DOCK, 117, 0, pid));
+        s.handle(Conn::State, st, &[0xc8]);
+        let a = s.accounts.get("roamer").unwrap();
+        assert_eq!((a.loc, a.last_base), (17, 17));
+        let out = s.handle(Conn::State, st, &login_pw("Roamer", "pw"));
+        assert_eq!(proto::parse_char_record(&out[0].msg).unwrap().loc, 17);
+    }
 }
+

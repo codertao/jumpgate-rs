@@ -9,23 +9,27 @@
 //!
 //! Usage:
 //!   jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip]
-//!                   [--state-port 5150] [--space-port 5151] [--home-station 18]
-//!                   [--no-npcs] [--verbose]
+//!                   [--state-port 5150] [--space-port 5151] [--home-station 7]
+//!                   [--accounts accounts.json] [--npcs] [--verbose]
 //!
 //! `--data` is the extracts directory (default: the workspace's `notes/extracts`):
 //! locations and the gate graph.
 //! `--templates` points at a local capture whose server→client messages are
 //! used for responses not yet built from scratch (see templates.rs). Without
 //! one, those responses are skipped and the client will likely stall at login.
+//! `--accounts` is the pilot snapshot (default `accounts.json` in the working
+//! directory; keep it out of git). It holds only argon2id password hashes.
+//! `--npcs` turns on the old in-server demo NPC; NPCs are now separate
+//! `jumpgate-agent` processes that log in like players.
 
+mod accounts;
 mod feed;
 mod game;
 mod net;
 mod npc;
-mod proto;
-mod ship;
 mod templates;
-mod world;
+
+use jumpgate_common::{proto, ship, world};
 
 use game::{Config, Conn, Server};
 use npc::{NpcSim, Orbit};
@@ -38,7 +42,7 @@ use world::World;
 fn usage() -> ! {
     eprintln!(
         "usage: jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip] \
-         [--state-port 5150] [--space-port 5151] [--home-station 18] [--no-npcs] [--verbose]"
+         [--state-port 5150] [--space-port 5151] [--home-station 7] [--accounts accounts.json] [--npcs] [--verbose]"
     );
     std::process::exit(2);
 }
@@ -53,7 +57,8 @@ fn main() {
     let mut space_port = 5151u16;
     let mut cfg = Config::default();
     let mut verbose = false;
-    let mut npcs_on = true;
+    let mut npcs_on = false;
+    let mut accounts_path = String::from("accounts.json");
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -64,7 +69,9 @@ fn main() {
             "--state-port" => state_port = val().parse().unwrap_or_else(|_| usage()),
             "--space-port" => space_port = val().parse().unwrap_or_else(|_| usage()),
             "--home-station" => cfg.home_station = val().parse().unwrap_or_else(|_| usage()),
+            "--npcs" => npcs_on = true,
             "--no-npcs" => npcs_on = false,
+            "--accounts" => accounts_path = val(),
             "--verbose" | "-v" => verbose = true,
             _ => usage(),
         }
@@ -108,6 +115,11 @@ fn main() {
         spawn_demo_npcs(&mut sim, &world);
     }
     let mut server = Server::new(cfg, tpl, world);
+    server.accounts = accounts::Accounts::open(accounts_path.clone().into()).unwrap_or_else(|e| {
+        eprintln!("[server] can't load accounts {accounts_path}: {e}");
+        std::process::exit(1)
+    });
+    eprintln!("[server] {} accounts from {accounts_path}", server.accounts.len());
     let mut state = Listener::bind("state", SocketAddr::new(listen, state_port)).unwrap_or_else(|e| {
         eprintln!("bind state: {e}");
         std::process::exit(1)
@@ -175,6 +187,7 @@ fn main() {
         }
         state.flush();
         space.flush();
+        server.tick(Instant::now());
         std::thread::sleep(Duration::from_millis(5));
     }
 }

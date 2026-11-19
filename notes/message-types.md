@@ -54,7 +54,7 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 
 | Type | Len | Name / meaning | Layout |
 |---|---|---|---|
-| 0x06 | 544 | Character / ship record (handler `0x9d205f`) | `[06][03][1e]` + callsign`\0` @3 … **space-server address @0x22** (UTF-16, same rule as 0x08, acted on only if **mode @0x45 == 1**) … **u16 loc @0x50**, **u32 player id @0x54** (→ `0xbe5da0`) … "My Ship" + 8-byte cargo/equip slots (`fe fe` = empty slot). [static + capture, 2026-11-17] |
+| 0x06 | 544 | Character / ship record (handler `0x9d205f`) | Full field map in **"0x06 character record"** below. `[06][faction][rank]` + callsign`\0` @3 … **space-server address @0x22** (UTF-16, same rule as 0x08, acted on only if **mode @0x45 == 1**) … ship type @0x42 … **u16 loc @0x50**, **u32 player id @0x54** (→ `0xbe5da0`) … exp @0x5c, credits @0x68, fittings @0x70, "My Ship" @0x8f, 48 item slots @0x9c. [static + capture, 2026-11-17/19] |
 | 0x81 | ~850 | Message of the day | `[81]` + ASCII ("Welcome back! ...") |
 | 0xFE | 321 | **Memory patch** | `[FE]` then records `[01][u32 addr][u16 len][bytes]`. In capture: only award/medal name strings. See network-protocol.md §3. |
 | 0x0A/0x0B/0x0D, 0x50–0x56 | 896 | **Station market, one category per message** | `[type][3 pad]` + N × `(u32 stock, u32 price)` + N flag bytes at +0x31C. Entry i = item i of that category. See "Station market" below. [static + capture jgcap2, 2026-11-18] |
@@ -154,7 +154,7 @@ Client → server in space (also see reversing-map "Weapon hits & damage": C→S
 | 0x71 | 52 | **Bot (conflux) state report "botloc"** — sent by the bot's controlling client | `[71][state][hull%][shield%][b][b][u16 id]…[u16 loc]` + i16 vel/orientation + `u32 player` + f32 pos. One per bot this client controls, after every 0x05; empty when you control none (so all-zero in the solo capture). See reversing-map "Conflux / bot AI". |
 | 0x2C | 12 | "bxr" bot handoff request | sent when I'm closer to a bot than its current controller |
 | 0x74 | 16 | **Mining report** (sender in `0x43b1b0` @`0x43d525`, every ≥10 s while mining) | `[74][junk][u16 asteroid id @2][u16 loc @4][2 junk][f32 ore mined since last report @8][u32 player_id @0x0c]`. Bytes 1 and 6–7 are uninitialised stack. The amount is the accumulator `0xbe5e10`, reset after each send. See "Asteroid ore levels" [static + capture jgcap2] |
-| 0x0F | 392 | **Cargo report** (sender `0x439f16`; named "building" in the error strings) | `[0f][u8 flag][2 bytes uninitialised][48 × 8-byte item-list slots @4, copied from 0xff7d2c][u32 player_id @0x184]`. Sent every ~10 s while the mined-amount accumulator `0xbe5e10` is non-zero (it's reset after each send), and once just before docking. flag was 1 during mining and 0 in the final pre-dock report. **The client reports its own mined ore**: the server accepted these amounts (0x45 echoed them), so ore is client-authoritative unless our server checks it. [static + capture jgcap2] |
+| 0x0F | 392 | **Cargo report** (sender `0x439f16`; named "building" in the error strings) | `[0f][u8 flag][2 bytes uninitialised][48 × 8-byte item-list slots @4, copied from 0xff7d2c][u32 player_id @0x184]`. Sent every ~10 s while the mined-amount accumulator `0xbe5e10` is non-zero (it's reset after each send), and once just before docking. flag was 1 during mining and 0 in the final pre-dock report. **The client reports its own mined ore**: the classic server accepted these amounts (0x45 echoed them), so ore is client-authoritative unless the server checks it. [static + capture jgcap2] |
 | 0x44 | 16 | **Bot destroyed** ("who killed me", sent by the bot's controlling client) | `[44][u8][u16 bot spawn#][u32 killer pid][u32 reporter pid][4 zero]`. The server answered with "Received 3000 credits and 320 experience" (3300/350 for the second), "<callsign> destroyed a member of the Conflux", 0x92, 0x45. [capture jgcap2] |
 | 0x32 | 40 | **Missile** create/remove | `[32][u8 missile id][u16 type @2]` (missile index, e.g. 7 = Purgatory; **0xfa = removed**, the same value as a 0x05 ship removal) … `u32 owner pid @0x14`, `@0x18`, `f32×3 position @0x1c`. One create and one remove per missile fired. [capture jgcap2] |
 | 0x4F | 20 | **Artifact pickup** ("teleportPacket", sender `0x43c8a9`) | `[4f][3 junk][u32 player_id @4][f32 own position ×3 @8]`. Sent after 4 s of InSight beam on an artifact with a Displacer or Burglar fitted. No artifact id. See "Mineral vein and artifact". [static 2026-11-19, never captured] |
@@ -219,6 +219,40 @@ timer in `0x9ce1c0..0x9ce2f6`; all three types go on the **space** connection.
   orientation `0xff2ab8..cc`, **velocity** `0xff2ad0..d8` (copied from the
   velocity cells), position `0xff2aac..b4`,
   clock `0xff2aa0`.
+
+### 0x06 character record  [static 2026-11-19, handler `0x9d205f`]
+
+544 bytes. The handler copies each field into the client's own-pilot globals
+and finishes with loadout_seal (`0x9cb650`), so a loadout sent by the server is
+accepted as legitimate.
+
+| off | type | field |
+|---|---|---|
+| @0 | u8 | 0x06 |
+| @1 | u8 | faction: 1 Solrain, 2 Octavius, 3 Quantar (→ `0xbe5b0e`) |
+| @2 | u8 | rank |
+| @3 | char[11] | callsign, NUL-terminated |
+| @0x0e | 5 B | → `0xff2a8d` (capture `04 00 7d 05 0d`, the same bytes as 0x05 report @0x3e) [unknown] |
+| @0x13 | | squad name |
+| @0x22 | wchar[16] | space-server address (only used when mode @0x45 == 1) |
+| @0x42 | u8 | ship type (capture 0x5b; Storm = 90) |
+| @0x43, @0x44 | u8 | [unknown] (capture `fe`, `01`) |
+| @0x45 | u8 | mode: 1 = connect to the address @0x22 |
+| @0x50 | u16 | location |
+| @0x52 | i16 | market price factor: 1 + v/10000 (see "Station market") |
+| @0x54 | u32 | player id |
+| @0x58 | u32 | [unknown] |
+| @0x5c | u32 | experience |
+| @0x60 | f32 | [unknown] |
+| @0x68 | u64 | credits |
+| @0x70..0x77 | u8 ×8 | gun slots (gun index, 0xfe = empty) |
+| @0x78..0x7f | u8 ×8 | missile racks |
+| @0x80..0x87 | u8 ×8 | devices |
+| @0x88..0x8d | u8 ×6 | engine, powerplant, radar, ECM, shield, capacitor (index within the category) |
+| @0x8e | u8 | [unknown] |
+| @0x8f | char[13] | ship name ("My Ship") |
+| @0x9c | 48 × 8 | item list, same slots as 0x45: `[cat][idx][cc cc][f32 qty]`, `fe fe` = empty |
+| @0x21c | u32 | [unknown] |
 
 ### Station market (C→S 0x09 ↔ listings)  [static + capture jgcap2, 2026-11-18]
 
@@ -288,8 +322,8 @@ Each category has a listing request, a reply type, an item count, and a buy sub-
   contract, +76,475) and Radioactive Metals came out ~6% and ~8% above the
   formula. That's unexplained, perhaps a server-side bonus. The same handler
   sets the prices of entries 150–159 (X-artifacts, Recon Relay, …) to 0.
-  A server must use the same formula when buying ore, or the
-  client will show one price and pay another.
+  The client always displays this formula's price, so a server that pays
+  anything else shows one price and pays another.
 
 ### Building sites (S→C 0x78)  [static + capture, 2026-11-18]
 
@@ -350,12 +384,6 @@ player/faction production economy. Its server side is unknown: what the
 buildings do (stock a station's market? need inputs?) isn't visible from the
 client.
 
-**For the server:** build 0x78 per destination sector from a per-sector site
-table (default all zero), not the captured template. The current template (the
-first capture's Quantar Depot SDS entry) is harmless elsewhere, because type 11
-needs a `station7a` station, but it is wrong for 116/117. A conflux eruption can
-be shown by putting type 15 on a site.
-
 ### Asteroid ore levels (S→C 0x73, C→S 0x74/0x75)  [static + capture, 2026-11-18]
 
 **S→C 0x73** = `[73]` + 250 bytes = 1000 two-bit levels, one per world object
@@ -412,20 +440,8 @@ continuously:
   combat). A rock you mined from 16 to 12 snaps back to full colour if the
   server still says level 3.
 
-**Server implications:** cap 0x74 claims with the same `remaining/base`
-diminishing-returns model. Round a rock's level to the nearest third (not up)
-so a refresh doesn't visibly refill rocks people just mined. Send 0x73 only
-on sector entry and in answer to 0x75.
-
 **C→S 0x75** asks for the levels again (every 100th 0x05 in a sector). Answer with
 0x73.
-
-**For the server:** build 0x73 per sector. Set level 3 for every object id with
-a `mining_divisor` (plus 948 where the sector has it), keep a per-asteroid
-remaining amount fed by 0x74 (capped, like 0x0F), send its level (nearest third; see "How depletion looks"), and regrow over time. **Today the server
-sends the captured Quantar Depot bitmap everywhere**, so in other sectors
-asteroids whose ids aren't asteroids at the Depot get level 0 = 0 ore. Mining
-there is probably broken until this is built.
 
 ### Mineral vein and artifact (S→C 0x58)  [static + capture, 2026-11-18]
 
@@ -496,14 +512,6 @@ Captured veins (one per space sector): 241 Long Walk = 16 Iron (−759, 6622,
 253 Outer Roh-Cloud = 6 Cesium; 254 Inner Roh-Cloud = 11 Gallium. These are
 the refined elements the contract texts describe (`0x9c57d0`). Byte 0x10 was
 0 and byte 0x20 was 0 in all five.
-
-**For the server:** choose a vein element, type and spot per space sector, and
-send 0x58 on sector entry (encode positions as `(int)(pos − origin) ^ 0xc0b55`).
-Every 0x58 also places an artifact, so pick byte 0x11 < 80 and a spot for it.
-Handle C→S 0x4F: check range to the artifact, add a cargo item, and send a
-new 0x58 with 0x20 = 1 to move it.
-Today a captured 0x58 goes everywhere, so every space sector gets the same
-vein at another sector's coordinates.
 
 ### Consumables and servicing (C→S 0x0E; S→C 0xA9, 0x79, 0x9E)  [static + capture, 2026-11-18]
 
@@ -598,18 +606,10 @@ fuel cell are listed below; hull and ammo have the same set.
     - Related: S→C 0xA1 `[a1][3 pad][f32 hull @4]` sets hull (clamped to max;
       handler `0x9d94b2`). It never appears in the captures.
 
-Our server: it replays the first captured 0xB3 as the reply to every 0x17.
-That means fuel is reset to 100 about every 13 s (infinite fuel), and **every
-ammo-gun slot is set to 0** (the template's ammo is all zero). Build 0xB3 from
-server state instead:
-- after a launch, fuel 100 and full magazines;
-- afterwards, echo the client's 0x05 fuel/hull, or the server's own figure;
-- charge for the refill on launch, if prices are wanted.
-
 0xA9 stays available for station services. Treat the 0x0E values as a report,
 not as truth (they're computed by the client).
 
-### Rewards seen (server-side rules, jgcap2)
+### Rewards seen (classic server rules, jgcap2)
 
 - Conflux kill: "Received 3000 credits and 320 experience." (the second kill: 3300/350).
 - Beacon income, periodic per tuned beacon: "You gain c1666, and 46 exp for

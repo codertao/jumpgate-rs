@@ -8,7 +8,7 @@
 
 [workspace]
 resolver = "2"
-members = ["raknet", "proxy", "server"]
+members = ["raknet", "proxy", "common", "server", "agent"]
 
 [workspace.package]
 edition = "2021"
