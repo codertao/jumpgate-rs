@@ -144,6 +144,71 @@ in S→C `0x71` @0x24, and damage re-targets the bot at the attacker (S→C
 > handler requires `+1 == 0` for players, so `+1` behaves like an "AI bot"
 > flag here. reversing-map labels it "dead", which needs re-checking.
 
+### Spawning [static, 2026-11-19]
+There are two ways a bot appears on a client.
+
+**1. S→C `0x70` spawn order, to the client that will own the bot.** The
+message is `[70][u8 ai_type][u16 spawn#][u16 ?]`. It carries **no position,
+no velocity and no target**.
+- `0x9cbac0` queues it in a 40-entry table (`0xba7ad0`, 6 B each). If the
+  table is full, the client bounces it back as C→S `0x16`.
+- `≈5 s` later (`0xac2a2c` = 4.99, timer `0xbe6e64`, main loop `0xa26619`),
+  `0x9cc700` calls `0x9cbb60` spawn_bot for each queued entry. A location
+  change flushes the queue with C→S `0x16` rejects (`0x9cb930`).
+- spawn_bot takes a free pbotloc entry (50 max; none free → C→S `0x16`) and
+  a free ship slot from 10 up.
+- It fills the slot from the ai_types row `0xbeb63c + type·64`, i.e.
+  the per-type table below at row 219 + ai_type. **ai_type = ship type −
+  219** [static + capture jgcap2: ai_type 0x0e → botloc type 233]:
+  - `+0` thrust → `+0x1608`, `+4` mass → `+0x15c0`, `+8` hull,
+    `+0xc` shields,
+  - weapon bytes `+0x18..+0x34` → `+0x1570..77`,
+  - model `+0x38`.
+- **Owner and target are both the receiving player**: pbotloc
+  `+0xc` = `+0x10` = me (`0xbe5da0`), and slot `+0x40` / `+0x15b4` = me.
+  Hand-off and retargeting come later, through S→C `0x71`.
+- ai_type < 11 (faction defenders) is refused in locations > 200.
+- **The client picks the position:**
+
+  | case | spawn point |
+  |---|---|
+  | ai_type < 11 and a station in slot 6 | the station's launch point (model `+0x834`), pushed 50 u along the launch axis (`+0x8b4 − +0x834`), with velocity 50 u/s along it |
+  | turret models (`0x429b20`, model < 0x104) | on a player structure: spawn# / 100 = structure index (slots from `0x11df728`), spawn# % 100 = hard-point index into the offset table `0xb2a588` (12-byte vectors), rotated by the structure's axes |
+  | loc < 310, nav marker (model 304 `flat.x`) in a gate slot 1–4 | within ±150 u of the marker, random velocity 0–149 per axis |
+  | loc 314, 318, 342 | 50 %: in front of the repulsor (model 0x1ae, slots 300–349): pos + 700·fwd, velocity 700·fwd, the repulsor's orientation. Otherwise ±4000 u of me in x/z and 16,000 u above, pointing down |
+  | loc ≥ 310, other, with a repulsor | ±25 u of repulsor pos + 680·fwd, velocity 700·fwd |
+  | anything else | uniformly random, about ±16,000 u around my own ship (rand() − 16000 per axis) |
+
+  `srand` is reseeded from QueryPerformanceCounter on each spawn, so
+  clients won't agree on positions. That doesn't matter, because only the
+  owner simulates the bot and everyone else sees it through botloc.
+
+**2. S→C `0x71` botloc relay, to everyone else (and for hand-off).**
+Handler `0x9d6f25`; the layout is the same as C→S 0x71 (52 B):
+- `@1` state, `@2` shield %, `@3` hull % (× `0xac24d4` × max),
+  `@4/@5` → pbotloc `+2/+3`, `@6` u16 → `+6`,
+- `@8` u16 bot id, `@0xa` u16 loc (must equal mine),
+- `@0xc` u16 ship type (219–259 or 0xffff),
+- `@0xe..12` i16 velocity × 0.1, `@0x14..18` i16 fwd × 1e-4,
+  `@0x1a..1e` i16 up × 1e-4,
+- **`@0x20` u32 controller player id, `@0x24` u32 target player id**,
+- **`@0x28/2c/30` f32 position**.
+
+An unknown bot id creates the bot from the packet, **including position**
+and target. A known id updates state, hull/shield, controller, target,
+velocity and orientation. The existing-bot branch I traced does not write
+position, so it may be corrected elsewhere [to check]. If the controller
+== me, the slot becomes locally driven (`+2 = 0`) and the client answers
+with a botloc right away (`0x9c9d10`). Otherwise the bot is linked to the
+controller's ship slot; if that player isn't present, the bot is removed
+("…" `0xb061a4`, `0x9cb9c0`).
+
+So the server can't choose where a stock bot spawns through 0x70. It can
+only choose the ai_type and, for turrets, the structure and hard-point. To
+place a bot exactly, it would have to send a 0x71 with the position and the
+controller set to the chosen owner. That path creates the bot directly and
+is untested.
+
 ### Per-type AI table: `0xbe7f7c + type*0x40` (filled by `0xa07240`)
 Extracted to `ai_types.csv`. Types 220–225 and 230–259 are defined.
 
@@ -187,6 +252,17 @@ These have zero thrust, so they never move. Each tick:
    probe covers world objects, ships 0–199, special objects 300–349 and
    player stations. If something is ahead (dot > 0.1), `0x42c1c0` steers
    away and the attack logic is skipped for that frame.
+   `0x42c1c0` bot_steer_avoid(slot, dir) [static, 2026-11-19]: it sets
+   thrust to the type's maximum (`0xbe7f7c + type·64`) with engine glow 110.
+   It takes dot(up, dir) and dot(right, dir) and turns away on the dominant
+   axis by writing the slot's *networked* target orientation (`+0x15d4` fwd,
+   `+0x15e0` up): fwd ± 0.5·up with up ∓ 0.5·fwd (pitch), or fwd ± 0.5·right
+   (yaw). That is a target about 26.6° off the current heading. The normal
+   slew (`0x42c540`) then turns the bot at its type's turn rate. The exact
+   sign-to-branch mapping was not traced. There is no braking, so a bot
+   relies on turning at full throttle. If the turn isn't enough, the
+   collision sweep in `0x40bf50` takes over (physics.md §6, "Bots this
+   client controls"): a mass-ratio bounce plus impact damage.
 3. **State 0, attack** (default). Full throttle toward the target, then:
    - **Inside weapon range:** lead the target. With t = range / closing
      speed, aim = target + t·v_target (×½ if skill is odd), minus the bot's

@@ -209,7 +209,7 @@ Ownership moves to whichever player is nearest.
 | S→C `0x71` handler `0x9d6f25` | spawn/assign: bot id @8, loc @0xa, ship type @0xc (219–259, else "Bot error - pbotloc->Shiptype is not valid"), ids @0x20/@0x24. If @0x24 == me: ship `+2`=0 (locally driven), controller=me, send a botloc right away. Otherwise links the bot to the owning player's ship slot. |
 | S→C `0x03` handler `0x9d1463` | also writes the table and ship `+2` (update/teardown) [inferred] |
 | `0x4338c0` | **online bot AI**, called every frame (`0xa26863`): per-bot state machine (`+1`), steering toward the target ship (`ship+2` = slot), rand-driven events |
-| `0x40bf50` | per-frame for bots *I* control: obstacle/ship avoidance (`0x409a40`), then sends botloc (`0x9ce490`) |
+| `0x40bf50` | per-frame **collision sweep** for bots *I* control (mesh tests vs ships 10–199, station, specials, structures, gates, world objects; mass-ratio bounce + damage; death → botloc `0x9ce490` with −1). Avoidance steering is in `0x4338c0` → `0x42c1c0`. See physics.md §6. |
 | `0x42f360` | offline-sim AI (loc 1005, `/ai #` "Spawns a flux ... offline sim mode") |
 | `0x9c9d10` | botloc sender: 0x71 (52 B) per controlled bot (hull%, shield%, position, velocity, orientation). Runs after every 0x05 and on assignment. |
 | C→S `0x71` sub 3 | "botloc 3" — sent from the AI when a condition fires within 60 units [inferred: arrival/attack] |

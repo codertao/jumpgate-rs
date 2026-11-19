@@ -3,9 +3,9 @@ addr,name,area,confidence,ref
 # confidence: high = verified in code/capture; med = strong inference; low = guess.
 # Lines starting with # are ignored. Region-init functions and dispatcher cases are added automatically.
 0x401000,text_start_stub,misc,low,
-0x409a40,collide_segment_vs_model,physics,med,physics.md#6
-0x407b00,collide_broadphase,physics,med,physics.md#6
-0x40bf50,bots_owned_avoidance_tick,bot-ai,high,reversing-map.md#conflux
+0x409a40,collide_segment_vs_model,physics,high,physics.md#6
+0x407b00,collide_bounds,physics,high,physics.md#6
+0x40bf50,bots_owned_collision_tick,physics,high,physics.md#6
 0x429b50,vec3_normalize,math,high,physics.md
 0x42ca30,missile_update,weapons,med,reversing-map.md#weapon-hits
 0x42f360,offline_sim_bot_ai,bot-ai,high,reversing-map.md#conflux
@@ -104,7 +104,7 @@ addr,name,area,confidence,ref
 0x4083f0,collide_broadphase_worldobj,physics,med,physics.md#6-collisions-and-docking-0x40d630
 0x40a3f0,collide_segment_vs_worldobj,physics,med,physics.md#6-collisions-and-docking-0x40d630
 0x429b20,is_turret_model,bot-ai,high,ai.md#turrets
-0x42c1c0,bot_steer_avoid,bot-ai,med,ai.md#mobile-bots
+0x42c1c0,bot_steer_avoid,bot-ai,high,ai.md#mobile-bots
 0xa07240,init_ai_types,bot-ai,high,ai.md#per-type-ai-table
 0x427c00,ecm_toggle,ecm,high,ai.md#life-and-expiry
 0x427af0,pwd_pulse_send,ecm,high,ai.md#life-and-expiry
@@ -262,7 +262,7 @@ addr,name,area,confidence,ref
 0x498030,rotacol_save,settings,high,rotacol.bin writer
 0x49d490,dinput_keyboard_error,input,med,'unknown keyboard error' DIERR_*
 0x4ad200,load_map_tips,map,high,maptips.txt
-0x4b4b00,spawn_artifacts,world,med,S->C 0x58 record 2 (artifact1-5.x, models 0x190-0x194); art1..4.bmp
+0x4b4b00,spawn_artifacts,world,high,message-types#mineral-vein-and-artifact: clears all artifacts (opt. burst) then 1 new in slot 10-59; model 0x190+b/16 skin art(b%4+1).bmp
 0x4b5c70,map_faction_buttons,map,med,mb_all mb_s mb_o mb_q ...
 0x4bb9a0,map_skybox,map,med,mapskybox.bmp
 0x9c3b50,miles_shutdown,sound,high,'SHUTDOWN MILES'
@@ -309,3 +309,14 @@ addr,name,area,confidence,ref
 0x4071f0,check_model_files,anti-tamper,high,physics.md#9 (D3D_ALLOC_ERROR 101%d)
 0x9cabc0,send_consumables_used_0x0e,net-send,high,message-types.md#consumables-and-servicing
 0x9c74c0,snapshot_consumables,game,high,message-types.md#consumables-and-servicing (fuel/hull/ammo used; total loss when 0xbe5af4==2)
+0x407430,collide_segment_triangle,physics,med,physics.md#6
+0x9cb650,loadout_seal,anti-tamper,high,physics.md#9
+0x9c8f40,loadout_check,anti-tamper,high,physics.md#9
+0xa612d0,build_collision_tris,physics,high,physics.md#6
+0xa61f20,finish_model_collision,physics,high,physics.md#6
+0x408130,point_in_volume,physics,high,physics.md#6
+0xa27b30,load_models_init,physics,med,physics.md#6
+0x9cbb60,spawn_bot,bot-ai,high,ai.md#spawning
+0x9cc700,spawn_queue_flush_due,bot-ai,high,ai.md#spawning
+0x9cb930,spawn_queue_reject_all,bot-ai,high,ai.md#spawning
+0x439f70,has_device_fitted,devices,high,device index = item - 152; used for Displacer(52)/Burglar(68) artifact pickup

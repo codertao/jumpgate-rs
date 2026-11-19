@@ -32,7 +32,7 @@ Common sub-fields seen across many messages:
 | 0x04 | 27 | Chat line | `[04][05][u16 loc][u32 player_id][callsign\0][text...]` |
 | 0x65 | 36 | Join chat channel ("chat") | `[65][u16 loc?][u32 player_id]["chat"\0]...` |
 | 0x6A | 8 | Player-list / player request | `[6A][...][u32 player_id]` |
-| 0x71 | 52 | Bot state report "botloc" (see Space section; 1000 = offline-sim variant) | `[71]...` |
+| 0x71 | 52 | Bot state report "botloc" relayed (handler `0x9d6f25`) | Same layout as C→S 0x71: `@8` bot id, `@0xa` loc, `@0xc` type, `@0x20` u32 controller, `@0x24` u32 target, `@0x28` f32×3 position. An unknown id **creates** the bot at that position. See ai.md "Spawning". [static 2026-11-19] |
 | 0x8F | 1 | **Keepalive** | `[8F]` — one per connection every ~16 s |
 | 0xC1 | 12 | Job-list request | `[C1][sub][u16 loc][u32 player_id][u32]` |
 | 0xC8 | 8 | Logout / session end | `[C8][u16 loc?][u32 player_id]` |
@@ -42,11 +42,11 @@ Other C→S types mapped **[static]** from send sites (names from the client's
 impact, 0x0F building(392B), 0x10 prodboost, 0x16 reject-spawn, 0x36 wingman,
 0x37–0x41 ("packet 55"–"65" in the strings = decimal), 0x43 hits-counter,
 0x44 who-killed-me, 0x4A trade-ack(sub@1), 0x4C mission, 0x4D modx, 0x4E mentor,
-0x4F teleport, 0x59 home, 0x74 asteroid-amount, 0x7B registry, 0x83 list-channels,
+0x4F artifact pickup (decoded below), 0x59 home, 0x74 asteroid-amount, 0x7B registry, 0x83 list-channels,
 0x8A weather-request(1B), 0x90 findPOSowner, 0x91 missions, 0x93 mode, 0x96
 volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 0xAA/0xAB invite, 0xAC shipname, 0xBB home-off, 0xC3 "util" (sub@1: 0xF2 miltour,
-0xF3 util-243, 0xF4 insurance, ...), 0xC5 commission/away.
+0xF3 util-243, 0xF4 insurance, 0xF5 squad mayday, 0xF6 faction mayday; the maydays are 2 bytes and key-bound, see physics.md §9 item 7), 0xC5 commission/away.
 
 ---
 
@@ -61,13 +61,14 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 | 0x45 | 400 | **Credits and item list** (handler `0x9d662a`; previously called "rank") | `[45][7 pad][u64 credits @8 → 0xff7cf8]` then, unless byte @0x10 is `0xfd` (credits-only update), 48 × 8-byte slots @0x10 copied to `0xff7d2c`: `[u8 category][u8 index][cc cc][f32 quantity]`, `fe` = empty. The list holds cargo and unfitted equipment. C→S 0x09 sell names a slot index from it. Sent after every credit change, purchase, fitting, and while mining. [static + capture jgcap2] |
 | 0x92 | 8 | **Experience total** (handler `0x9d8120`) | `[92][3 pad][u32 experience @4 → 0xbe5da8]`. Rises by exactly the experience in the reward chat lines. [static + capture jgcap2] |
 | 0x77 | 2 | **Medal awarded** (handler `0x9d7ccb`) | `[77][u8 medal id]`. Followed by a system chat "You receive N experience for the medal." The medal names are what the tri server's 0xFE patches into client memory. [static + capture jgcap2] |
-| 0x70 | 6 | **Bot spawn order** (handler `0x9cbac0`) | `[70][u8 ai_type][u16 spawn#][cc cc]`. ai_type = ai_types.csv row (12–14 = conflux types 236–238 in The Dark Trail / Inner Roh-Cloud). Queued in a 40-entry table at `0xba7ad0`. If the table is full, the client sends it back as **C→S 0x16 RejectSpawn** (same bytes, type changed). Sent on sector entry, right after 0x73. The client then flies the bot (C→S 0x71 botloc) and reports its death with C→S 0x44. No S→C 0x71 was seen in this solo session. [static + capture jgcap2] |
+| 0x70 | 6 | **Bot spawn order** (handler `0x9cbac0`) | `[70][u8 ai_type][u16 spawn#][cc cc]`. **ai_type = bot ship type − 219** (spawn_bot reads `0xbeb63c + t·64` = ai_types.csv row 219 + t, whose +0x38 holds that ship type; capture jgcap2: ai_type 0x0d/0x0e came back in botloc @0xc as ships 232/233, C2/C3 'Squid'). So 1–6 = defenders 220–225, 11 = Jellyfish, 12–38 = C1–C27, 39/40 = turrets. spawn# = the bot id in botloc @8 and C→S 0x44 (captured: 0, 1 per sector). Queued in a 40-entry table at `0xba7ad0`. If the table is full, the client sends it back as **C→S 0x16 RejectSpawn** (same bytes, type changed). Sent on sector entry, right after 0x73. **No position or target**: the client picks the spawn point (station launch point, structure hard-point = spawn# /100 and %100, nav marker, repulsor, or random ±16 km around the player), and the target is the receiving player (ai.md "Spawning"). The client then flies the bot (C→S 0x71 botloc) and reports its death with C→S 0x44. No S→C 0x71 was seen in this solo session. [static + capture jgcap2] |
 | 0x4B | 60 | **Contract** (handler `0x9d66ee`) | Bytes 8..0x3c are copied to `0xff1e58`. `[u8 job type @8]` (0 = no contract; seen 2 trade, 9 mining, 0x0b/0x0f/0x10/0x13 courier, 0x0d patrol) `[u8 state @9]` (0x33–0x35 = viewing offer 1–3, 1 = active), **10 waypoint-visited flags @0x0a–0x13** (00 = to visit, 01 = unused slot), **u8 waypoint count @0x14**, `[u8 category @0x15][u8 item index @0x16]` (goods, 0xcc = none), u8 @0x17 (always 0xfe), u8 board @0x18, **u16 waypoint locs @0x1a + 2i** (up to 10; the first is the destination; a patrol lists 3–5 sectors). For job 3, entering waypoint i's sector sets its flag and sends C→S 0x64(8) (`0x40ff7f`). **`u32 experience @0x30`** (UI `mission_experienceearned`), **`u32 credits @0x34`** (UI `mission_creditsearn`), **`f32 remaining @0x38`**. When goods of the matching category/index are sold at the destination, the client subtracts the quantity from `remaining` (`0x4569cf`). The server's completion message carried 1 − sold (−15 after selling 16). [static + capture jgcap2] |
 | 0x14 | 16 | **Conflux swarm moved** (handler `0x9c9660`) | `[14][3 pad][u32 swarm 0–2][u32 loc now][u32 loc before]` (0 = no move, e.g. the 3 sent on entering space). Stored as `0xb909e0[swarm] = loc` (read by the galaxy map, `0x4ae98e`). On a move into a sector of the player's current faction, the client prints "ALERT: A swarm of conflux has entered %s from %s." The capture's swarms wandered C-1100, The Chase, Outskirts, Saron's Shoulder (faction 6 space). [static + capture jgcap2] |
 | 0x08 | 64 | **Location change / space-server redirect** (handler `0x9d30c6`) | `[08][sub]` … space-server address @0x0c (UTF-16LE, ≤16 units incl. NUL, field ends at 0x2c) … **u16 dest loc @0x2c** (checked 1..1005) … @0x34. If the address differs from the current one (`0xba79a0`), the client drops space and connects to `<addr>:5151` (`0x9c7190`). Dock sends **"none" as narrow ASCII bytes**: the compare is `wcscmp` (0xaabf39) against a narrow literal at `0xb05afc`, which only works because both are the same raw bytes. **sub @1 = contact slot to appear at**: the arrival gate number (= extract `gate_dest_gate`) for a jump, 6 for a launch, 0xcc on dock (the handler uses `slot = msg[1]`, position = slot pos + random offset). Verified against all captured jumps. [static + capture, 2026-11-17] |
 | 0x04 | 20 / 69 | Chat line (e.g. "KTRI" news bot) | `[04][sub][u16 loc][u32 player_id][callsign\0]...` |
 | 0x65 | 35 | Channel-join ack | `[65][...][u32 handle]` |
 | 0xC2 | 750 | Table of 41 × 18-byte entries, mostly empty | `[C2]` + entries padded with `cc`/`ff ff ff` |
+| 0x58 | 36 | **Mineral vein + artifact** (handler `0x9d883f`; space sectors only, loc ≥ 201) | `[58][u8 commodity][u8 asteroid type][cc][i32×3 vein pos][u8 burst][u8 artifact look][cc cc][i32×3 artifact pos][u8 burst-old-artifacts][cc cc cc]`, positions `^ 0xc0b55` + sector origin. Every 0x58 moves the vein and replaces all artifacts. See "Mineral vein and artifact" below. [static + capture] |
 | 0x78 | 151 | **Building sites** (see "Building sites" below) | `[78]` + 50 × 3-byte entries; all zero in empty sectors |
 | 0x18 | 8 | Small status (medal?) | `[18][u32][ff 00 ff 01]` |
 | 0x8C | 7 | Small status | `[8C][cc cc cc][u16?]` |
@@ -84,7 +85,7 @@ The message is first copied to `0xba8e20`.
 | +1 | (set from thrust) | u8 | +0x156d | engine glow: 0x33 sets 0, or 50 when thrust ≠ 0 |
 | +3 | +1 | u8 | +0x156f | ? (0 in capture) |
 | +4..+0x13 | | 16 B | +0x1568.. | equipment array (`fe` empty) |
-| +0x14..+0x17 | | u8 ×4 | +0x1580.. | ? (capture `1e fe 01 01`) |
+| +0x14..+0x17 | | u8 ×4 | +0x1580.. | ? (capture `1e fe 01 01`); **+0x17 → slot +0x1583 = towing a cargo pod (`cargo.x`, model 119)**, which adds the pod to rendering and collision |
 | +0x19 | | cstr | +0x1584 | **callsign**; the message is **ignored if strlen ≤ 1** |
 | +0x2f | | cstr | +0x159a | squad; `"$master$"` → stored empty |
 | +0x3e..+0x42 | | u8 ×5 | +0x15a9.. | ? (capture `04 00 7d 05 0d`) |
@@ -156,6 +157,7 @@ Client → server in space (also see reversing-map "Weapon hits & damage": C→S
 | 0x0F | 392 | **Cargo report** (sender `0x439f16`; named "building" in the error strings) | `[0f][u8 flag][2 bytes uninitialised][48 × 8-byte item-list slots @4, copied from 0xff7d2c][u32 player_id @0x184]`. Sent every ~10 s while the mined-amount accumulator `0xbe5e10` is non-zero (it's reset after each send), and once just before docking. flag was 1 during mining and 0 in the final pre-dock report. **The client reports its own mined ore**: the server accepted these amounts (0x45 echoed them), so ore is client-authoritative unless our server checks it. [static + capture jgcap2] |
 | 0x44 | 16 | **Bot destroyed** ("who killed me", sent by the bot's controlling client) | `[44][u8][u16 bot spawn#][u32 killer pid][u32 reporter pid][4 zero]`. The server answered with "Received 3000 credits and 320 experience" (3300/350 for the second), "<callsign> destroyed a member of the Conflux", 0x92, 0x45. [capture jgcap2] |
 | 0x32 | 40 | **Missile** create/remove | `[32][u8 missile id][u16 type @2]` (missile index, e.g. 7 = Purgatory; **0xfa = removed**, the same value as a 0x05 ship removal) … `u32 owner pid @0x14`, `@0x18`, `f32×3 position @0x1c`. One create and one remove per missile fired. [capture jgcap2] |
+| 0x4F | 20 | **Artifact pickup** ("teleportPacket", sender `0x43c8a9`) | `[4f][3 junk][u32 player_id @4][f32 own position ×3 @8]`. Sent after 4 s of InSight beam on an artifact with a Displacer or Burglar fitted. No artifact id. See "Mineral vein and artifact". [static 2026-11-19, never captured] |
 | 0x64 | 8 | **Beacon / contract event** (sender `0x9cad80`) | `[64][u8 arg][2 bytes uninitialised stack][u32 player_id]`. Three callers: beacon tuned (`0x41006f`; arg = the faction the beacon now belongs to, set in the location table `0xfd925c + loc*0x64`; the server confirms with 0x61 state = arg), job-3 waypoint reached (arg 8), and a job-0x0d event (arg 9). [static + capture jgcap2] |
 | 0x43 | 12 | **Combat stats**, every 30 s in space if any are non-zero (sender `0x9caa30`) | `[43][u8 missiles fired @1][u8 missile hits @2][pad][u16 gun shots @4][u16 gun hits on ships @6][u32 player_id]`. Counters: `0xff266d` (launch, `0x436e38`), `0xff266e` (missile impact on a ship/bot slot, `0x42d4db`), `0xff2670` (gun fired, `0x4375a5`), `0xff2672` (gun hit on hull types 30–119 or bots 219–259, `0x43f60a`). Reset after sending. [static + capture jgcap2] |
 | 0x66 | 12 | **Fitting change** (38 send sites, `0x4781bf`..`0x47b865` + missile fire `0x43753d`) | `[66][u8 item-list slot @1][u8 category @2][u8 ship slot @3][u8 op @4][3 bytes stack junk][u32 player_id]`. op 0 = unfit ship slot → item-list slot, 1 = fit item-list slot → ship slot, 2 = missile fired (rack slot emptied). The server answers fits/unfits with an updated 0x45. Changing ship sent 13 unfits (engine, powerplant, radar, shield, capacitor, 4 guns into one stacked slot, 4 devices), then each item was fitted back. [static + capture jgcap2] |
@@ -439,9 +441,9 @@ otherwise). It carries 36 bytes in two records. Coordinates are **obfuscated i32
 | 3 | pad (`cc`) |
 | 4, 8, 12 | vein position x, y, z (obfuscated) |
 | 0x10 | 1 = first play a particle burst at the old vein, coloured from `0xbe6e8c[old commodity]` (only at high detail `0xff1d80 == 1`) [inferred: depleted/moved] |
-| 0x11 | first argument to `spawn_artifacts` `0x4b4b00` [meaning unknown] |
+| 0x11 | **artifact look**: model = `0x190 + b/16` (`artifact1.x`…`artifact5.x`), skin = `b % 4` (`art1.bmp`…`art4.bmp`). Keep b < 80; higher values name models that aren't artifacts. Captured: 0x02, 0x14, 0x15, 0x39, 0x4c |
 | 0x14, 0x18, 0x1c | artifact position (obfuscated) |
-| 0x20 | `spawn_artifacts` flag: clear/explode existing artifacts (slots with models 0x190–0x194, `artifact1–5.x`) |
+| 0x20 | 1 = play an explosion burst at each old artifact before it's removed (high detail only) |
 
 The vein is **world object 948** (`0x140ad48 + 948*0xdc`): reset, given that
 type and position, mass 100000, active. Everything that handles 948 does so
@@ -455,6 +457,40 @@ specially:
   from `0xbe6e8c + n*12`. The HUD (`0x9e980b`) also handles it separately.
 - It is set in every 0x73 (level 3).
 
+**The artifact** (`spawn_artifacts` `0x4b4b00`, called on every 0x58)
+[static 2026-11-19]:
+- It first removes **every** contact with a model in 0x190–0x194 (slots
+  0–699), whatever byte 0x20 says. The flag only adds the burst. Your target
+  is cleared if it was one of them.
+- It then creates **one** artifact in the first free contact slot **10–59**,
+  which is part of the remote-ship pool. With no free slot, there's no
+  artifact.
+- The new contact gets the model and skin from byte 0x11, the position from
+  0x14–0x1c, and mass 50,000.
+- The skin is set on the shared model (`0xa60d90`), so it applies to every
+  artifact using that model.
+- **It has no name or item identity on the client.** The only strings are the
+  file names (`artifact1–5.x`, `art1–4.bmp`). The cargo table's 32 artifact
+  items (285–316: PC-DSS1–4 in Poor/plain/Rare/Perfect, PC-UC1–16) are not
+  referenced by this code. What a pickup is worth is the server's choice.
+
+**Picking it up** (`0x43b1b0` weapon-hit code, branch `0x43c79a`):
+- Hold an **InSight** beam on it. The gun must be class 3 (`gun +0xe0`), and
+  InSight is the only class-3 gun.
+- A **Displacer** (item 204) or a **Burglar** (220) must be fitted. They are
+  device indices 52/68 = item − 152, checked by `0x439f70`.
+- An unknown value at `*0x1440904` must be > 5.0.
+- After **4 s** of beam time (accumulator `0xbe70e4`), the client sends
+  **C→S 0x4F** (the "teleportPacket"):
+  - layout: `[4f][3 junk][u32 player_id @4][f32 own position x, y, z @8]`, 20 B
+  - it names **no artifact**: the server has to match the player's position
+    to the artifact it placed.
+- Locally, own missiles aimed at the artifact are retargeted and nothing is
+  removed. The server presumably answers with the item (0x45) and a fresh 0x58
+  with byte 0x20 = 1: the old artifact bursts and a new one appears elsewhere
+  [inferred; never captured].
+- In the simulator the client only plays a sound.
+
 Captured veins (one per space sector): 241 Long Walk = 16 Iron (−759, 6622,
 25663); 249 Tictac's Hook = 18 Magnesium; 257 The Dark Trail = 24 Radium;
 253 Outer Roh-Cloud = 6 Cesium; 254 Inner Roh-Cloud = 11 Gallium. These are
@@ -463,6 +499,9 @@ the refined elements the contract texts describe (`0x9c57d0`). Byte 0x10 was
 
 **For the server:** choose a vein element, type and spot per space sector, and
 send 0x58 on sector entry (encode positions as `(int)(pos − origin) ^ 0xc0b55`).
+Every 0x58 also places an artifact, so pick byte 0x11 < 80 and a spot for it.
+Handle C→S 0x4F: check range to the artifact, add a cargo item, and send a
+new 0x58 with 0x20 = 1 to move it.
 Today a captured 0x58 goes everywhere, so every space sector gets the same
 vein at another sector's coordinates.
 

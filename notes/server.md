@@ -79,10 +79,12 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 | 0x07 jump | state | gate = arg + 1 → extract link → 0x78, 0x08 (our IP, dest loc, sub = arrival gate). Built, no template | extract; byte-identical to captured jumps |
 | 0x07 dock | state | loc = sector−100; 0x45, 0x92, 0xba (pid patched), 0x4b, 0x06, 0x8c, **0x08 "none"** | capture |
 | 0xc8 | state | logout | — |
-| 0x8f | both | 0x8f on the same connection (the client's dispatcher ignores it, `0x9d3006`) | capture |
+| 0x8f | both | 0x8f on the same connection (the client's dispatcher ignores it, `0x9d3006`). **The answer on the space connection is required**: the client sends one per connection every ~16 s, and when the space ones went unanswered it dropped space ("Disconnected from space server") about 55–65 s after connecting [capture 2026-11-19; the timeout constant isn't located in the binary yet] | capture |
 | 0x05 (176 B) report | space | stored and relayed to sector-mates as S→C 0x05 (handler `0x9cf7c8` creates/updates that ship). Newcomers are sent everyone's last report | static |
 | 0x33 / 0x34 | space | relayed to sector-mates if the id field is the sender's | static |
-| 0x71 / 0x2c | space | ignored (bots not implemented) | — |
+| 0x71 | space | botloc relayed verbatim as S→C 0x71 (state conn) to sector-mates, only if ship type @0xc is 219–259 or 0xffff (the "no bots" report has 0), controller @0x20 is the sender and loc @0xa is the sender's sector. Others' clients create/update the bot from it. Untested live: whether the existing-bot branch takes position from it (ai.md "Spawning") | static |
+| 0x2c | space | ignored (bot handoff not implemented, so the spawner keeps the bot even after leaving) | — |
+| 0x16 / 0x44 | any | logged (spawn rejected / bot destroyed); no reward yet | capture (0x44) |
 
 Server-side authority already enforced: player id and loc in relayed 0x05 are
 overwritten with the server's values. A space session can only claim a player
@@ -190,7 +192,26 @@ and are answered privately with a system chat line, never relayed.
 | command | effect |
 |---|---|
 | `!goto <sector id or name> [gate 1-4]` | In space only. Sends the same 0x78 + 0x08 as a gate jump. Names match without case or punctuation (exact, else unique substring). Without a gate: a station sector (101–118) arrives at the launch point (sub 6), others at their lowest gate. |
+| `!ai <0-27 \| jelly \| def [1\|2] [sol\|oct\|quan] \| 220-257>` | In space only. Sends S→C 0x70 (state conn) to the caller only, so that client owns the bot and is its target; it appears ~5 s later where the client chooses (ai.md "Spawning"). A number 0–27 is the conflux C-number (ship 230 + n; C0 = `jelly` = Jellyfish 230, per the user); a raw ship type 220–257 is accepted. `def` = the sector faction's Def 1 (220/222/224), `2` for Def 2, or name the faction. Defenders are refused outside locations 101–200 (spawn_bot drops them there). Turrets 258/259 are excluded (spawn# must name a structure). spawn# is a global counter. C→S 0x16 rejects and 0x44 kills are logged only. The owner's C→S 0x71 botlocs are relayed to the rest of the sector (see the request table). Untested live. |
 | `!help` | lists commands |
 
 Dev helpers for now: anyone can use them. Gate them behind GM rights once
 accounts exist. Untested live: `!goto` into the sector you're already in.
+
+## Fixed: space disconnect after dock + relaunch (2026-11-19)
+
+Symptom: mid-flight "Disconnected from space server", on the second launch of
+a session only. Cause, from the client-side capture: after the relaunch every
+space-connection 0x8f went unanswered (state ones were fine). Docking didn't
+unbind the old space session, so the new connection was bound only by its
+first 0x05. Then the old session hit `PEER_TIMEOUT` (60 s after the dock), and
+`disconnected()` cleared the player's *current* `space_addr`, so keepalive
+answers had nowhere to go. Fixed in `game.rs`:
+- dock unbinds the space session;
+- `bind_space` forgets the player's previous space address;
+- `disconnected(Space, addr)` ignores any session that isn't the player's
+  current one.
+
+Test: `stale_space_session_does_not_unbind_the_new_one`. The RakNet layer
+wasn't at fault.
+

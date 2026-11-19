@@ -97,7 +97,8 @@ From the WinMain loop, checkpoint ids in `0x14ff668`:
 5. **`0x429bb0` linear dynamics**: thrust, drag, brakes, boost, sector current.
 6. Unless docking/docked (`0xbe5af4`, `0xbe5b01`): **`0x40d630` collisions and
    docking** (which first calls `0x40cb50`, the service-beam pad), then
-   `0x40bf50` avoidance for bots this client controls.
+   `0x40bf50` collisions for bots this client controls (§6, "Bots this client
+   controls").
 7. **`0x9c7270` position integration**, `pos += v·dt`, then the own ship is
    copied into contact slot 0 (`0x1042118`).
 8. **`0x433010` dead reckoning for remote ships**, then `0x4338c0` bot AI.
@@ -283,6 +284,84 @@ Then up to 7 segment-vs-model tests (`0x409a40`; it fills the contact point at
 `0xb3377c..84`). The probe points are the ship centre and the centre ±½·extent
 along the forward, up and right axes, swept by v·dt.
 
+**Test primitives** [static, 2026-11-19]. Every collision, fuse and
+line-of-fire check in the game is a **swept segment** p → p + d tested against
+a model placed by a contact slot (`0x1042118 + slot·0x160c`: axes up/fwd/right
+at `+0x68/+0x74/+0x80`, position `+0x15c8`). Nothing is volume-vs-volume.
+- **Collision volumes are hand-authored and hard-coded in the exe**, not
+  read from the model files and not computed. The `.x` files are plain
+  render meshes: 708 of 718 have one `Mesh` and no frames or extra data.
+  Each model object (`0x14ff690[id]`) carries 21 volume blocks of 0x40
+  bytes: the whole model at `+0x2b0`, then 20 sub-volumes at
+  `+0x2f0 + 0x40·i`. Block layout:
+  - `+0x00` axis A, `+0x0c` axis B (unit vectors in model space; the third
+    axis is their cross product),
+  - `+0x18/1c/20` full extents,
+  - `+0x24/28/2c` centre,
+  - `+0x30` radius,
+  - `+0x38` triangle-list head.
+
+  The model loaders (`0xa27b30` and its siblings up to `≈0xa72250`, the
+  generated "region-init" code) store axes, extents and centres as float
+  immediates for **206 models**. 144 of those have whole-model bounds only;
+  62 also have sub-volumes, e.g. station bodies 4/5/6 (9, 11, 7), 321–323
+  (18, 13, 16), 381–383 (7, 8, 12), and player buildings 349–375 (2–7).
+  Afterwards `0xa61f20` sets each radius to the largest |extent| and calls
+  `0xa612d0` for every model.
+- `0xa612d0` build_collision_tris. It walks the render mesh's 16-bit index
+  buffer (32-byte vertices, position first). If sub-volume 0 is empty
+  (`+0x308 == 0`), each triangle with **at least one vertex inside the
+  whole-model volume** (`0x408130`) is copied into a 0x28-byte node:
+  next, then x[3] @+4, y[3] @+0x10, z[3] @+0x1c in model space. The node is
+  pushed onto `+0x2e8`. Otherwise the same test runs per non-empty
+  sub-volume, and the triangle goes onto that volume's list `+0x38`.
+  A triangle can land in several lists, and one outside every volume is
+  dropped. Models with no hard-coded volume probably have no collision
+  triangles at all [inferred].
+- `0x408130` point_in_volume(block, p) is an oriented-**ellipsoid** test:
+  Σ 4·(dᵢ/extᵢ)² ≤ 1, where dᵢ is (p − centre) projected onto A, B and A×B.
+  So the extents are diameters.
+- `0x407b00` collide_bounds(block, slot, p, d) tests the segment against a
+  volume placed by the slot. A cheap axis reject comes first, then
+  |centre − p| ≤ radius + |d|, then closest approach, then the same
+  ellipsoid test. It returns 1 on a hit.
+- `0x409a40` collide_segment_vs_model(out, slot, p, d) runs the whole-model
+  `0x407b00` test, then either the single list or, per sub-volume, that
+  volume's `0x407b00` test and its triangles. Vertices are transformed by
+  the slot axes and position and tested by `0x407430`. The nearest hit wins:
+  `out[0]` = hit parameter, `out+0x14..1c` = contact point. If slot byte
+  `+0x1583` is set, the triangles of model 119 are tested too. Model 119 is
+  **`cargo.x`**, the towed cargo pod (`0xa587f0` loads it; `cargo_shield.x`
+  sits beside it). The flag means "towing a pod". For remote players it
+  comes from 0x05 gloc byte `+0x17` (`0x9cf8e7`, capture value 01). World
+  objects with models 32/62/92 get it set (`0x4baa15`); those are the Cargo
+  Tow hulls Pioneer, Condor and Thunder. So a tow's collision includes
+  its pod.
+- `0x407430` collide_segment_triangle is a **one-sided** segment-plane test
+  followed by an edge test:
+  ```
+  n  = normalize((v1 - v0) x (v2 - v1))     // winding defines the front
+  a  = n . (p - v0);      if a < 0: miss    // start must be in front
+  b  = n . (p + d - v0);  if b > 0: miss    // end must be behind or on
+  t  = -a / (n . d);  P = p + t*d
+  for each edge (vi, vj): inside test using the edge vector, the edge
+      midpoint and P against n               // 3 same-side checks
+  ```
+  Back faces never register, so a segment leaving a mesh from inside passes
+  straight out.
+
+**The mover is never a volume.** Every test is a zero-width segment (a ray
+of length |v·dt|) against triangles. There is no model-vs-model, sphere or
+box sweep. The movers are:
+- **Own ship:** 7 points, the centre plus the centre ±½ of the type's
+  collision extents (`+0x158/15c/160`) along right, up and forward. Each
+  point is swept by v·dt. A thin spar can slip between the points.
+- **Bots I control:** the centre point only.
+- **Missiles:** the centre point. Small models that don't get the mesh
+  test (models outside 30–121) instead use the ellipsoid fuse (ai.md).
+
+- `0x40a3f0` is the same test for a world-object table entry.
+
 **Response to static objects and buildings** (same code in many copies):
 ```
 n   = normalize(pos - contact)
@@ -336,6 +415,55 @@ your own ship is moved; each client pushes itself. In practice, then, **there
 are no collisions between player ships**, which matches how the game is
 remembered. Remote ships are not run through the static-object probe either
 (§8).
+
+**Bots this client controls: `0x40bf50`** [static, 2026-11-19; an earlier
+version called this "avoidance", which is wrong]. For each pbotloc entry whose
+controller (`+0xc`) is me, the bot's slot is swept by v·dt (`[0x1440914]` =
+dt) with `0x409a40`. The search stops at the first contact, in this order:
+1. **Ship slots 10–199**: active, `+3 == 0xff`, not the bot itself. This is
+   a full mesh test, so **bots collide with players and with other bots**.
+   The sweep uses the bot's velocity relative to the other ship.
+2. **Station slot 6**, if active. When the bot is inside the station's
+   bounds, the code works out where it sits relative to the docking axis
+   (model `+0x7f4` → `+0x814`, constants 761, 449.44, 175). A bot lined up
+   on the approach is not tested against the station, so docking defenders
+   can fly in [inferred from the constants and branch structure].
+3. **Special objects, slots 300–349.**
+4. **Player structures**, 64 entries (`0x1185e1c + i·0x160c`, within 1500
+   units), tested as slot 235 + i. A miss calls `0x40a650` [role unknown].
+5. **Slots 0–5**: gates and the beacon.
+6. Separately, **world objects 0–999** (asteroids etc., `0x40a3f0`).
+
+Response, which is the same for ships and world objects:
+```
+e  = (m_bot - m_other) / (m_bot + m_other)   // m_bot = ship-type mass (0xff7ee0 + type*0x1e0)
+                                             // m_other = slot +0x15c0, or world object +0x58
+v' = v_other + (v - v_other) * e             // world objects carry a velocity at +0x84
+E  = 0.1 * m_bot * |v' - v|^2
+shields(+0x15f8) -= E    // a positive shield sets the hit flash: +0x2f = 1, +0xc8 = clock
+overflow -> hull(+0x1600), shields = 0
+hull < 0 and slot +2 == 0 -> botloc death report 0x9ce490(slot, me, -1)
+```
+Unlike the own ship, a bot gets **no normal, no push-out and no +5 kick**.
+The velocity is scaled toward the other body's velocity along the bot's own
+direction of travel, so a bot moving fast enough can still end up inside the
+mesh on later frames. Only the bot changes. The ship it hit (even a player)
+is untouched on this client, and that player's own client gives them only
+the soft push above. **So a bot that rams a player bounces and takes damage,
+and the player only gets nudged.**
+
+**Summary: who collides with what on one client.**
+| mover | vs static/world objects | vs ships | test |
+|---|---|---|---|
+| own ship | bounce `−0.8v + 5n` + damage | soft push only, no damage | 7-point probe + mesh |
+| bots I control | mass-ratio bounce + damage, no push-out | mesh hit, mass-ratio bounce + damage (bot only) | centre segment + mesh |
+| remote players, bots others control | none | none | none: dead reckoning, gate pull, repulsor only (§8) |
+| own missiles | fuse/impact | fuse (contact or proximity) | segment + mesh/ellipsoid (ai.md) |
+| others' missiles | none locally | none | slots only |
+
+The server does no collision on the wire either. No message carries a
+collision. A death by impact sends C→S `0x0C`, and a bot death goes in
+botloc.
 
 **Special objects in contact slots 1–4 (gates) and 300–349** (slot model id at
 `ship+0x34`):
@@ -480,8 +608,9 @@ blend.
 > the physics code those offsets are the position. Hull is likely elsewhere;
 > re-check that entry.
 
-**Bots I control** run their own AI and steering code (`0x4338c0`,
-`0x40bf50`; reversing-map "Conflux"). Its integrator was not traced here.
+**Bots I control** run their own AI and steering code (`0x4338c0`;
+reversing-map "Conflux"), and collide in `0x40bf50` (§6). Their integrator was
+not traced here.
 
 ## 9. Anti-tamper around the physics
 
@@ -565,7 +694,73 @@ blend.
    (`31 C0 C3` at file offsets 0x7130/0x7190/0x71f0), would disable the check
    entirely and was not used. Nothing else reads the table or checksums the
    exe's code.
-4. Velocity does not go into the frequent packets: `0x33` carries
+6. **Loadout seal** [static, 2026-11-19]. `0x9cb650` loadout_seal sums the
+   fitted-item id bytes into `0xba79c0` (a plain byte sum, not the shifted
+   one):
+   - gun slots `0xff7d00..07`,
+   - the next 8 slots `0xff7d08..0f`,
+   - engine `0x140ac0c`, plus powerplant/radar/ECM/shield/capacitor, read as
+     `0xff7d19..1d` and mirrored into `0x140ac0d..11`,
+   - `0x140ac1d..24`.
+
+   It then tail-jumps to `0x9c8de0`. It is called wherever the loadout
+   legitimately changes: `0x4374f8` (a slot emptied, `0xfe`), `0x9cd1a4`,
+   `0x9cd3de`, `0x9d24f1` (a message handler), and `0xa1bf9e`.
+   `0x9c8f40` loadout_check runs every frame from the main loop (`0xa27264`,
+   just before the `0xb8e288` exit test). It re-copies the mirror bytes,
+   recomputes the sum and, on a mismatch, sets checkpoint `0x6b` and calls
+   the shutdown → **Last Code 107**. It is skipped while `0xbe5aeb` is set.
+   So equipment ids can't be poked in memory, but the stored sum sits in
+   writable `.data`, so this is obfuscation rather than protection.
+7. **Mayday rate limit** [static, 2026-11-19]. Mayday has two
+   key-bound actions, "Faction Mayday" and "Squad Mayday" (samples.txt; fixes.txt: defaults "=" for faction and "-" for squad, set
+   in Options → Controls:Combat). They are key actions 44 and 45
+   (`0x49c872` switch → `0x1440899` / `0x144089a`), handled in
+   `0x43d6d0`:
+   - Faction sends C→S `0xC3` sub `0xF6` ("mayday1").
+   - Squad sends `0xC3` sub `0xF5` ("mayday2") and needs a squad name
+     (`0xbe3da4`); otherwise the client prints "Only available to members of
+     a squad".
+
+   Both need in-flight (`0xbe5b90`), not the simulator (`0xbe5aeb`), and a
+   location 101–349 (space). Both are 2-byte packets. The server must add the
+   position and broadcast.
+
+   They share a counter at `0x14ff678` with `/tour` (`0x4a003f`, `0xC3`
+   `0xF2`). It is reset to 0 only on location change (`0xa25d6b`). If the
+   counter is 0, the press sends and the counter becomes 1. **So you get one
+   mayday (or tour) per sector visit.** A further press prints "Message not
+   sent due to overuse of command." and increments the counter. Past 7 it
+   warns "ALERT: Continued overuse will result in disconnection." Past 10,
+   `0x43d6d0` returns 0, and the main loop (`0xa26a33`, checkpoint 0x25)
+   logs **"Exit: mayday function abuse"** and shuts down. This is anti-spam
+   rather than anti-cheat, but it is the only other client-side self-kick.
+
+**Checked and not present** (2026-11-19). The import table has no
+IsDebuggerPresent, CheckRemoteDebuggerPresent, Toolhelp/Process32,
+FindWindow/EnumWindows, ReadProcessMemory or OpenProcess, and no strings for
+those names, cheat tools or debuggers, so nothing resolves them at runtime
+either. `VirtualProtect`, `GetTickCount`, `TerminateProcess` and
+`CreateProcessA` each have one call site, all in CRT/library code
+(`0xaa…`–`0xab…`; CreateProcess runs `dxdiag.exe` after a video-mode
+failure). `timeGetTime` drives the FPS counter (`0xa20fe6`) and the network
+library. `QueryPerformanceCounter` drives frame timing and random seeding
+(`0x9c8cab`). Nothing compares the two clocks, so there is **no speed-hack
+(clock-skew) check**. There is no code self-checksum (item 5).
+
+Every call to the shutdown `0xa215e0` (25 sites), and every write of
+`0xb8e288 = 2`, is now accounted for:
+- the anti-tamper items 2–7;
+- init and video failures (`0xa248d7`, `0xa25a68`, `0xa25c1c`, `0xa25c5c`);
+- `/quit`-style commands (`0x4a72eb`);
+- the in-flight quit button (`0x48f25d`). It compares shield/hull with
+  values snapshotted at `0x440d27`/`0x440d43` before allowing it, possibly a
+  combat-logout guard [not traced];
+- "Network Problems Detected" (`0x482724`);
+- the menu quit (`0x49128f`);
+- the crash path (`0xa2734e`);
+- the Dpnet.dll warning (`0x4420e2`, which sets 1, not 2).
+8. Velocity does not go into the frequent packets: `0x33` carries
    **velocity × 10 as i16** at `@0x12` (from snapshot `0xff2ad0..d8`, scale
    const `0xb05ac8` = 10.0). Orientation goes as i16 × 10000. So the server
    *could* sanity-check speed. Whether it does is unknown (server-side).
@@ -586,7 +781,8 @@ speed_tripwire · `0x428290` recalc_mass_thrust · `0x428b60` power_tick ·
 enter_space_handler · `0x4bbfb0` freecam_tick · `0x9dc570` space_dust_fx ·
 `0x49d1e0` dinput_keyboard_poll · `0xa08440` init_ship_types ·
 `0x414460` init_item_tables · `0x4083f0` collide_broadphase_worldobj ·
-`0x40a3f0` collide_segment_vs_worldobj.
+`0x40a3f0` collide_segment_vs_worldobj · `0x407b00` collide_bounds ·
+`0x407430` collide_segment_triangle · `0x40bf50` bots_owned_collision_tick.
 
 ## Open items
 - Which `0xa1a700` call sites verify vs re-seal, and what `0x440660` does.
