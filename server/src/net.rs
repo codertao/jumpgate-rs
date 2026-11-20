@@ -100,6 +100,17 @@ impl Listener {
         events
     }
 
+    /// Close a session: send RakNet's disconnect notification and forget the
+    /// peer. No `Disconnected` event follows (the caller already knows).
+    pub fn close(&mut self, addr: SocketAddr) {
+        if let Some(mut p) = self.peers.remove(&addr) {
+            p.endpoint.disconnect();
+            let out = p.endpoint.flush();
+            Self::send_raw(&self.sock, self.tag, addr, out);
+            eprintln!("[{}] closed {addr}", self.tag);
+        }
+    }
+
     pub fn queue(&mut self, to: SocketAddr, msg: &[u8]) -> bool {
         match self.peers.get_mut(&to) {
             Some(p) if p.endpoint.is_connected() => {

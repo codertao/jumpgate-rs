@@ -19,7 +19,7 @@ re-extracts everything below in about 0.3 s (it needs objdump and checks the SHA
 | `guns.csv` | gun objects (separate struct, see below) | 60 |
 | `ship_types.csv`, `ai_types.csv` | ship hulls, bot AI (physics.md, ai.md) | 88/36 |
 | `locations.csv` | sectors/stations: name, galaxy XYZ, faction | 173 |
-| `station_points.csv` | per station model: dock tube start/end, 4 guide points, launch point (model space; physics.md §6) | 24 |
+| `station_points.csv` | per station model: dock tube start/end, launch tubes 0–3 inner/outer ends (model space; physics.md §6, launch.md) | 25 |
 
 ## Global item ids — `init_item_tables` `0x414460`..`0x424e70`
 

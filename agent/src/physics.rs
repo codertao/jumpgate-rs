@@ -28,6 +28,33 @@ pub struct Flight {
     /// Turn coefficients (rad/s ≈ 1000 × rate at full stick).
     pub pitch_rate: f32,
     pub yaw_rate: f32,
+    /// The launch tube while the ship is still in it (notes/launch.md).
+    pub tube: Option<Tube>,
+}
+
+/// A launch tube in sector coordinates, for the client's tube push.
+#[derive(Clone, Copy, Debug)]
+pub struct Tube {
+    /// Inner end, and unit direction out.
+    pub start: Vec3,
+    pub dir: Vec3,
+    /// Ship-type `size`; half of it counts against the tube radius.
+    pub ship_size: f32,
+}
+
+/// The tube push (`0x40e370`): while inside a launch tube, 0 < along < 175 and
+/// (size/2)² + lateral² < 449.44, velocity += dir × 3 **per frame**.
+pub const TUBE_LENGTH: f32 = 175.0;
+pub const TUBE_RADIUS_SQ: f32 = 449.44;
+pub const TUBE_PUSH: f32 = 3.0;
+
+impl Tube {
+    pub fn contains(&self, p: Vec3) -> bool {
+        let rel = sub(p, self.start);
+        let along = dot(rel, self.dir);
+        let lat_sq = dot(rel, rel) - along * along;
+        along > 0.0 && along < TUBE_LENGTH && (self.ship_size * 0.5).powi(2) + lat_sq < TUBE_RADIUS_SQ
+    }
 }
 
 pub fn dot(a: Vec3, b: Vec3) -> f32 {
@@ -59,6 +86,7 @@ impl Flight {
             drag: hull.drag,
             pitch_rate: hull.pitch,
             yaw_rate: hull.yaw,
+            tube: None,
         };
         f.fix_up();
         f
@@ -119,6 +147,16 @@ impl Flight {
 
     /// Linear dynamics, `0x429bb0` without afterburner, boost or currents.
     pub fn step(&mut self, dt: f32) {
+        // The push is per client frame; one DT step stands for one 30 fps
+        // frame. At 30 fps a Storm leaves the tube at ~170 u/s (faster at
+        // higher frame rates, as on a real client).
+        if let Some(t) = self.tube {
+            if t.contains(self.pos) {
+                self.vel = add(self.vel, scale(t.dir, TUBE_PUSH * dt / DT));
+            } else {
+                self.tube = None;
+            }
+        }
         let speed = self.speed();
         let mut drag_dec = speed * speed / self.mass * self.drag;
         // Brakes: on whenever the throttle is closed and the ship is moving.
@@ -139,7 +177,7 @@ impl Flight {
         self.pos = add(self.pos, scale(self.vel, dt));
     }
 
-    pub fn view(&self, callsign: &str, loc: u16, hull: &Hull) -> ShipView {
+    pub fn view(&self, callsign: &str, loc: u16, hull: &Hull, rank: u8) -> ShipView {
         ShipView {
             loc,
             hull_type: hull.type_id,
@@ -152,6 +190,7 @@ impl Flight {
             thrust: self.thrust(),
             armour: 1.0,
             armour_max: hull.armour,
+            rank,
         }
     }
 }
@@ -171,7 +210,24 @@ mod tests {
             yaw: 0.001571,
             roll: 0.001571,
             engines: 2,
+            tube_offset: 15.0,
+            size: 5.74,
         }
+    }
+
+    #[test]
+    fn launch_tube_catapults_the_ship() {
+        let mut f = Flight::new(&storm(), 758_000.0, [0.0, 0.0, 15.0], [0.0, 0.0, 1.0]);
+        f.tube = Some(Tube { start: [0.0; 3], dir: [0.0, 0.0, 1.0], ship_size: 5.74 });
+        f.throttle = 0.5;
+        let mut steps = 0;
+        while f.tube.is_some() {
+            f.step(DT);
+            steps += 1;
+        }
+        assert!(f.speed() > 150.0 && f.speed() < 250.0, "left the tube at {:.0} u/s", f.speed());
+        assert!(steps < 70, "{steps} frames in the tube");
+        assert!(f.pos[2] >= TUBE_LENGTH);
     }
 
     #[test]

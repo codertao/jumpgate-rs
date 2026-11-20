@@ -113,6 +113,7 @@ mod tests {
             thrust: 736000.0,
             armour: 1.0,
             armour_max: 62500.0,
+            rank: 0,
         }
     }
 

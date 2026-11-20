@@ -46,6 +46,8 @@ pub struct Config {
     /// Returning pilots start at their account's last base.
     pub home_station: u16,
     /// Flat market price and stock for every item (no economy yet).
+    /// Equipment is raised to the client's display floor
+    /// (`proto::EQUIPMENT_MIN_PRICE`, 201); commodities use it as is.
     pub price: u32,
     pub stock: u32,
     pub motd: (String, String),
@@ -101,6 +103,11 @@ pub struct Server {
     /// Refused logins awaiting their reply: one-shot id → state address.
     /// Cleared by `tick`, after the network loop has sent the replies.
     rejected: HashMap<PlayerId, SocketAddr>,
+    /// Transport sessions to close (a newer login replaced them). Drained by
+    /// the network loop with `take_kicks`.
+    kicks: Vec<(Conn, SocketAddr)>,
+    /// xorshift state for launch-tube choice.
+    rng: u64,
     pub log: Vec<String>,
 }
 
@@ -138,8 +145,36 @@ impl Server {
             feed: Feed::new(),
             next_spawn: 0,
             rejected: HashMap::new(),
+            kicks: Vec::new(),
+            rng: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9e37_79b9_7f4a_7c15, |d| d.as_nanos() as u64)
+                | 1,
             log: Vec::new(),
         }
+    }
+
+    /// Sessions the network loop should close (sends RakNet's disconnect).
+    pub fn take_kicks(&mut self) -> Vec<(Conn, SocketAddr)> {
+        std::mem::take(&mut self.kicks)
+    }
+
+    fn random(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    /// A launch tube for a launch into `sector`: one of the station model's
+    /// tubes at random (the classic server chose; captures show 0 and 2).
+    fn pick_tube(&mut self, sector: u16) -> u8 {
+        let tubes = self.world.station(sector).map(|(_, sp)| sp.launch_tubes()).unwrap_or_default();
+        if tubes.is_empty() {
+            return 0;
+        }
+        let i = (self.random() % tubes.len() as u64) as usize;
+        tubes[i]
     }
 
     /// One frame of server-driven ships (from the NPC sim, or anything else):
@@ -330,14 +365,25 @@ impl Server {
             let text = "Wrong password for that callsign.";
             return vec![Out { to, conn: Conn::State, msg: proto::system_chat(0, "Server", text) }];
         }
+        // Whatever a replaced session leaves behind: its ship's removal for
+        // the sector (sent with this login's replies) and its connections.
+        let mut gone = Vec::new();
         if let Some(old) = self.by_state.get(&addr).copied() {
-            self.logout(old);
+            gone.extend(self.logout(old));
         }
-        // One session per account: a new login replaces the old one.
+        // One session per account: a new login replaces the old one and
+        // closes its connections, so a stale client can't keep flying it.
         let key = login.callsign.to_ascii_lowercase();
         if let Some(old) = self.players.values().find(|p| p.callsign.to_ascii_lowercase() == key).map(|p| p.id) {
             self.note(format!("{} logged in again; dropping session {old}", login.callsign));
-            self.logout(old);
+            let (old_state, old_space) = (self.players[&old].state_addr, self.players[&old].space_addr);
+            gone.extend(self.logout(old));
+            if old_state != addr {
+                self.kicks.push((Conn::State, old_state));
+            }
+            if let Some(a) = old_space {
+                self.kicks.push((Conn::Space, a));
+            }
         }
         let acct = self.accounts.get(&login.callsign).expect("account exists after login");
         let callsign = acct.pilot.callsign.clone();
@@ -377,6 +423,7 @@ impl Server {
                         but the game sends it unencrypted: don't reuse a password from anywhere else.";
             out.push(Out { to: pid, conn: Conn::State, msg: proto::system_chat(loc, "Server", text) });
         }
+        out.extend(gone);
         out
     }
 
@@ -452,8 +499,13 @@ impl Server {
         qty.is_finite() && qty > 0.0 && qty <= self.cfg.stock as f32
     }
 
-    fn cost(&self, qty: f32) -> u64 {
-        (qty * self.cfg.price as f32).ceil() as u64
+    /// Unit price of a category, as its listing shows it.
+    fn price(&self, cat: u8) -> u32 {
+        proto::listed_price(cat, self.cfg.price)
+    }
+
+    fn cost(&self, cat: u8, qty: f32) -> u64 {
+        (qty * self.price(cat) as f32).ceil() as u64
     }
 
     fn buy(&mut self, pid: PlayerId, cat: u8, index: u32, qty: f32) -> Vec<Out> {
@@ -462,7 +514,7 @@ impl Server {
             self.note(format!("player {pid}: bad buy cat {cat} #{index} ×{qty}"));
             return vec![self.credits_items(pid)];
         }
-        let cost = self.cost(qty);
+        let cost = self.cost(cat, qty);
         let c = self.pilot_mut(pid);
         if c.credits < cost {
             let out = self.tell(pid, &format!("You need {cost} credits for that."));
@@ -481,7 +533,10 @@ impl Server {
         if !self.players[&pid].docked || !self.valid_qty(qty) {
             return vec![self.credits_items(pid)];
         }
-        let price = self.cfg.price as f32;
+        let Some(cat) = self.pilot(pid).items.get(slot).map(|i| i.cat) else {
+            return vec![self.credits_items(pid)];
+        };
+        let price = self.price(cat) as f32;
         let c = self.pilot_mut(pid);
         if let Some((item, took)) = c.take_item(slot, qty) {
             let gain = (took * price).floor() as u64;
@@ -595,12 +650,13 @@ impl Server {
                 self.note(format!("player {pid} launch {cur} → sector {sector}"));
                 out.push(self.char_record(pid));
                 out.extend(self.reply_tpl(pid, &[0x78]));
-                let m = proto::location_change(
+                let mut m = proto::location_change(
                     self.tpl.launch_redirect.as_deref(),
-                    6,
+                    LAUNCH_SLOT,
                     sector,
                     SpaceTarget::Ip(&advertise),
                 );
+                m[proto::LOCCHG_TUBE_OFF] = self.pick_tube(sector);
                 out.push(Out { to: pid, conn: Conn::State, msg: m });
                 out
             }
@@ -675,7 +731,10 @@ impl Server {
         self.set_account_loc(pid, dest, false);
         out.extend(self.reply_tpl(pid, &[0x78]));
         // sub = arrival slot: the client spawns the ship at that contact slot.
-        let m = proto::location_change(None, sub, dest, SpaceTarget::Ip(&advertise));
+        let mut m = proto::location_change(None, sub, dest, SpaceTarget::Ip(&advertise));
+        if sub == LAUNCH_SLOT {
+            m[proto::LOCCHG_TUBE_OFF] = self.pick_tube(dest);
+        }
         out.push(Out { to: pid, conn: Conn::State, msg: m });
         out
     }
@@ -1033,6 +1092,47 @@ mod tests {
         assert!(s.players[&pid].docked);
     }
 
+    /// Restarting a client (or agent) mid-flight: the new login must remove the
+    /// old ship from everyone's view and close the old connections.
+    #[test]
+    fn relogin_removes_the_old_ship_and_closes_its_sessions() {
+        let mut s = server();
+        let a = into_space(&mut s, "10.0.0.5:4000", "10.0.0.5:4001");
+        let b = into_space(&mut s, "10.0.0.6:4000", "10.0.0.6:4001");
+        s.handle(Conn::Space, addr("10.0.0.5:4001"), &report(a, 1));
+        s.handle(Conn::Space, addr("10.0.0.6:4001"), &report(b, 2));
+        assert!(s.take_kicks().is_empty());
+
+        // pilot0 (a) logs in again from a new process.
+        let out = s.handle(Conn::State, addr("10.0.0.5:5000"), &login_msg("pilot0"));
+        let new = out[0].to;
+        assert_ne!(new, a);
+        let gone = out.iter().find(|o| o.to == b && o.msg[0] == 0x05).expect("b told the old ship left");
+        assert_eq!(proto::u16_at(&gone.msg, proto::LOC_SHIP_OFF), proto::SHIP_GONE);
+        assert!(!s.players.contains_key(&a));
+        let mut kicks = s.take_kicks();
+        kicks.sort_by_key(|k| k.1);
+        assert_eq!(kicks, vec![(Conn::State, addr("10.0.0.5:4000")), (Conn::Space, addr("10.0.0.5:4001"))]);
+    }
+
+    #[test]
+    fn launch_picks_one_of_the_stations_tubes() {
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), real_world());
+        let pid = s.handle(Conn::State, addr("10.0.0.5:4000"), &login_msg("pilot"))[0].to;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let out = s.handle(Conn::State, addr("10.0.0.5:4000"), &travel(proto::ACT_LAUNCH, 18, 0, pid));
+            let m = &out.iter().find(|o| o.msg[0] == 0x08).unwrap().msg;
+            seen.insert(proto::parse_location_change(m).unwrap().tube);
+            s.handle(Conn::State, addr("10.0.0.5:4000"), &travel(proto::ACT_DOCK, 118, 0, pid));
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 3], "Quantar Depot has four tubes");
+    }
+
+    fn real_world() -> World {
+        World::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"))).unwrap()
+    }
+
     #[test]
     fn players_in_a_sector_see_each_other() {
         let mut s = server();
@@ -1182,6 +1282,7 @@ mod tests {
             thrust: 0.0,
             armour: 1.0,
             armour_max: 62500.0,
+            rank: 0,
         };
         // In space but no report from the sector yet: client may still be loading.
         assert!(s.present_ships([(0, &ship)], 1.0).is_empty());
@@ -1416,7 +1517,10 @@ mod tests {
         assert_eq!(s.pilot(pid).items[0].qty, 6.0);
         // A full stock of 99 guns #2.
         let out = s.handle(Conn::State, st, &market(0x04, 2, pid, 99.0));
-        assert_eq!(credits_of(&out), 200_000 - 990 + 396 - 99 * 99);
+        assert_eq!(credits_of(&out), 200_000 - 990 + 396 - 99 * 201, "equipment at the 201 display floor");
+        // Equipment listings show 201 (the client hides anything ≤ 200).
+        let gl = s.handle(Conn::State, st, &market(0x00, 0, pid, 0.0));
+        assert_eq!((gl[0].msg[0], proto::u32_at(&gl[0].msg, 8)), (0x0a, 201));
         // Buy a gun and fit it in gun slot 0.
         s.handle(Conn::State, st, &market(0x04, 5, pid, 1.0));
         let slot = s.pilot(pid).items.iter().position(|i| i.cat == 0 && i.idx == 5).unwrap() as u8;

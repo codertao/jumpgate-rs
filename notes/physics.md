@@ -171,9 +171,11 @@ The same function also handles:
   - State 2: steer the nose 0.023 per frame toward the beacon. While aligned
     (dot > 0.9999) and speed < 25, throttle goes up by 1 per frame (cap 22).
     If speed > 30, throttle drops to 0. Within 3 units it moves to state 3.
-  - State 3: aim at the dock point. Throttle +1 while speed < 75, and 0 if
-    speed > 90. Done within 60 units.
+  - State 3: aim at the tube's inner end (`+0x7f4`). Throttle +1 while
+    speed < 75, and 0 if speed > 90. Done within 60 units of it.
   - These steps are per frame, so they depend on frame rate.
+  - The beacon is on the tube axis 1500 units out from `+0x814` (2550 in
+    loc 107). Full write-up: **autodock.md**.
 - **Afterburner** needs throttle ≥ 6 and fuel > 0. **Brakes** need throttle ≤ 5
   and fuel > 0. Running out shows a message and plays a sound. Brakes spawn
   particle effects.
@@ -475,38 +477,46 @@ botloc.
 | `0x1ae` (430, `cf_eruption.x`, placed by S→C 0x78 type 15) | **Repulsor** within 2000: `v += r̂·(10000/m)·(1 + 1/d)` per frame (not × dt). |
 
 **Docking with stations** (model points `+0x7f4` → `+0x814` define the docking
-axis; four guide segments at `+0x834 + k*0x20`):
+axis; the four launch tubes are at `+0x834 + k*0x20` → `+0x8b4 + k*0x20`,
+see launch.md):
 - **Dock** when all of these hold: inside the tube (radial² + (size/2)² < 761);
   less than **60** units along the axis; **speed < 100**; controls live; you
   are allowed to dock there (faction table `0xbe5abc[owner]` == 1, location not
   "unregulated" (6), `0xbe5aeb` clear). Docking zeroes v and all sticks and the
   throttle, sends `0x0F` (392 B loadout) and `0x07` sub 2 "dock" (`"Error
   Sending Dock Packet"`), and sets `0xbe5bc8`/`0xbe5b01`.
-- **Otherwise** you are pushed along the guide segments by 3 u/s per frame
+- **Otherwise**, inside a launch tube (and only while the "just launched"
+  flag `0xbe5af6` is set) you are pushed out along it by 3 u/s per frame
   (3.3 for player stations, whose thresholds are 1250 / 1761 within a 1500
-  range).
+  range). This is the launch catapult (launch.md). Earlier versions of these
+  notes read it as guide segments pushing off-tube ships; corrected
+  2026-11-20.
 
 **Station points extract** [static + capture check, 2026-11-19]. The dock
 and launch points are float immediates in the same model loaders as the
 collision volumes. `tools/jg_tables.py` tracks register immediates
 (`mov`/`xor`), maps a register to a model through `mov reg, ds:[0x14ff690 +
-id·4]`, and collects stores to `+0x7f4..+0x8bc`. It writes
-**`extracts/station_points.csv`**: 24 station models, each with `dock_start`
-(`+0x7f4`), `dock_end` (`+0x814`), `guide0..3` (`+0x834 + 0x20k`) and `launch`
-(`+0x8b4`), in model space. Components that are never stored are written as 0
-[inferred: the object is zeroed beforehand]. Placement: the sector's contact
+id·4]`, and collects stores to `+0x7f4..+0x91c`. It writes
+**`extracts/station_points.csv`**: 25 station models, each with `dock_start`
+(`+0x7f4`), `dock_end` (`+0x814`) and launch tubes `tube0..3_in`
+(`+0x834 + 0x20k`) / `tube0..3_out` (`+0x8b4 + 0x20k`), in model space.
+Components that are never stored are written as 0 [inferred: the object is
+zeroed beforehand]. Before 2026-11-20 the extractor missed model pointers
+loaded into eax (objdump prints `mov eax,ds:…` without `DWORD PTR`), which
+zeroed some components (e.g. Quantar Core tube 0's inner x, and dock points
+of models 4–8, 347, 367, 412, 413) and dropped model 411. Placement: the sector's contact
 slot 6 (station row, `object_id` 6, in `sector_objects_all.csv`). World point =
 pos + x·right + y·up + z·fwd, with right = up × fwd. Checks against the captures:
+- Launches: all three captured launches (118 tube 2, 109 tube 2, 107
+  tube 0) first report at rest exactly where launch.md's placement rule puts
+  them (within 1 unit).
 - Quantar Core (107, model 323, station at (−23.37, 0, 0), identity
-  orientation): launch → (−537.7, 155.3, −1570.4). The captured launch was at
-  (−537.7, 155.3, −1461.1): x and y match, and z is 109 units further in
-  (spawned between guide0 and the launch point, or pushed back along the
-  guide). The last report before docking, (−23.0, 146.8, 10.5), is 59 units
+  orientation): the last report before docking, (−23.0, 146.8, 10.5), is 59 units
   past `dock_end` (−20.2, 143.5, −48.5) on the tube axis. So "within 60
   along the axis" is measured from `dock_end`, and ships come in from outside
   along `dock_start → dock_end`.
 - Quantar Depot (118, model 380): the captured launch y (611.3) equals the
-  model's guide y.
+  tubes' y.
 
 **Service beam `0x40cb50`** (refuel / repair / rearm / transaction pads, models
 `0x157..0x177`): it freezes the ship (v = 0, sticks = 0) and shows "Hold

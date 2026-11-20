@@ -140,6 +140,9 @@ pub struct Agent {
     pid: u32,
     loc: u16,
     ship_type: u8,
+    rank: u8,
+    /// Launch tube from the last 0x08 (sub 6).
+    tube: u8,
     engine: u8,
     clock0: Instant,
     /// Last time another ship's report reached us in our sector.
@@ -159,6 +162,8 @@ impl Agent {
             pid: 0,
             loc: 0,
             ship_type: 0,
+            rank: 0,
+            tube: 0,
             engine: 0xfe,
             clock0: Instant::now(),
             company: None,
@@ -225,6 +230,7 @@ impl Agent {
                 if let Some(c) = proto::parse_char_record(m) {
                     self.pid = c.pid;
                     self.ship_type = c.ship_type;
+                    self.rank = c.rank;
                     self.engine = c.fittings[24];
                     if let Phase::LoggingIn { .. } = self.phase {
                         self.loc = c.loc;
@@ -262,6 +268,7 @@ impl Agent {
                     self.log(&format!("0x08 names space server {ip}; using {} (the configured server)", self.cfg.server));
                 }
                 self.loc = lc.loc;
+                self.tube = lc.tube;
                 self.company = None;
                 match Link::open("space", SocketAddr::new(self.cfg.server, self.cfg.space_port)) {
                     Ok(l) => self.space = Some(l),
@@ -290,13 +297,20 @@ impl Agent {
             yaw: 0.001,
             roll: 0.001,
             engines: 1,
+            ..Default::default()
         });
         let thrust = self.world.engine_thrust.get(self.engine as usize).copied().unwrap_or(DEFAULT_ENGINE_THRUST);
         let (flight, ai) = match self.world.station(self.loc) {
             Some((st, sp)) => {
-                let route = Route::around(st, sp, self.cfg.laps);
-                self.log(&format!("patrol ring {:.0} u, {} waypoints", route.radius, route.ring.len()));
-                let f = Flight::new(&hull, thrust, route.launch, route.launch_fwd);
+                let route = Route::around(st, sp, self.loc, self.cfg.laps, self.tube, &hull);
+                self.log(&format!(
+                    "launch tube {}; patrol ring {:.0} u, {} waypoints",
+                    self.tube,
+                    route.radius,
+                    route.ring.len()
+                ));
+                let mut f = Flight::new(&hull, thrust, route.launch, route.launch_fwd);
+                f.tube = Some(route.tube);
                 (f, Some(Patrol::new(route)))
             }
             None => {
@@ -355,7 +369,7 @@ impl Agent {
 
     fn fly(&mut self, now: Instant) {
         let clock = self.clock();
-        let (pid, loc) = (self.pid, self.loc);
+        let (pid, loc, rank) = (self.pid, self.loc, self.rank);
         let callsign = self.cfg.callsign.clone();
         let company = self.company.is_some_and(|t| t.elapsed() < COMPANY_TIMEOUT);
         let Phase::Flying(s) = &mut self.phase else { return };
@@ -385,7 +399,7 @@ impl Agent {
 
         let space_up = self.space.as_ref().is_some_and(|l| l.ep.is_connected());
         if space_up {
-            let view = s.flight.view(&callsign, loc, &s.hull);
+            let view = s.flight.view(&callsign, loc, &s.hull, rank);
             let space = self.space.as_mut().unwrap();
             if s.last_full.map_or(true, |t| t.elapsed() >= FULL_REPORT_EVERY) {
                 s.last_full = Some(now);

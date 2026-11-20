@@ -69,28 +69,51 @@ updates should match what they predict.
 
 ## Patrol AI (first behaviour)
 
-Shaped like the stock defender (ai.md §2: launch → patrol → return → dock).
-Geometry comes from `extracts/station_points.csv` (physics.md §6, "Station
-points extract"):
-- **Launch:** the ship appears at the model's launch point (`+0x8b4`), facing
-  away from the station horizontally. It flies 800 units straight out at half
-  speed.
+Shaped like the stock defender (ai.md §2: launch → patrol → return → dock),
+with the docking copied from the client's Auto-Dock (autodock.md). Geometry
+comes from `extracts/station_points.csv` and the station's bounding radius
+(`model_radius`):
+- **Launch:** as the client does (notes/launch.md): the ship appears at rest
+  in the launch tube the server's 0x08 names (@2), `f142` units down it,
+  nose along the tube. Our physics applies the client's tube push (+3 u/s
+  per 1/30 s step while inside the tube), and the AI holds the nose straight
+  until the ship is out, which takes ~1.3 s and leaves it at ~240 u/s with
+  full throttle. It then carries on straight at cruise until 300 units clear
+  of the station's bounding sphere. Unit tests fly from every tube at both
+  stations.
 - **Patrol:** a ring of 12 waypoints per lap, counter-clockwise about the
-  station's up axis, in the plane of the dock point. The radius is
-  max(3000, 2.5 × launch distance): 4150 at Quantar Core and 3000 at
-  Quantar Depot. The ring starts at the exit's bearing and ends on the
-  docking axis after `laps` full turns. Waypoints are flown at top speed
-  (√(thrust/drag), 335 u/s for a starter Storm).
-- **Entry:** a point on the docking axis, one ring radius out from `dock_end`.
-  The ship slows towards it to line up.
-- **Approach:** down the axis to `dock_end`, at most 70 u/s (like the
-  Auto-Dock autopilot's state 3).
-- **Dock:** within 50 units of `dock_end` and under 100 u/s (the client
-  allows < 60 and < 100).
+  station's up axis, in the plane of the dock point. Radius = the largest of
+  3000, 2.5 × launch distance, 1.5 × station radius, and beacon distance +
+  2500 (5000 at Quantar Core). The ring ends on the docking axis after `laps`
+  full turns. Waypoints are flown at top speed (√(thrust/drag), 335 u/s for a
+  starter Storm), easing to ≤ 150 u/s when a waypoint is well off the nose
+  (a Storm at full throttle turns on an ~850 u radius and would orbit it).
+  The last ring point is approached slowly for the turn onto the axis.
+- **Run-in (ToBeacon):** inward along the axis to the docking beacon (1500 out
+  from `dock_end`, 2550 at Quantar Core), at ≤ 150 u/s and slowing with
+  distance. A velocity controller holds the axis line: wanted velocity = along
+  the axis plus a sideways term proportional to the error, with the nose
+  pointed at that plus a correction for the velocity error (damps the swing).
+- **Stop:** within 350 of the beacon (the Auto-Dock's engage range), close
+  the throttle and brake to < 2 u/s. The client damps velocity ×0.98 per
+  frame instead; we use the real brakes and drag so other clients' dead
+  reckoning agrees.
+- **Creep:** face the beacon and creep onto it at up to 25 u/s with 22 %
+  throttle (the client's state 2), easing off near it; done within 10 units.
+- **Final:** down the axis towards `dock_start` at ≤ 70 u/s (state 3), thrust
+  only once lined up, same axis-holding controller.
+- **Dock:** within 50 units of `dock_end` and under 100 u/s (the client's dock
+  test allows < 60 and < 100).
 
-Unit test: the whole patrol flown at the real Quantar Core and Depot geometry.
-At Core it docks after about 204 s and never goes more than ~200 units outside
-the ring.
+Unit tests fly the whole patrol at the real Quantar Core and Depot geometry
+and assert that the ship never enters the station's bounding sphere more than
+30 units off the axis (launch excepted) and stays within 30 units of the axis
+on the final run. Typical run: stop ~5 off axis, creep to the beacon, final
+run ≤ 1 unit off axis, docked after ~230 s.
+
+Reports carry the pilot's rank (0x05 @0x14, from the 0x06) and set the cargo
+pod byte (@0x17) only for the Cargo Tow hulls. Before 2026-11-20 both were
+copied from a captured Thunder, so every agent showed rank 30 and a pod.
 
 ## Status
 
@@ -98,12 +121,18 @@ the ring.
   provisioned, launched into 107, had their space sessions bound, flew the
   patrol, docked at 7 and logged out. The snapshot had Storm / 200,000 /
   last base 7 with argon2id hashes only.
-- **Not yet checked with the real client:** that agents appear and move
-  smoothly, and that they vanish on dock (0xfa removal).
+- 2026-11-20, first look with the real client: agents visible and moving.
+  Reported and fixed: a cargo pod on every agent, rank 30 shown for rank-0
+  agents, and an approach that overshot the axis and would have hit the
+  station. The new approach is unit-tested only so far.
+- 2026-11-20, second look: docking good. Launch started at rest with no
+  catapult and always from one point: fixed (tube push, server-chosen
+  tube). Restarting the agents left a second Agent01 in the sector: the
+  server dropped the replaced session's ship-removal messages; fixed (see
+  server.md "Sessions").
 - Approximations: mass = hull + 5000 (fitted equipment isn't summed yet). No
-  collision with the station: the route stays outside it and comes in along
-  the tube. Launch facing doesn't follow the guide segments exactly (captures:
-  fwd (0, 0, −1) at Core).
+  collision model: the route avoids the station's bounding sphere except down
+  the tube.
 
 ## Next
 

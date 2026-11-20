@@ -399,13 +399,16 @@ with open(os.path.join(OUT, 'locations.csv'), 'w', newline='') as f:
 # The model loaders (0xa27b30 .. ~0xa72400, generated region-init code) load a
 # model pointer from the table 0x14ff690 + id*4 and store float immediates into
 # it, the same way as the collision volumes (physics.md section 6). Docking tube:
-# +0x7f4 -> +0x814. Guide points: +0x834 + k*0x20 (k = 0..3). Launch: +0x8b4.
+# +0x7f4 -> +0x814. Launch tube k (k = 0..3): inner end +0x834 + k*0x20, outer
+# end +0x8b4 + k*0x20 (the 0x08 launch handler 0x9d34c8 and the tube push in
+# 0x40e370 index both by the tube number from S->C 0x08 @2).
 # Components never written are 0 (validated against captured launches/docks).
 MODEL_TABLE = 0x14ff690
 R_ = r'(e[a-d]x|e[sd]i|ebp)'
 regs, mptr, pts = {}, {}, {}
 for a, op, args in disasm(0xa27b30, 0xa72400):
-    m = re.match(R_ + r',DWORD PTR ds:0x([0-9a-f]+)$', args)
+    # objdump writes loads into eax as `mov eax,ds:0x...` (no DWORD PTR).
+    m = re.match(R_ + r',(?:DWORD PTR )?ds:0x([0-9a-f]+)$', args)
     if op == 'mov' and m:
         r, v = m.group(1), int(m.group(2), 16)
         regs.pop(r, None); mptr.pop(r, None)
@@ -427,7 +430,7 @@ for a, op, args in disasm(0xa27b30, 0xa72400):
     m = re.match(r'DWORD PTR \[' + R_ + r'\+0x([0-9a-f]+)\],(\S+)$', args)
     if op == 'mov' and m:
         off = int(m.group(2), 16)
-        if m.group(1) in mptr and 0x7f4 <= off < 0x8c0:
+        if m.group(1) in mptr and 0x7f4 <= off < 0x920:
             v = m.group(3)
             val = int(v, 16) if v.startswith('0x') else regs.get(v)
             if val is not None:
@@ -444,7 +447,8 @@ for a, op, args in disasm(0xa27b30, 0xa72400):
     if m and op in ('pop', 'inc', 'dec', 'neg', 'not'):
         regs.pop(m.group(1), None); mptr.pop(m.group(1), None)
 station_points = []
-PT_FIELDS = [('dock_start', 0x7f4), ('dock_end', 0x814)] + [('guide%d' % k, 0x834 + 0x20 * k) for k in range(4)] + [('launch', 0x8b4)]
+PT_FIELDS = [('dock_start', 0x7f4), ('dock_end', 0x814)] + \
+    [(n, base + 0x20 * k) for k in range(4) for n, base in (('tube%d_in' % k, 0x834), ('tube%d_out' % k, 0x8b4))]
 for mid in sorted(pts):
     d = pts[mid]
     if 0x7f4 not in d and 0x814 not in d:

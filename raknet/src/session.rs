@@ -192,6 +192,16 @@ impl Endpoint {
         self.connected
     }
 
+    /// Close the connection: send ID_DISCONNECTION_NOTIFICATION (0x14) on the
+    /// next [`flush`](Self::flush), as RakNet's `CloseConnection` does. The
+    /// peer sees [`Event::Disconnected`]; we stop being connected.
+    pub fn disconnect(&mut self) {
+        if self.connected {
+            self.emit_transport(vec![MessageId::DisconnectionNotification as u8], true);
+            self.connected = false;
+        }
+    }
+
     /// A reliable packet went unacked for [`ACK_TIMEOUT`]: the peer is gone.
     pub fn is_lost(&self) -> bool {
         self.lost
@@ -889,6 +899,16 @@ mod tests {
         let evs: Vec<Event> = client.flush().iter().flat_map(|d| server.recv(d)).collect();
         assert!(evs.contains(&Event::Disconnected));
         assert!(!server.is_connected());
+    }
+
+    #[test]
+    fn server_can_close_a_session() {
+        let (mut server, mut client, _) = connected_pair();
+        server.disconnect();
+        assert!(!server.is_connected());
+        let evs: Vec<Event> = server.flush().iter().flat_map(|d| client.recv(d)).collect();
+        assert!(evs.contains(&Event::Disconnected), "{evs:?}");
+        assert!(!client.is_connected());
     }
 
     fn messages(evs: Vec<Event>) -> Vec<Vec<u8>> {

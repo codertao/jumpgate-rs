@@ -51,6 +51,7 @@ impl NpcSim {
             thrust: 0.0,
             armour: 1.0,
             armour_max: hull.armour,
+            rank: 0,
         };
         let mut npc = Npc { id, hull, ship, brain };
         npc.brain.step(&mut npc.ship, &npc.hull, 0.0);

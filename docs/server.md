@@ -78,7 +78,7 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 | C→S | conn | Server does | Source |
 |---|---|---|---|
 | 0x05 (33 B) login | state | verify or provision the account (see "Accounts"); new player id; **built 0x06** from the account, docked at its last base; 0x8c, our 0x81, 0x18; a password-reuse warning (0x04) for new pilots. Wrong password: one 0x04 line, no session | capture + built |
-| 0x09 listing cmd | state | built listing: every entry stock 99, price 99, flag 1 (no surcharge) | built |
+| 0x09 listing cmd | state | built listing: every entry stock 99, price 99 (equipment 201, the display floor), flag 1 (no surcharge) | built |
 | 0x09 buy (04/05/07/0a–10) | state | docked, index in range, 0 < qty ≤ stock, credits ≥ ⌈99·qty⌉, free slot → add to item list, charge; always answers 0x45 | built |
 | 0x09 sell (08) | state | index = item-list slot; +⌊99·qty⌋; 0x45 | built |
 | 0x66 fitting | state | op 0 unfit (ship slot → list slot), op 1 fit, op 2 missile fired (rack emptied, no reply); 0x45 | built |
@@ -142,7 +142,7 @@ background.
   [bin]. Live-confirmed 2026-11-18: NPC motion stays smooth with 0x33 sent
   sequenced, so the client accepts server-sent sequenced packets.
 - Economy: listings, buy/sell, fitting and ship changes are built (flat
-  99/99, 2026-11-19; "Accounts and economy" below). Still to design: real
+  99/99, equipment 201 since 2026-11-20; "Accounts and economy" below). Still to design: real
   stock and prices per station, and contracts (0x4B). The captured prices are
   a reference only.
   Ore sale prices must follow the client's mineral-composition formula
@@ -183,8 +183,10 @@ background.
   don't model come from the captured template when one is loaded, else from
   captured constants), 0x45, 0x92, and the listings. See message-types "0x06
   character record".
-- **Economy rules:** every listing shows stock 99 and price 99 (`Config::price`
-  / `stock`). Buying more than 99 or more than you can afford is refused, with
+- **Economy rules:** every listing shows stock 99; commodities cost 99 and
+  equipment 201 (`Config::price` / `stock`, raised by `proto::listed_price`).
+  The client hides any equipment priced ≤ 200 (message-types "Station
+  market"), so a flat 99 showed empty equipment tabs (fixed 2026-11-20). Buying more than 99 or more than you can afford is refused, with
   a reason in chat; every buy and sell answers with the current 0x45. Stock
   isn't depleted. Ship changes cost 99. Item indices are the listing entry
   numbers, as in the 0x45 item list.
@@ -263,3 +265,26 @@ answers had nowhere to go. Fixed in `game.rs`:
 Test: `stale_space_session_does_not_unbind_the_new_one`. The RakNet layer
 wasn't at fault.
 
+
+## Sessions  [2026-11-20]
+
+- **One session per account.** A login for a callsign that's already
+  logged in replaces the old session. The old player is logged out, the
+  sector gets its ship-removal report (0x05 with ship type 0xfa) with the new
+  login's replies, and its state and space connections are **closed**: the
+  game queues them (`Server::take_kicks`) and the network loop sends RakNet's
+  ID_DISCONNECTION_NOTIFICATION (`Endpoint::disconnect`, `Listener::close`).
+  Until this fix the removal messages were built and thrown away, so
+  restarting an agent mid-flight left its old ship hanging in other players'
+  sectors.
+- A transport timeout or disconnect logs the player out the same way (the
+  removal goes out; nothing to close).
+- Two processes running the same callsign will keep kicking each other: each
+  reconnects (agents retry after 10 s) and replaces the other.
+
+## Launch tubes  [2026-11-20]
+
+S→C 0x08 sub 6 carries the launch tube @2 (notes/launch.md). The server
+picks one of the station model's tubes at random (`pick_tube`; all four at
+the core stations and depots). This is done for launches and for `relocate`
+to a launch slot, which used to send 0xcc there, an out-of-range tube.

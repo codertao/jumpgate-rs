@@ -135,6 +135,9 @@ pub fn patch_char_record(rec: &mut [u8], callsign: &str, pid: u32, loc: u16) {
 /// launch (verified against the capture and the extract's gate links); dest loc @0x2c.
 pub const LOCCHG_LEN: usize = 64;
 pub const LOCCHG_LOC_OFF: usize = 0x2c;
+/// Launch tube (0–3) for sub 6: the client places the ship in that tube of the
+/// station model (`0x9d34a3`; notes/launch.md). Captures: 2 at 118 and 109, 0 at 107.
+pub const LOCCHG_TUBE_OFF: usize = 2;
 
 pub enum SpaceTarget<'a> {
     /// Connect (or stay connected) to the space server at this IPv4 address.
@@ -338,12 +341,25 @@ fn hull_points(armour: f32) -> (f32, f32, f32) {
     (max, max, max * 3.0)
 }
 
+/// 0x05 @0x17: the ship tows a cargo pod (`cargo.x`, model 119), drawn and
+/// collided behind it. The client's sender (`0x9cd6cd`) sets it exactly for
+/// the "Cargo Tow" hulls: Pioneer (32), Condor (62) and Thunder (92).
+pub const LOC_CARGO_POD_OFF: usize = 0x17;
+pub const LOC_RANK_OFF: usize = 0x14;
+
+pub fn tows_cargo_pod(ship_type: u16) -> bool {
+    matches!(ship_type, 32 | 62 | 92)
+}
+
 /// S→C 0x05 for a server-driven ship (176 B).
 ///
 /// Unknown scalar bytes are copied from the user's own report (2026-11-10
 /// capture) with the callsign and the uninitialised-memory tail removed: the
-/// equipment array @4..0x14 (`19 19` then `fe` = empty), 0x14..0x19 and
-/// 0x3e..0x43. Their meaning isn't traced.
+/// equipment array @4..0x14 (`19 19` then `fe` = empty), 0x16 and
+/// 0x3e..0x43. Their meaning isn't traced. Known: 0x14 = pilot rank (the
+/// sender copies 0x06 @2, `0x9d22cc`; shown as the level), 0x15 = fitted ECM
+/// while it's switched on, else 0xfe (`0x9cd686`), 0x17 = cargo pod (see
+/// [`tows_cargo_pod`]). The capture had rank 30 and a pod (a Thunder).
 pub fn ship_report(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
     let mut m = vec![0u8; LOC_REPORT_LEN];
     m[0] = 0x05;
@@ -351,7 +367,9 @@ pub fn ship_report(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
     m[4..0x14].fill(0xfe);
     m[4] = 0x19;
     m[5] = 0x19;
-    m[0x14..0x19].copy_from_slice(&[0x1e, 0xfe, 0x01, 0x01, 0x0b]);
+    m[0x14..0x19].copy_from_slice(&[0x00, 0xfe, 0x01, 0x00, 0x0b]);
+    m[LOC_RANK_OFF] = ship.rank;
+    m[LOC_CARGO_POD_OFF] = tows_cargo_pod(ship.hull_type) as u8;
     put_cstr(&mut m[0x19..0x2f], &ship.callsign); // squad name @0x2f stays empty
     m[0x3e..0x43].copy_from_slice(&[0x04, 0x00, 0x7d, 0x05, 0x0d]);
     put_u16(&mut m, LOC_LOC_OFF, ship.loc);
@@ -457,6 +475,7 @@ pub struct CharSummary {
     pub pid: u32,
     pub loc: u16,
     pub faction: u8,
+    pub rank: u8,
     pub ship_type: u8,
     pub credits: u64,
     pub fittings: [u8; Fittings::LEN],
@@ -472,6 +491,7 @@ pub fn parse_char_record(m: &[u8]) -> Option<CharSummary> {
         pid: u32_at(m, CHAR_PID_OFF),
         loc: u16_at(m, CHAR_LOC_OFF),
         faction: m[CHAR_FACTION_OFF],
+        rank: m[CHAR_RANK_OFF],
         ship_type: m[CHAR_SHIP_OFF],
         credits: u64::from_le_bytes(m[CHAR_CREDITS_OFF..CHAR_CREDITS_OFF + 8].try_into().unwrap()),
         fittings,
@@ -486,6 +506,8 @@ pub struct LocationChange {
     pub loc: u16,
     /// Space server to use; None = "none" (docked: drop space).
     pub space_ip: Option<String>,
+    /// Launch tube, meaningful when `sub` is 6.
+    pub tube: u8,
 }
 
 pub fn parse_location_change(m: &[u8]) -> Option<LocationChange> {
@@ -498,7 +520,7 @@ pub fn parse_location_change(m: &[u8]) -> Option<LocationChange> {
     } else {
         game::read_wstr(m, off, game::SPACE_IP_FIELD_BYTES).filter(|s| !s.is_empty())
     };
-    Some(LocationChange { sub: m[1], loc: u16_at(m, LOCCHG_LOC_OFF), space_ip })
+    Some(LocationChange { sub: m[1], loc: u16_at(m, LOCCHG_LOC_OFF), space_ip, tube: m[LOCCHG_TUBE_OFF] })
 }
 
 /// C→S 0x0F cargo report (392 B, sender `0x439f16`): `[0f][u8 flag][cc cc]`,
@@ -587,8 +609,24 @@ pub fn listing_category(cmd: u8) -> Option<u8> {
 /// flag bytes at 0x31C (1 = no 2% surcharge; the commodity handler zeroes them).
 pub const LISTING_FLAGS_OFF: usize = 0x31c;
 
+/// The market list (`0x44f870`) hides an equipment entry unless its stock is
+/// non-zero **and its price is above 200** (outside GM / "show all" modes).
+/// Commodities aren't filtered by price.
+pub const EQUIPMENT_MIN_PRICE: u32 = 201;
+
+/// The price a listing can actually show for `cat`: `price`, raised to the
+/// equipment floor for everything but commodities.
+pub fn listed_price(cat: u8, price: u32) -> u32 {
+    if cat == crate::character::CAT_COMMODITY {
+        price
+    } else {
+        price.max(EQUIPMENT_MIN_PRICE)
+    }
+}
+
 pub fn listing(cat: u8, stock: u32, price: u32) -> Option<Vec<u8>> {
     let (ty, n) = listing_for_category(cat)?;
+    let price = listed_price(cat, price);
     let mut m = vec![0u8; LISTING_LEN];
     m[0] = ty;
     for i in 0..n {
@@ -780,6 +818,7 @@ mod tests {
             thrust: 736000.0,
             armour: 1.0,
             armour_max: 62500.0,
+            rank: 0,
         }
     }
 
@@ -897,10 +936,34 @@ mod tests {
 
     #[test]
     fn location_change_round_trips() {
-        let m = location_change(None, 6, 107, SpaceTarget::Ip("127.0.0.1"));
-        assert_eq!(parse_location_change(&m), Some(LocationChange { sub: 6, loc: 107, space_ip: Some("127.0.0.1".into()) }));
+        let mut m = location_change(None, 6, 107, SpaceTarget::Ip("127.0.0.1"));
+        m[LOCCHG_TUBE_OFF] = 3;
+        assert_eq!(
+            parse_location_change(&m),
+            Some(LocationChange { sub: 6, loc: 107, space_ip: Some("127.0.0.1".into()), tube: 3 })
+        );
         let m = location_change(None, 0xcc, 7, SpaceTarget::None);
         assert_eq!(parse_location_change(&m).unwrap().space_ip, None);
+    }
+
+    #[test]
+    fn report_rank_and_cargo_pod_follow_the_ship() {
+        let mut v = npc();
+        v.hull_type = 90;
+        v.rank = 0;
+        let m = ship_report(&v, 1, 1.0);
+        assert_eq!((m[LOC_RANK_OFF], m[LOC_CARGO_POD_OFF]), (0, 0), "Storm, rank 0: no pod");
+        v.hull_type = 92;
+        v.rank = 12;
+        let m = ship_report(&v, 1, 1.0);
+        assert_eq!((m[LOC_RANK_OFF], m[LOC_CARGO_POD_OFF]), (12, 1), "Thunder tows a pod");
+    }
+
+    #[test]
+    fn equipment_listings_respect_the_display_floor() {
+        assert_eq!(u32_at(&listing(7, 99, 99).unwrap(), 8), EQUIPMENT_MIN_PRICE);
+        assert_eq!(u32_at(&listing(3, 99, 99).unwrap(), 8), 99);
+        assert_eq!(u32_at(&listing(0, 99, 5000).unwrap(), 8), 5000);
     }
 }
 

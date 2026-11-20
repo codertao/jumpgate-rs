@@ -23,6 +23,12 @@ pub struct Hull {
     pub roll: f32,
     /// Number of engine mounts: thrust = engines × engine thrust (physics.md §5).
     pub engines: u8,
+    /// Ship-type field +0x142 (`f142`): how far down the launch tube the ship
+    /// appears (notes/launch.md).
+    pub tube_offset: f32,
+    /// Ship-type field +0x144 (`size`): half of it counts against the launch
+    /// tube's radius.
+    pub size: f32,
 }
 
 impl Hull {
@@ -31,6 +37,19 @@ impl Hull {
     /// updates.
     pub fn cruise_thrust(&self, speed: f32) -> f32 {
         self.drag * speed * speed
+    }
+
+    /// Distance from the tube's inner end to where a launch places the ship:
+    /// `f142` × 5 for types 241–242, × 4 for 246–248, × 2 for 120–121
+    /// (`0x9d363a`…).
+    pub fn launch_depth(&self) -> f32 {
+        let k = match self.type_id {
+            241 | 242 => 5.0,
+            246..=248 => 4.0,
+            120 | 121 => 2.0,
+            _ => 1.0,
+        };
+        self.tube_offset * k
     }
 }
 
@@ -51,6 +70,8 @@ pub struct ShipView {
     /// Armour remaining as a fraction 0..1, and the hull's full armour points.
     pub armour: f32,
     pub armour_max: f32,
+    /// Pilot rank, shown as the level on other clients (0x05 @0x14).
+    pub rank: u8,
 }
 
 pub fn length(v: Vec3) -> f32 {

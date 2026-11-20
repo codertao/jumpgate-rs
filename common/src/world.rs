@@ -11,7 +11,8 @@
 //! - `sector_objects_all.csv` also gives each sector's station (the object in
 //!   contact slot 6) with its model, position and orientation.
 //! - `station_points.csv`: per station model, the docking tube (`+0x7f4` →
-//!   `+0x814`), guide points and launch point (`+0x8b4`), in model space.
+//!   `+0x814`) and up to four launch tubes (inner end `+0x834 + 0x20k`, outer
+//!   end `+0x8b4 + 0x20k`), in model space.
 //! - `engines.csv`: engine thrust by index.
 
 use crate::ship::{Hull, Vec3};
@@ -48,6 +49,8 @@ pub struct World {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Station {
     pub model: u16,
+    /// Bounding radius of the model (sector_objects_all.csv `model_radius`).
+    pub radius: f32,
     pub pos: Vec3,
     pub fwd: Vec3,
     pub up: Vec3,
@@ -60,10 +63,29 @@ pub struct StationPoints {
     /// beyond `dock_end` (captured dock at Quantar Core: just past the end).
     pub dock_start: Vec3,
     pub dock_end: Vec3,
-    pub guides: [Vec3; 4],
-    /// `+0x8b4`: where a launching ship appears (captured launches match in
-    /// x and y).
-    pub launch: Vec3,
+    /// Launch tubes 0–3 (S→C 0x08 @2 picks one). A tube whose ends coincide
+    /// doesn't exist on that model.
+    pub tubes: [LaunchTube; 4],
+}
+
+/// A launch tube, inner end → outer end (model space).
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct LaunchTube {
+    pub inner: Vec3,
+    pub outer: Vec3,
+}
+
+impl LaunchTube {
+    pub fn exists(&self) -> bool {
+        self.inner != self.outer
+    }
+}
+
+impl StationPoints {
+    /// Numbers of the tubes this model has.
+    pub fn launch_tubes(&self) -> Vec<u8> {
+        (0..4u8).filter(|&k| self.tubes[k as usize].exists()).collect()
+    }
 }
 
 impl Station {
@@ -151,6 +173,7 @@ impl World {
             ) {
                 let st = Station {
                     model,
+                    radius: f("model_radius"),
                     pos: [f("x"), f("y"), f("z")],
                     fwd: [f("fwd_x"), f("fwd_y"), f("fwd_z")],
                     up: [f("up_x"), f("up_y"), f("up_z")],
@@ -171,8 +194,10 @@ impl World {
                 let sp = StationPoints {
                     dock_start: v("dock_start"),
                     dock_end: v("dock_end"),
-                    guides: [v("guide0"), v("guide1"), v("guide2"), v("guide3")],
-                    launch: v("launch"),
+                    tubes: [0, 1, 2, 3].map(|k| LaunchTube {
+                        inner: v(&format!("tube{k}_in")),
+                        outer: v(&format!("tube{k}_out")),
+                    }),
                 };
                 self.station_points.insert(model, sp);
             }
@@ -203,6 +228,8 @@ impl World {
                     yaw: f("yaw").unwrap_or(0.001),
                     roll: f("roll").unwrap_or(0.001),
                     engines: row.get("engines").and_then(|v| v.parse().ok()).unwrap_or(1),
+                    tube_offset: f("f142").unwrap_or(0.0),
+                    size: f("size").unwrap_or(0.0),
                 };
                 self.hulls.insert(id, hull);
             }
@@ -306,17 +333,30 @@ mod tests {
         assert_eq!(w.gates.len(), 2);
     }
 
-    /// Quantar Core: station model 323 at (−23.37, 0, 0), identity orientation.
-    /// Its launch point must land where the captured launch did in x and y
-    /// (jgcap2: (−537.7, 155.3, −1461.1)).
+    /// Every captured launch (S→C 0x08 sub 6, tube @2) is followed by a
+    /// report at rest at tube inner end + dir × launch depth (notes/launch.md).
     #[test]
     fn real_extract_station_points() {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"));
         let w = World::load(dir).unwrap();
         let (st, sp) = w.station(107).expect("Quantar Core station");
         assert_eq!(st.model, 323);
-        let l = st.to_world(sp.launch);
-        assert!((l[0] - -537.7).abs() < 1.0 && (l[1] - 155.3).abs() < 1.0, "{l:?}");
+        assert_eq!(sp.launch_tubes(), vec![0, 1, 2, 3]);
+        // (loc, tube, ship type, first reported position)
+        for (loc, tube, ship, seen) in [
+            (118, 2, 92, [151.6, 611.3, -98.0]),
+            (109, 2, 91, [1037.8, -30.8, 919.2]),
+            (107, 0, 94, [-537.7, 155.3, -1461.1]),
+        ] {
+            let (st, sp) = w.station(loc).unwrap();
+            let t = sp.tubes[tube];
+            let d: Vec3 = std::array::from_fn(|i| t.outer[i] - t.inner[i]);
+            let dir = crate::ship::normalize(d);
+            let depth = w.hull(ship).unwrap().launch_depth();
+            let p = st.to_world(std::array::from_fn(|i| t.inner[i] + dir[i] * depth));
+            let err = crate::ship::length(std::array::from_fn(|i| p[i] - seen[i]));
+            assert!(err < 1.0, "loc {loc} tube {tube}: predicted {p:?}, captured {seen:?}");
+        }
         let storm = w.hull(90).unwrap();
         assert_eq!((storm.name.as_str(), storm.engines), ("Storm", 2));
         assert_eq!(w.engine_thrust[0], 758000.0);

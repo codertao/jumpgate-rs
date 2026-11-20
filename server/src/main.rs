@@ -156,7 +156,7 @@ fn main() {
                     }
                 }
                 NetEvent::Message(a, m) => {
-                    if verbose {
+                    if verbose && !is_high_rate(&m) {
                         log_msg(conn, a, &m);
                     }
                     outs.extend(server.handle(conn, a, &m));
@@ -173,7 +173,7 @@ fn main() {
                 Conn::Space => (&mut space, server.space_addr(o.to)),
             };
             if let Some(addr) = addr {
-                if verbose {
+                if verbose && !is_high_rate(&o.msg) {
                     eprintln!(
                         "  → {:?} {} 0x{:02x} ({}B)",
                         o.conn,
@@ -187,6 +187,12 @@ fn main() {
         }
         state.flush();
         space.flush();
+        for (conn, addr) in server.take_kicks() {
+            match conn {
+                Conn::State => state.close(addr),
+                Conn::Space => space.close(addr),
+            }
+        }
         server.tick(Instant::now());
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -207,6 +213,14 @@ fn spawn_demo_npcs(sim: &mut NpcSim, world: &World) {
 
 /// Type and length, plus a short hex prefix — except the login, which holds a
 /// password and is never printed.
+/// Messages sent several times a second per ship, left out of `--verbose`
+/// (both directions, state and space): 0x33 fast position updates.
+const HIGH_RATE: &[u8] = &[0x33];
+
+fn is_high_rate(m: &[u8]) -> bool {
+    m.first().is_some_and(|t| HIGH_RATE.contains(t))
+}
+
 fn log_msg(conn: Conn, from: SocketAddr, m: &[u8]) {
     let ty = m.first().copied().unwrap_or(0);
     if conn == Conn::State && ty == 0x05 && m.len() <= proto::LOGIN_MAX_LEN {

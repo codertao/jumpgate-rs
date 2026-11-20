@@ -55,7 +55,8 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
 ## Economy
 
 - [x] Listings, buy/sell, fitting (0x66) and ship change (0x08) on the account,
-      flat 99/99 (2026-11-19). Not yet tried with the real client.
+      flat 99/99, equipment 201 so the client lists it (2026-11-20).
+      Commodities seen with the real client; equipment fix not yet retested.
 - [ ] Real per-station stock and prices (design), stock depletion.
 - [ ] Check the starter Storm loadout in the client's fitting screen.
 - [ ] 0x4B contracts (trade and mining); award experience (0x92).
