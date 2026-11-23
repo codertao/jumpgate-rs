@@ -77,10 +77,10 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 
 | C→S | conn | Server does | Source |
 |---|---|---|---|
-| 0x05 (33 B) login | state | verify or provision the account (see "Accounts"); new player id; **built 0x06** from the account, docked at its last base; 0x8c, our 0x81, 0x18; a password-reuse warning (0x04) for new pilots. Wrong password: one 0x04 line, no session | capture + built |
+| 0x05 (33 B) login | state | verify or provision the account (see "Accounts"); new player id; **built 0x06** from the account, docked at its last base; 0x8c, our 0x81, 0x18; a password-reuse warning (0x04) for new pilots. Wrong password: rejection 0x06 code 0xce ("Password or username incorrect"), no session; no callsign: 0xc9 | capture + built |
 | 0x09 listing cmd | state | built listing: every entry stock 99, price 99 (equipment 201, the display floor), flag 1 (no surcharge) | built |
 | 0x09 buy (04/05/07/0a–10) | state | docked, index in range, 0 < qty ≤ stock, credits ≥ ⌈99·qty⌉, free slot → add to item list, charge; always answers 0x45 | built |
-| 0x09 sell (08) | state | index = item-list slot; +⌊99·qty⌋; 0x45 | built |
+| 0x09 sell (08) | state | index = item-list slot; +⌊99·qty⌋; 0x45. A slot sold out is removed and the rest move up, as on the classic server (`Character::take_item`; fits too); lists saved with gaps are closed up when next used | built |
 | 0x66 fitting | state | op 0 unfit (ship slot → list slot), op 1 fit, op 2 missile fired (rack emptied, no reply); 0x45 | built |
 | 0x08 change ship | state | docked, known hull, 99 credits → set ship type, anything still fitted goes to the item list; 0x45 + 0x06 | built |
 | 0xc1 | state | 0xc2 | capture |
@@ -88,27 +88,43 @@ and the replay milestone ran entirely on state. Whether any handler checks the
 | 0x04 chat | state | relayed verbatim to every other player [inferred] | — |
 | 0x63 / 0xc3 / 0x8a | state | 0x62 / 3×0x14 / weather: docked 0x87, in space 0x73+0x87 (0x73 is the captured Depot asteroid bitmap; build per sector, see message-types "Asteroid ore levels"), plus 0x61 beacon only in sectors 201–999 | capture, pairing [inferred] |
 | 0x91 / 0x4b | state | 0x91+2×0x76 / 0x4b | capture |
-| 0x17 | state | 0x42 + 0xb3 | capture |
+| 0x17 | state | 0x42 + **built 0xB3**: the first after a launch repairs (hull = armour × 3000), refuels (100) and fills magazines (guns.csv `ammo`); later ones echo the client's last 0x05 hull @0xa4 and fuel @0xac so damage sticks. Ammo isn't reported by the client, so magazines are always sent full (TODO.md) | capture (0x42) + built |
 | 0x07 launch | state | loc = station+100 (saved to the account); 0x06, 0x78, **0x08 → our IP**, dest sector | capture |
 | 0x07 jump | state | gate = arg + 1 → extract link → 0x78, 0x08 (our IP, dest loc, sub = arrival gate). Built, no template | extract; byte-identical to captured jumps |
-| 0x07 dock | state | loc = sector−100, saved as the account's last base; built 0x45 and 0x92, 0xba (pid patched), 0x4b, 0x06, 0x8c, **0x08 "none"** | capture + built |
+| 0x07 dock | state | loc = sector−100, saved as the account's last base. **to_loc 0xfe = the pilot died**: the station is the account's last base instead, wherever they died (no ship loss or insurance yet); built 0x45 and 0x92, 0xba (pid patched), 0x4b, 0x06, 0x8c, **0x08 "none"** | capture + built |
 | 0xc8 | state | logout; snapshot saved | — |
 | 0x0F cargo report | state | ignored (never trust it for credit; TODO.md) | — |
 | 0x8f | both | 0x8f on the same connection (the client's dispatcher ignores it, `0x9d3006`). **The answer on the space connection is required**: the client sends one per connection every ~16 s, and when the space ones went unanswered it dropped space ("Disconnected from space server") about 55–65 s after connecting [capture 2026-11-19; the timeout constant isn't located in the binary yet] | capture |
 | 0x05 (176 B) report | space | stored and relayed to sector-mates as S→C 0x05 (handler `0x9cf7c8` creates/updates that ship). Newcomers are sent everyone's last report | static |
 | 0x33 / 0x34 | space | relayed to sector-mates if the id field is the sender's | static |
-| 0x71 | space | botloc relayed verbatim as S→C 0x71 (state conn) to sector-mates, only if ship type @0xc is 219–259 or 0xffff (the "no bots" report has 0), controller @0x20 is the sender and loc @0xa is the sender's sector. Others' clients create/update the bot from it. Untested live: whether the existing-bot branch takes position from it (ai.md "Spawning") | static |
-| 0x2c | space | ignored (bot handoff not implemented, so the spawner keeps the bot even after leaving) | — |
-| 0x16 / 0x44 | any | logged (spawn rejected / bot destroyed); no reward yet | capture (0x44) |
+| 0x71 | space | botloc relayed verbatim as S→C 0x71 (state conn) to sector-mates, only if ship type @0xc is 219–259 or 0xffff (the "no bots" report has 0), controller @0x20 is the sender, loc @0xa is the sender's sector, and the sender is the bot's controller in the registry (a stale botloc from the previous controller is dropped; an unknown bot is adopted). See "Stock bots" | static + loopback |
+| 0x2c | space | bxr hand-off: if the sender is in space in that sector and someone else flies the bot, the bot becomes the sender's and the last botloc, re-addressed to it (@0x20 = @0x24 = sender), goes to the whole sector including the sender. See "Stock bots" | static + loopback |
+| 0x32 missile | space | relayed verbatim as S→C 0x32 (state conn) to sector-mates if the owner @0x18 is the sender. Their clients fly it for display and warn its target; the owner's client resolves hits (0x1D). C→S 0x1A (mkill) isn't handled yet | static + capture |
+| 0x1D hit | space | → **S→C 0x03** `[03][0][u16 bot][u32 attacker][f32 dmg]` on the victim's state link. Damage: direct gun/missile hits = count (≤ 40) × guns.csv / missiles.csv `damage`; splash and beam hits = the shooter's value. Victim = the 0x1D pid for a player; for a bot (id ≠ 0xfe), the controller from its last botloc. Dropped: object hits (class 1), specials (class 3), unknown weapons, self-hits, victims not in the shooter's sector or docked. No validation of range or rate yet (TODO.md) | built (message-types "Combat") |
+| 0x16 / 0x44 | any | the bot is forgotten if the sender is its controller (0x16: spawn bounce or the controller removed it; 0x44: killed). 0x44 with bot id 0xfe (the sender died) is logged. No reward yet | capture (0x44) + static |
 
 Server-side authority already enforced: player id and loc in relayed 0x05 are
 overwritten with the server's values. A space session can only claim a player
-whose state session is on the same host. Fast updates must name the sender.
+whose state session comes from the same IP. Fast updates must name the sender.
 When a player leaves a sector, the others get their last report with ship type
 @0x46 = 0xfa [inferred removal value].
 
-Space-session binding: on handshake, the newest in-space player on the same
-host with no space session. A later 0x05 report (pid @0x5c) can correct it.
+Space-session binding [2026-11-21]: the space link carries no session token
+(notes/network-protocol.md §1.1a), so a session is bound by the player id @0x5c
+in its first 0x05 report, which the client sends as soon as it connects. The
+claim is accepted only if that player is logged in, is in space (not docked),
+and its state session comes from the same IP. Ids are sequential, so this is a
+minimal check, not authentication. Until then the session is anonymous and its
+traffic (including 0x8f) is ignored. Once bound, a session keeps its player: a
+report claiming someone else is refused and logged once, not rebound. A player's
+new session (relaunch, new port) replaces its old one. The connection's IP alone
+identifies nobody (NAT; agents and a player on one host).
+
+Replaced 2026-11-21: binding on handshake to "the newest in-space player on the
+same host with no space session". With 30 local agents it bound sessions to the
+wrong pilots, leaving the real owner's link unbound ("Space 0x33 from unbound
+peer"). Tests: `space_sessions_bind_by_claimed_player_not_by_ip` and the
+`space_claim_*` / `bound_space_session_cannot_switch_player` tests.
 
 ## Not done yet / next
 
@@ -154,15 +170,43 @@ background.
   the stock-bot path (approach b in CLAUDE.md), seen working in solo play.
 - Unhandled types are logged once each. Use `--verbose` sessions to grow the table.
 
+## Stock bots  [2026-11-20; loopback-tested with agents, not yet with the real client]
+
+As in the classic design, the server only books bots; clients fly them
+(notes/ai.md §2). `server/src/bots.rs` holds, per (loc, bot id): the ship
+type, the controller, the last botloc and position.
+- **Spawning:** `!ai` or a population rule sends S→C 0x70 to one pilot in
+  the sector. That client flies the bot and is its target. An order with no
+  botloc within 30 s is forgotten.
+- **Population rules:** `--bots <file>`, one rule per line,
+  `loc ship_type count` (`#` comments). Every 20 s at most, a rule below its
+  count orders one more bot from a pilot in space in that sector. A sector
+  holds at most 40 bots (the client's table holds 50). The spawner is the first
+  such pilot; agents aren't preferred yet (the server can't tell them apart).
+- **Hand-off:** C→S 0x2C from a pilot in the sector → the bot is theirs; the
+  last botloc goes out with @0x20 = @0x24 = the new pilot, to everyone in the
+  sector. Every client's 0x71 handler then agrees (target == me → I fly it).
+- **Re-homing:** each tick, a bot whose controller isn't in space in its
+  sector goes to the nearest pilot still there (by their last 0x05), or is
+  forgotten. Usually the old controller's client already removed it (0x16).
+- **Damage:** C→S 0x1D hits on a bot go as S→C 0x03 to its controller.
+- Not done: rewards for 0x44, choosing agents as spawners, sector-entry
+  spawning.
+
 ## Accounts and economy  [2026-11-19; unit-tested, not yet tried with the real client]
 
 `accounts.rs`. One account per callsign, case-insensitive.
 - **Password:** only an argon2id PHC string (random salt, default parameters)
   is stored. The login message's password is hashed (new account) or verified,
   then dropped. It is never logged, and `--verbose` doesn't print the login.
-  A wrong password gets a single 0x04 "Wrong password" line addressed by a
-  one-shot id (`REJECTED_BASE`), and no session. What the stock client shows
-  for that is untested (it probably waits at the login screen).
+  A wrong password gets the client's own login rejection: a 0x06 with code
+  0xce @0x42 (`proto::login_rejection`), addressed by a one-shot id
+  (`REJECTED_BASE`), and no session. The client shows "Password or username
+  incorrect" on its Connection Error panel (notes/message-types "0x06 login
+  rejection"). A login with no usable callsign gets 0xc9. The state session is
+  left for the client to close. Until 2026-11-21 this was a 0x04 chat line,
+  which the login screen never shows, so a refused login looked like a hang
+  ending in a connection error. Not yet seen on the real client.
 - **Provisioning** on the first login of an unknown callsign: Quantar
   (faction 3), docked at Quantar-Core Station (7; `--home-station`), a Storm
   (type 90), 200,000 credits, 0 exp, and a starter loadout of engine 0,

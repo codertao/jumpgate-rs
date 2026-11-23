@@ -292,6 +292,7 @@ mod tests {
             engines: 2,
             tube_offset: 15.0,
             size: 5.74,
+            ext: [11.686, 3.007, 9.632],
         }
     }
 
@@ -302,6 +303,15 @@ mod tests {
         let w = jumpgate_common::world::World::load(dir).unwrap();
         let (st, sp) = w.station(loc).unwrap();
         let route = Route::around(st, sp, loc, 1, tube, &storm());
+        // With the user's install next to the repo, fly against the real
+        // meshes (stations, tunnels, gates, asteroids): no contact allowed.
+        let client = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+        let client = client.join("station3b_body.x").exists().then_some(client);
+        let models = jumpgate_common::mesh::Models::load(dir, client).unwrap();
+        let world_objs = crate::collide::Surroundings::new(&w, &models, loc);
+        let size = crate::collide::model_size(&models, 90);
+        eprintln!("{loc}: {} obstacles, {} triangles, meshes {}", world_objs.obstacles.len(), world_objs.obstacles.iter().map(|o| o.geom.triangle_count()).sum::<usize>(), models.has_meshes());
+        let (others, mut fields) = (crate::sector::Sector::default(), crate::collide::FieldState::default());
         let mut f = Flight::new(&storm(), 758_000.0, route.launch, route.launch_fwd);
         f.tube = Some(route.tube);
         let mut left_tube = None;
@@ -339,7 +349,10 @@ mod tests {
                     f.turn_toward(toward, DT);
                 }
             }
-            f.step(DT);
+            f.dynamics(DT);
+            let fr = crate::collide::step(&mut f, storm().ext, size, &world_objs, &others, &models, &mut fields, DT);
+            assert!(fr.hit.is_none(), "{loc} tube {tube}: hit {:?} at {:?} in {:?} at t={t:.1}s, speed {:.0}", fr.hit, f.pos, ai.phase, f.speed());
+            f.integrate(DT);
             if left_tube.is_none() && f.tube.is_none() {
                 left_tube = Some(f.speed());
                 eprintln!("{loc} tube {tube}: out of the tube at t={t:.2}s, {:.0} u/s", f.speed());

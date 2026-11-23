@@ -8,9 +8,10 @@
 //! patched with this player's fields. Each is marked in `docs/server.md`.
 
 use crate::accounts::{Accounts, LoginResult};
+use crate::bots::Bots;
 use crate::feed::Feed;
-use crate::proto::{self, SpaceTarget, ACT_DOCK, ACT_JUMP, ACT_LAUNCH};
-use crate::ship::ShipView;
+use crate::proto::{self, LoginRejection, SpaceTarget, ACT_DOCK, ACT_JUMP, ACT_LAUNCH};
+use crate::ship::{ShipView, Vec3, HULL_PER_ARMOUR};
 use crate::templates::Templates;
 use crate::world::World;
 use jumpgate_common::character::Character;
@@ -24,6 +25,10 @@ pub type PlayerId = u32;
 pub const SHIP_PID_BASE: u32 = 0x4000_0000;
 /// One-shot ids for replies to refused logins (see `Server::rejected`).
 pub const REJECTED_BASE: u32 = 0x7000_0000;
+/// The client's hit queue caps a count at 40 (`0x43a0a1`).
+const MAX_HITS_PER_REPORT: u16 = 40;
+/// 0x05/0xB3 fuel at full tank.
+const FULL_FUEL: f32 = 100.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Conn {
@@ -77,6 +82,9 @@ pub struct Player {
     pub space_addr: Option<SocketAddr>,
     /// Latest 176-byte location report, relayed to others in the sector.
     pub last_report: Option<Vec<u8>>,
+    /// Launched since the last 0xB3: the next one repairs, refuels and
+    /// rearms (how the live server services a ship, message-types "0xB3").
+    pub service_due: bool,
 }
 
 pub struct Server {
@@ -88,6 +96,8 @@ pub struct Server {
     pub accounts: Accounts,
     by_state: HashMap<SocketAddr, PlayerId>,
     by_space: HashMap<SocketAddr, PlayerId>,
+    /// Space sessions whose player claim was refused, to log each once.
+    space_refused: HashSet<SocketAddr>,
     next_id: PlayerId,
     /// Unhandled (conn, type) pairs already reported, to log each once.
     pub unhandled: HashSet<(Conn, u8)>,
@@ -98,8 +108,11 @@ pub struct Server {
     seen_in_sector: HashSet<PlayerId>,
     /// What each player has been shown of the server-driven ships.
     feed: Feed,
-    /// Next spawn# for `!ai` (the bot id in botloc and 0x44).
-    next_spawn: u16,
+    /// Stock bots: which client flies each one (hits on a bot are routed to
+    /// it), their last botlocs, and the population rules (bots.rs).
+    pub bots: Bots,
+    /// Seconds since start, as of the last `bots_tick`.
+    clock: f32,
     /// Refused logins awaiting their reply: one-shot id → state address.
     /// Cleared by `tick`, after the network loop has sent the replies.
     rejected: HashMap<PlayerId, SocketAddr>,
@@ -137,13 +150,15 @@ impl Server {
             accounts: Accounts::in_memory(),
             by_state: HashMap::new(),
             by_space: HashMap::new(),
+            space_refused: HashSet::new(),
             next_id: 1000,
             unhandled: HashSet::new(),
             unhandled_cmds: HashSet::new(),
             missing_tpl: HashSet::new(),
+            bots: Bots::default(),
+            clock: 0.0,
             seen_in_sector: HashSet::new(),
             feed: Feed::new(),
-            next_spawn: 0,
             rejected: HashMap::new(),
             kicks: Vec::new(),
             rng: std::time::SystemTime::now()
@@ -208,6 +223,7 @@ impl Server {
                 None => Vec::new(),
             },
             Conn::Space => {
+                self.space_refused.remove(&addr);
                 let Some(pid) = self.by_space.remove(&addr) else { return Vec::new() };
                 // Only the player's current space session counts. An older one
                 // (left over from before a dock and relaunch) timing out must
@@ -225,21 +241,6 @@ impl Server {
                 out.retain(|o| o.to != pid);
                 out
             }
-        }
-    }
-
-    /// A space session finished its handshake: bind it to the player on the same
-    /// host who is in space and has no space session yet (latest login wins).
-    pub fn space_connected(&mut self, addr: SocketAddr) {
-        let ip = addr.ip();
-        let pid = self
-            .players
-            .values()
-            .rev()
-            .find(|p| p.state_addr.ip() == ip && p.space_addr.is_none() && !p.docked)
-            .map(|p| p.id);
-        if let Some(pid) = pid {
-            self.bind_space(pid, addr);
         }
     }
 
@@ -298,7 +299,11 @@ impl Server {
                 out
             }
             (Conn::State, 0x4b) => self.reply_tpl(pid, &[0x4b]),
-            (Conn::State, 0x17) => self.reply_tpl(pid, &[0x42, 0xb3]),
+            (Conn::State, 0x17) => {
+                let mut out = self.reply_tpl(pid, &[0x42]);
+                out.push(self.own_state(pid));
+                out
+            }
             (Conn::State, 0x07) => self.travel(pid, msg),
             (Conn::State, 0x66) => self.fitting(pid, msg),
             (Conn::State, 0x08) => self.change_ship(pid, msg),
@@ -309,16 +314,30 @@ impl Server {
             (Conn::Space, 0x05) => self.location_report(pid, msg),
             (Conn::Space, 0x33) | (Conn::Space, 0x34) => self.relay_fast(pid, msg),
             (Conn::Space, 0x71) => self.relay_botloc(pid, msg),
-            (Conn::Space, 0x2c) => Vec::new(), // bot handoff request: not yet
+            (Conn::Space, 0x1d) => self.hit(pid, msg),
+            (Conn::Space, 0x2c) => self.handoff_request(pid, msg),
+            (Conn::Space, 0x32) => self.relay_missile(pid, msg),
             (_, 0x16) if msg.len() >= 4 => {
-                // RejectSpawn: our 0x70 bounced (queue or pbotloc full, or a sector change).
-                let (t, n) = (msg[1], proto::u16_at(msg, 2));
-                self.note(format!("player {pid} rejected bot spawn ai_type {t} (ship {}) #{n}", t as u16 + 219));
+                // The bot left the sender's client: our 0x70 bounced (queue or
+                // pbotloc full, or a sector change), or its controller removed
+                // it (despawned, docked, target gone; `0x9cb9c0`).
+                let (b1, id) = (msg[1], proto::u16_at(msg, 2));
+                let loc = self.players[&pid].loc;
+                if self.bots.gone(loc, id, pid) {
+                    self.note(format!("player {pid}: bot #{id} gone (0x16 byte1 {b1})"));
+                }
                 Vec::new()
             }
-            (_, 0x44) if msg.len() >= 12 => {
-                let (n, killer) = (proto::u16_at(msg, 2), proto::u32_at(msg, 4));
-                self.note(format!("player {pid}: bot #{n} destroyed by {killer}"));
+            (_, 0x44) => {
+                if let Some(k) = proto::parse_kill(msg) {
+                    if k.bot == proto::NOT_A_BOT {
+                        self.note(format!("player {pid} destroyed by {}", k.killer));
+                    } else {
+                        let loc = self.players[&pid].loc;
+                        self.bots.gone(loc, k.bot, pid);
+                        self.note(format!("player {pid}: bot #{} destroyed by {}", k.bot, k.killer));
+                    }
+                }
                 Vec::new()
             }
             _ => {
@@ -330,20 +349,38 @@ impl Server {
         }
     }
 
-    /// Resolve a space peer. A location report names its player (@0x5c); accept
-    /// that only if the player's state session is on the same host.
+    /// Resolve a space peer. The space connection carries no session token: the
+    /// only identity the client offers is the player id in its location report
+    /// (0x05 @0x5c), which it sends first on a new space link. Bind on that
+    /// claim, and only if the player is in space and its state session comes
+    /// from the same IP (a minimal check; ids are guessable). Many players can
+    /// share an IP (NAT, or local agents), so the address alone means nothing.
+    /// Once bound, a session keeps its player: a claim for someone else is
+    /// refused rather than rebinding.
     fn space_player(&mut self, addr: SocketAddr, msg: &[u8]) -> Option<PlayerId> {
+        let bound = self.by_space.get(&addr).copied();
         if msg.first() == Some(&0x05) && msg.len() >= proto::LOC_PID_OFF + 4 {
             let claimed = proto::u32_at(msg, proto::LOC_PID_OFF);
-            let same_host = self
-                .players
-                .get(&claimed)
-                .is_some_and(|p| p.state_addr.ip() == addr.ip());
-            if same_host && self.by_space.get(&addr) != Some(&claimed) {
-                self.bind_space(claimed, addr);
+            let refusal = match (bound, self.players.get(&claimed)) {
+                (Some(b), _) if b == claimed => None,
+                (Some(b), _) => Some(format!("is bound to player {b}")),
+                (None, None) => Some("no such player is logged in".into()),
+                (None, Some(p)) if p.state_addr.ip() != addr.ip() => {
+                    Some(format!("is not from the state session's host {}", p.state_addr.ip()))
+                }
+                (None, Some(p)) if p.docked => Some("that player is docked".into()),
+                (None, Some(_)) => {
+                    self.bind_space(claimed, addr);
+                    return Some(claimed);
+                }
+            };
+            if let Some(why) = refusal {
+                if self.space_refused.insert(addr) {
+                    self.note(format!("space session {addr} claims player {claimed} but {why}; refused"));
+                }
             }
         }
-        self.by_space.get(&addr).copied()
+        bound
     }
 
     // ---- handlers ----
@@ -351,7 +388,7 @@ impl Server {
     fn login(&mut self, addr: SocketAddr, msg: &[u8]) -> Vec<Out> {
         let Some(login) = proto::parse_login(msg) else {
             self.note(format!("malformed login from {addr}"));
-            return Vec::new();
+            return self.refuse_login(addr, LoginRejection::InvalidUsername);
         };
         // The password is only hashed (new account) or verified, then dropped.
         // Never log it (CLAUDE.md "Credentials").
@@ -359,11 +396,7 @@ impl Server {
         drop(login.password);
         if let LoginResult::WrongPassword = result {
             self.note(format!("login {} from {addr}: wrong password", login.callsign));
-            // No player exists: address the reply by a one-shot id.
-            let to = REJECTED_BASE + (self.rejected.len() as u32);
-            self.rejected.insert(to, addr);
-            let text = "Wrong password for that callsign.";
-            return vec![Out { to, conn: Conn::State, msg: proto::system_chat(0, "Server", text) }];
+            return self.refuse_login(addr, LoginRejection::BadPassword);
         }
         // Whatever a replaced session leaves behind: its ship's removal for
         // the sector (sent with this login's replies) and its connections.
@@ -403,6 +436,7 @@ impl Server {
                 state_addr: addr,
                 space_addr: None,
                 last_report: None,
+                service_due: true,
             },
         );
         self.by_state.insert(addr, pid);
@@ -425,6 +459,17 @@ impl Server {
         }
         out.extend(gone);
         out
+    }
+
+    /// Refuse a login with the client's own rejection 0x06: it shows the
+    /// matching text on its "Connection Error!" panel (a chat line would be
+    /// invisible on the login screen). No player exists, so the reply is
+    /// addressed by a one-shot id. The session is left for the client to
+    /// close: dropping it now could lose the reply.
+    fn refuse_login(&mut self, addr: SocketAddr, why: LoginRejection) -> Vec<Out> {
+        let to = REJECTED_BASE + (self.rejected.len() as u32);
+        self.rejected.insert(to, addr);
+        vec![Out { to, conn: Conn::State, msg: proto::login_rejection(why) }]
     }
 
     /// The pilot behind a session (every logged-in player has one).
@@ -645,6 +690,7 @@ impl Server {
                     let p = self.players.get_mut(&pid).unwrap();
                     p.docked = false;
                     p.loc = sector;
+                    p.service_due = true;
                 }
                 self.set_account_loc(pid, sector, false);
                 self.note(format!("player {pid} launch {cur} → sector {sector}"));
@@ -683,11 +729,19 @@ impl Server {
                 self.relocate(pid, link.dest_loc, link.dest_gate)
             }
             ACT_DOCK => {
-                let station = station_of_sector(cur).unwrap_or(self.cfg.home_station);
+                // A dying client docks with target 0xfe (`player_death`): it
+                // wakes up at its last base, wherever it died.
+                let died = tr.arg == proto::DEATH_DOCK_ARG;
+                let station = if died {
+                    let cs = &self.players[&pid].callsign;
+                    self.accounts.get(cs).map(|a| a.last_base).unwrap_or(self.cfg.home_station)
+                } else {
+                    station_of_sector(cur).unwrap_or(self.cfg.home_station)
+                };
                 let mut out = self.despawn(pid);
                 {
                     // Dock drops the client's space connection (0x08 "none"); the
-                    // next launch opens a new one, which space_connected binds.
+                    // next launch opens a new one, bound by its first 0x05 (space_player).
                     let p = self.players.get_mut(&pid).unwrap();
                     if let Some(a) = p.space_addr.take() {
                         self.by_space.remove(&a);
@@ -697,7 +751,11 @@ impl Server {
                     p.last_report = None;
                 }
                 self.set_account_loc(pid, station, true);
-                self.note(format!("player {pid} dock {cur} → station {station}"));
+                if died {
+                    self.note(format!("player {pid} died in {cur}; respawn at station {station}"));
+                } else {
+                    self.note(format!("player {pid} dock {cur} → station {station}"));
+                }
                 out.push(self.credits_items(pid));
                 out.push(self.experience(pid));
                 if let Some(t) = self.tpl.first(0xba) {
@@ -758,8 +816,8 @@ impl Server {
             },
             "!ai" => match self.parse_ai(pid, &args) {
                 Ok(ship) => {
-                    let n = self.next_spawn;
-                    self.next_spawn = self.next_spawn.wrapping_add(1);
+                    let n = self.bots.next_id();
+                    self.bots.ordered(loc, n, ship, pid, self.clock);
                     let name = self.world.hulls.get(&ship).map_or("?".to_string(), |h| h.name.clone());
                     self.note(format!("player {pid} !ai {name} (ship {ship}) #{n} in {loc}"));
                     let m = proto::bot_spawn(ship, n).expect("parse_ai returns bot types");
@@ -929,12 +987,165 @@ impl Server {
     /// (@0xa) is the sender's current sector (the receiving handler drops
     /// other locs anyway).
     fn relay_botloc(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
-        let Some(b) = proto::parse_botloc(msg) else { return Vec::new() };
+        let (Some(b), Some(st)) = (proto::parse_botloc(msg), proto::parse_bot_state(msg)) else { return Vec::new() };
         let loc = self.players[&pid].loc;
         if !b.is_bot() || b.controller != pid || b.loc != loc {
             return Vec::new();
         }
+        if !self.bots.report(loc, b.id, b.ship_type, pid, msg, st.pos, self.clock) {
+            return Vec::new(); // a previous controller's last word
+        }
         self.to_sector(pid, Conn::State, msg)
+    }
+
+    /// C→S 0x32 missile create/remove → S→C 0x32 (same layout) to the rest of
+    /// the sector, whose clients fly it for display and warn its target
+    /// (handler `0x9d4686`). Only the owner (@0x18) may report it. Hits are
+    /// resolved by the owner's client and come back as 0x1D.
+    fn relay_missile(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        match proto::parse_missile(msg) {
+            Some(m) if m.owner == pid => self.to_sector(pid, Conn::State, msg),
+            _ => Vec::new(),
+        }
+    }
+
+    /// C→S 0x2C "bxr": the sender's client found itself closer to someone
+    /// else's bot than that bot's controller is (online_bot_ai `0x43648b`,
+    /// ai.md "Hand-off"). Give it the bot and tell the whole sector, the old
+    /// and new controllers included.
+    fn handoff_request(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        let Some(r) = proto::parse_bxr(msg) else { return Vec::new() };
+        let p = &self.players[&pid];
+        if p.docked || r.loc != p.loc || r.pid != pid {
+            return Vec::new();
+        }
+        match self.bots.map.get(&(r.loc, r.bot)) {
+            Some(b) if b.controller != pid => {}
+            _ => return Vec::new(),
+        }
+        let Some(m) = self.bots.hand_over(r.loc, r.bot, pid) else { return Vec::new() };
+        self.note(format!("bot #{} in {} handed to player {pid}", r.bot, r.loc));
+        let mut out = self.to_sector(pid, Conn::State, &m);
+        out.push(Out { to: pid, conn: Conn::State, msg: m });
+        out
+    }
+
+    fn in_space_at(&self, pid: PlayerId, loc: u16) -> bool {
+        self.players.get(&pid).is_some_and(|p| !p.docked && p.loc == loc)
+    }
+
+    fn report_pos(p: &Player) -> Option<Vec3> {
+        let r = p.last_report.as_ref()?;
+        Some([proto::f32_at(r, 0x90), proto::f32_at(r, 0x94), proto::f32_at(r, 0x98)])
+    }
+
+    /// Periodic bot upkeep (`now`: seconds since start):
+    /// - a bot whose controller left the sector (docked, jumped, logged
+    ///   out) goes to the nearest pilot still there, or is forgotten (every
+    ///   client's AI despawns a bot whose target ship is gone);
+    /// - population rules send spawn orders (0x70) to a pilot in the sector.
+    pub fn bots_tick(&mut self, now: f32) -> Vec<Out> {
+        self.clock = now;
+        self.bots.expire(now);
+        let mut out = Vec::new();
+        let orphans: Vec<(u16, u16, Vec3)> = self
+            .bots
+            .map
+            .iter()
+            .filter(|&(&(loc, _), b)| b.last.is_some() && !self.in_space_at(b.controller, loc))
+            .map(|(&(loc, id), b)| (loc, id, b.pos))
+            .collect();
+        for (loc, id, pos) in orphans {
+            let heir = self
+                .players
+                .values()
+                .filter(|p| !p.docked && p.loc == loc)
+                .min_by(|a, b| {
+                    let d = |p: &Player| Self::report_pos(p).map_or(f32::MAX, |q| jumpgate_common::ship::length([q[0] - pos[0], q[1] - pos[1], q[2] - pos[2]]));
+                    d(a).total_cmp(&d(b))
+                })
+                .map(|p| p.id);
+            match heir.and_then(|h| self.bots.hand_over(loc, id, h).map(|m| (h, m))) {
+                Some((h, m)) => {
+                    self.note(format!("bot #{id} in {loc} re-homed to player {h}"));
+                    out.extend(self.to_sector(h, Conn::State, &m));
+                    out.push(Out { to: h, conn: Conn::State, msg: m });
+                }
+                None => {
+                    self.bots.map.remove(&(loc, id));
+                }
+            }
+        }
+        for (i, rule) in self.bots.due(now) {
+            let mut pilots = self.players.values().filter(|p| !p.docked && p.loc == rule.loc && p.space_addr.is_some());
+            let Some(pid) = pilots.next().map(|p| p.id) else { continue };
+            let id = self.bots.next_id();
+            let Some(m) = proto::bot_spawn(rule.ship_type, id) else { continue };
+            self.bots.ordered(rule.loc, id, rule.ship_type, pid, now);
+            self.bots.spawned_for(i, now);
+            self.note(format!("population: bot type {} #{id} in {} ordered from player {pid}", rule.ship_type, rule.loc));
+            out.push(Out { to: pid, conn: Conn::State, msg: m });
+        }
+        out
+    }
+
+    /// C→S 0x1D hit report → S→C 0x03 damage to whoever applies it: the
+    /// victim's own client, or for a bot the client flying it. Direct gun and
+    /// missile hits carry only a count, priced here from the weapon tables;
+    /// splash and beam hits carry the shooter's computed damage (message-types
+    /// "0x1D"). Object hits (class 1) and special weapons (class 3) don't damage
+    /// ships and are dropped.
+    fn hit(&mut self, pid: PlayerId, msg: &[u8]) -> Vec<Out> {
+        let Some(h) = proto::parse_hit(msg) else { return Vec::new() };
+        let loc = self.players[&pid].loc;
+        let amount = match h.class {
+            proto::HIT_CLASS_SHIP if h.value > 0.0 => h.value,
+            proto::HIT_CLASS_SHIP => match self.world.weapon_damage(h.kind, h.weapon) {
+                Some(d) => d * h.count.min(MAX_HITS_PER_REPORT) as f32,
+                None => {
+                    self.note(format!("player {pid}: hit by unknown weapon kind {} #{}", h.kind, h.weapon));
+                    return Vec::new();
+                }
+            },
+            proto::HIT_CLASS_BEAM => h.value,
+            _ => return Vec::new(),
+        };
+        if !(amount > 0.0 && amount.is_finite()) {
+            return Vec::new();
+        }
+        // The client applies hits on bots it controls itself; for anyone
+        // else's bot, the controller gets the damage.
+        let (to, bot) = if h.bot == proto::NOT_A_BOT {
+            (h.victim, proto::NOT_A_BOT)
+        } else {
+            match self.bots.map.get(&(loc, h.bot)) {
+                Some(b) => (b.controller, h.bot),
+                None => return Vec::new(),
+            }
+        };
+        let victim_here = self.players.get(&to).is_some_and(|v| v.loc == loc && !v.docked);
+        if to == pid || !victim_here {
+            return Vec::new();
+        }
+        vec![Out { to, conn: Conn::State, msg: proto::damage(bot, pid, amount) }]
+    }
+
+    /// S→C 0xB3 own-ship state, built (it was a replayed capture that reset
+    /// hull, fuel and ammo every 13 s). After a launch: full hull, fuel and
+    /// magazines. Otherwise: the client's own last reported hull and fuel, so
+    /// damage sticks. Ammo isn't reported by the client at all, so magazines
+    /// stay full [design: the server doesn't track ammo yet].
+    fn own_state(&mut self, pid: PlayerId) -> Out {
+        let pilot = self.pilot(pid);
+        let ammo = pilot.fittings.guns.map(|g| self.world.guns.get(g as usize).map_or(0, |gun| gun.ammo));
+        let full_hull = self.world.hull(pilot.ship_type as u16).map_or(0.0, |h| h.armour * HULL_PER_ARMOUR);
+        let p = self.players.get_mut(&pid).unwrap();
+        let (hull, fuel) = match (&p.last_report, p.service_due) {
+            (Some(r), false) => (proto::f32_at(r, proto::LOC_HULL_OFF), proto::f32_at(r, proto::LOC_FUEL_OFF)),
+            _ => (full_hull, FULL_FUEL),
+        };
+        p.service_due = false;
+        Out { to: pid, conn: Conn::State, msg: proto::own_state(ammo, hull, fuel) }
     }
 
     /// Tell sector-mates this player's ship has left (last report with ship
@@ -1057,7 +1268,7 @@ mod tests {
         let out = s.handle(Conn::State, addr(state), &login_msg(&cs));
         let pid = out[0].to;
         s.handle(Conn::State, addr(state), &travel(proto::ACT_LAUNCH, 18, 0, pid));
-        s.space_connected(addr(space));
+        s.handle(Conn::Space, addr(space), &report(pid, 0));
         pid
     }
 
@@ -1136,8 +1347,8 @@ mod tests {
     #[test]
     fn players_in_a_sector_see_each_other() {
         let mut s = server();
-        let a = into_space(&mut s, "10.0.0.5:4000", "10.0.0.5:4001");
-        let b = into_space(&mut s, "10.0.0.6:4000", "10.0.0.6:4001");
+        let a = launched(&mut s, "10.0.0.5:4000");
+        let b = launched(&mut s, "10.0.0.6:4000");
 
         // A reports first: nobody else has reported yet, so B gets A's ship.
         let out = s.handle(Conn::Space, addr("10.0.0.5:4001"), &report(a, 1));
@@ -1269,7 +1480,7 @@ mod tests {
     #[test]
     fn npcs_shown_only_after_arrival_in_their_sector() {
         let mut s = server();
-        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let a = launched(&mut s, "10.0.0.1:1000");
         let ship = ShipView {
             loc: 118,
             hull_type: 104,
@@ -1280,8 +1491,9 @@ mod tests {
             fwd: [0.0, 0.0, 1.0],
             up: [0.0, 1.0, 0.0],
             thrust: 0.0,
-            armour: 1.0,
-            armour_max: 62500.0,
+            shields: 62.5e6,
+            shields_max: 62.5e6,
+            hull: 187.5e6,
             rank: 0,
         };
         // In space but no report from the sector yet: client may still be loading.
@@ -1324,8 +1536,8 @@ mod tests {
     #[test]
     fn goto_moves_a_player_in_space_and_is_not_relayed() {
         let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
-        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
-        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let a = launched(&mut s, "10.0.0.1:1000");
+        let b = launched(&mut s, "10.0.0.2:1000");
         let st = addr("10.0.0.1:1000");
         // By name (exact beats substring), default gate = lowest.
         let out = s.handle(Conn::State, st, &chat_line(a, "!goto quantar core gate"));
@@ -1427,6 +1639,167 @@ mod tests {
         assert!(s.handle(Conn::Space, sp, &botloc(0, 118, 233, a)).is_empty());
     }
 
+    #[test]
+    fn closer_pilots_take_bots_over_and_orphans_are_rehomed() {
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let (sa, sb) = (addr("10.0.0.1:2000"), addr("10.0.0.2:2000"));
+        s.handle(Conn::Space, sa, &report(a, 1));
+        s.handle(Conn::Space, sb, &report(b, 1));
+        let st = proto::BotState { id: 3, loc: 118, ship_type: 233, controller: a, target: a, ..Default::default() };
+        s.handle(Conn::Space, sa, &proto::botloc(&st));
+        // A bxr naming someone else, or for another sector: ignored.
+        assert!(s.handle(Conn::Space, sb, &proto::bxr(3, 118, a)).is_empty());
+        assert!(s.handle(Conn::Space, sb, &proto::bxr(3, 241, b)).is_empty());
+        // b asks: both pilots hear that b now flies (and is targeted by) #3.
+        let out = s.handle(Conn::Space, sb, &proto::bxr(3, 118, b));
+        let mut to: Vec<_> = out.iter().map(|o| o.to).collect();
+        to.sort();
+        assert_eq!(to, vec![a, b]);
+        let h = proto::parse_botloc(&out[0].msg).unwrap();
+        assert_eq!((h.id, h.controller, h.target), (3, b, b));
+        // a's stale botloc is dropped; b's is relayed.
+        assert!(s.handle(Conn::Space, sa, &proto::botloc(&st)).is_empty());
+        let mine = proto::botloc(&proto::BotState { controller: b, target: b, ..st });
+        assert_eq!(s.handle(Conn::Space, sb, &mine).len(), 1);
+        // b leaves the sector: #3 goes back to a.
+        s.handle(Conn::State, addr("10.0.0.2:1000"), &chat_line(b, "!goto 241"));
+        let out = s.bots_tick(10.0);
+        assert!(out.iter().any(|o| o.to == a && proto::parse_botloc(&o.msg).is_some_and(|h| h.controller == a)), "{out:?}");
+        // The controller drops it (0x16): forgotten.
+        s.handle(Conn::State, addr("10.0.0.1:1000"), &proto::bot_gone(0, 3));
+        assert!(s.bots.map.is_empty());
+    }
+
+    #[test]
+    fn population_rules_order_bots_from_a_pilot_in_the_sector() {
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
+        s.bots = crate::bots::Bots::with_rules(crate::bots::parse_rules("118 233 1\n241 220 1").unwrap());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let out = s.bots_tick(1.0);
+        assert_eq!(out.len(), 1, "nobody in 241");
+        assert_eq!((out[0].to, out[0].msg[0], out[0].msg[1]), (a, 0x70, 233 - 219));
+        assert!(s.bots_tick(30.0).is_empty(), "the order is still pending");
+    }
+
+    fn gun_hit(shooter: PlayerId, victim: PlayerId, bot: u16, count: u16) -> Vec<u8> {
+        proto::hit(&proto::Hit {
+            shooter,
+            loc: 118,
+            victim,
+            bot,
+            count,
+            kind: proto::HIT_KIND_GUN,
+            weapon: 0,
+            value: 0.0,
+            class: proto::HIT_CLASS_SHIP,
+        })
+    }
+
+    fn combat_world() -> World {
+        let mut w = goto_world();
+        w.guns = vec![crate::world::Gun { damage: 251000.0, ..Default::default() }];
+        w
+    }
+
+    /// A gun hit on a player becomes S→C 0x03 to the victim, priced at count ×
+    /// the gun's damage; splash/beam damage passes through; object hits and
+    /// hits on someone who isn't here are dropped.
+    #[test]
+    fn hits_on_a_player_damage_the_victim() {
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), combat_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let sp = addr("10.0.0.1:2000");
+        let out = s.handle(Conn::Space, sp, &gun_hit(a, b, proto::NOT_A_BOT, 3));
+        assert_eq!(out, vec![Out { to: b, conn: Conn::State, msg: proto::damage(proto::NOT_A_BOT, a, 753000.0) }]);
+        let d = proto::parse_damage(&out[0].msg).unwrap();
+        assert_eq!((d.bot, d.attacker, d.amount), (proto::NOT_A_BOT, a, 753000.0));
+
+        let mut beam = proto::parse_hit(&gun_hit(a, b, proto::NOT_A_BOT, 1)).unwrap();
+        (beam.class, beam.value) = (proto::HIT_CLASS_BEAM, 1234.5);
+        let out = s.handle(Conn::Space, sp, &proto::hit(&beam));
+        assert_eq!(proto::parse_damage(&out[0].msg).unwrap().amount, 1234.5);
+
+        let mut obj = beam;
+        obj.class = proto::HIT_CLASS_OBJECT;
+        assert!(s.handle(Conn::Space, sp, &proto::hit(&obj)).is_empty());
+        // Unknown gun, self-hit, victim elsewhere.
+        let mut unk = proto::parse_hit(&gun_hit(a, b, proto::NOT_A_BOT, 1)).unwrap();
+        unk.weapon = 9;
+        assert!(s.handle(Conn::Space, sp, &proto::hit(&unk)).is_empty());
+        assert!(s.handle(Conn::Space, sp, &gun_hit(a, a, proto::NOT_A_BOT, 1)).is_empty());
+        s.handle(Conn::State, addr("10.0.0.2:1000"), &chat_line(b, "!goto 241"));
+        assert!(s.handle(Conn::Space, sp, &gun_hit(a, b, proto::NOT_A_BOT, 1)).is_empty());
+    }
+
+    /// A hit on a bot goes to the client flying it (from its botlocs).
+    #[test]
+    fn hits_on_a_bot_damage_its_controller() {
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), combat_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.2:1000", "10.0.0.2:2000");
+        let (spa, spb) = (addr("10.0.0.1:2000"), addr("10.0.0.2:2000"));
+        // Unknown bot: dropped.
+        assert!(s.handle(Conn::Space, spb, &gun_hit(b, 0, 7, 1)).is_empty());
+        let mut bl = vec![0u8; proto::BOTLOC_LEN];
+        bl[0] = 0x71;
+        proto::put_u16(&mut bl, 8, 7);
+        proto::put_u16(&mut bl, 0xa, 118);
+        proto::put_u16(&mut bl, 0xc, 233);
+        proto::put_u32(&mut bl, 0x20, a);
+        s.handle(Conn::Space, spa, &bl);
+        let out = s.handle(Conn::Space, spb, &gun_hit(b, 0, 7, 2));
+        assert_eq!(out, vec![Out { to: a, conn: Conn::State, msg: proto::damage(7, b, 502000.0) }]);
+        // Its death report forgets it.
+        s.handle(Conn::State, addr("10.0.0.1:1000"), &proto::kill_report(7, a, b, 0));
+        assert!(s.handle(Conn::Space, spb, &gun_hit(b, 0, 7, 1)).is_empty());
+    }
+
+    /// The dying client's 0x07 (dock, target 0xfe) sends it home to its last
+    /// base, not to the station of the sector it died in.
+    #[test]
+    fn death_respawns_at_the_last_base() {
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), goto_world());
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let st = addr("10.0.0.1:1000");
+        s.handle(Conn::State, st, &chat_line(a, "!goto 241"));
+        let out = s.handle(Conn::State, st, &proto::kill_report(proto::NOT_A_BOT, a, 99, -2));
+        assert!(out.is_empty());
+        let out = s.handle(Conn::State, st, &travel(ACT_DOCK, 241, proto::DEATH_DOCK_ARG, a));
+        assert_eq!(sent_redirect(&out), Some((0xcc, 18)));
+        assert!(s.players[&a].docked);
+    }
+
+    /// 0xB3: full service on the first one after a launch, then the client's
+    /// own reported hull and fuel (the replayed capture used to undo damage).
+    #[test]
+    fn own_state_services_after_launch_then_echoes() {
+        let mut w = goto_world();
+        let storm = crate::ship::Hull { type_id: 90, armour: 4000.0, ..Default::default() };
+        w.hulls.insert(90, storm);
+        let mut s = Server::new(Config { home_station: 18, ..Config::default() }, Templates::default(), w);
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        assert_eq!(s.pilot(a).ship_type, 90);
+        let b3 = |s: &mut Server| {
+            let out = s.handle(Conn::State, addr("10.0.0.1:1000"), &[0x17; 10]);
+            let m = out.into_iter().find(|o| o.msg[0] == 0xb3).expect("0xB3").msg;
+            assert_eq!(m.len(), proto::OWN_STATE_LEN);
+            (proto::f32_at(&m, 0xc), proto::f32_at(&m, 0x18))
+        };
+        assert_eq!(b3(&mut s), (12.0e6, 100.0));
+        let mut r = report(a, 1);
+        proto::put_f32(&mut r, proto::LOC_HULL_OFF, 5.0e6);
+        proto::put_f32(&mut r, proto::LOC_FUEL_OFF, 87.0);
+        s.handle(Conn::Space, addr("10.0.0.1:2000"), &r);
+        assert_eq!(b3(&mut s), (5.0e6, 87.0));
+        // Relaunch: serviced again.
+        s.handle(Conn::State, addr("10.0.0.1:1000"), &travel(ACT_DOCK, 118, 0, a));
+        s.handle(Conn::State, addr("10.0.0.1:1000"), &travel(proto::ACT_LAUNCH, 18, 0, a));
+        assert_eq!(b3(&mut s), (12.0e6, 100.0));
+    }
+
     /// Dock, relaunch on a new space port, then the old space session times
     /// out: the new one must stay bound and keep getting keepalive answers.
     #[test]
@@ -1438,7 +1811,7 @@ mod tests {
         s.handle(Conn::State, st, &travel(ACT_DOCK, 118, 0, a));
         assert_eq!(s.space_addr(a), None, "dock drops space");
         s.handle(Conn::State, st, &travel(proto::ACT_LAUNCH, 18, 0, a));
-        s.space_connected(new);
+        s.handle(Conn::Space, new, &report(a, 0));
         assert_eq!(s.space_addr(a), Some(new));
         s.disconnected(Conn::Space, old);
         assert_eq!(s.space_addr(a), Some(new));
@@ -1450,6 +1823,71 @@ mod tests {
         assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2002")));
         assert!(s.disconnected(Conn::Space, new).is_empty());
         assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2002")));
+    }
+
+    /// Log in and launch without opening space; returns the player id.
+    fn launched(s: &mut Server, state: &str) -> PlayerId {
+        let cs = format!("pilot{}", s.players.len());
+        let pid = s.handle(Conn::State, addr(state), &login_msg(&cs))[0].to;
+        s.handle(Conn::State, addr(state), &travel(proto::ACT_LAUNCH, 18, 0, pid));
+        pid
+    }
+
+    /// Players behind one IP (NAT, or local agents) each get their own space
+    /// session, whatever order the space links connect and report in.
+    #[test]
+    fn space_sessions_bind_by_claimed_player_not_by_ip() {
+        let mut s = server();
+        let a = launched(&mut s, "10.0.0.1:1000");
+        let b = launched(&mut s, "10.0.0.1:1001");
+        // b's link reports first, then a's.
+        s.handle(Conn::Space, addr("10.0.0.1:2001"), &report(b, 0));
+        s.handle(Conn::Space, addr("10.0.0.1:2000"), &report(a, 0));
+        assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2000")));
+        assert_eq!(s.space_addr(b), Some(addr("10.0.0.1:2001")));
+        let out = s.handle(Conn::Space, addr("10.0.0.1:2000"), &[0x8f]);
+        assert_eq!(out, vec![Out { to: a, conn: Conn::Space, msg: vec![0x8f] }]);
+    }
+
+    /// Before its first location report a space link is anonymous: its other
+    /// traffic is ignored, not credited to some player on the same host.
+    #[test]
+    fn space_traffic_before_the_first_report_is_ignored() {
+        let mut s = server();
+        let a = launched(&mut s, "10.0.0.1:1000");
+        assert!(s.handle(Conn::Space, addr("10.0.0.1:2000"), &[0x8f]).is_empty());
+        assert_eq!(s.space_addr(a), None);
+    }
+
+    #[test]
+    fn space_claim_from_another_host_is_refused() {
+        let mut s = server();
+        let a = launched(&mut s, "10.0.0.1:1000");
+        s.handle(Conn::Space, addr("10.0.0.2:2000"), &report(a, 0));
+        assert_eq!(s.space_addr(a), None);
+        assert!(s.handle(Conn::Space, addr("10.0.0.2:2000"), &[0x8f]).is_empty());
+    }
+
+    #[test]
+    fn space_claim_for_a_docked_or_unknown_player_is_refused() {
+        let mut s = server();
+        let pid = s.handle(Conn::State, addr("10.0.0.1:1000"), &login_msg("docked"))[0].to;
+        s.handle(Conn::Space, addr("10.0.0.1:2000"), &report(pid, 0));
+        assert_eq!(s.space_addr(pid), None);
+        s.handle(Conn::Space, addr("10.0.0.1:2001"), &report(4242, 0));
+        assert!(s.handle(Conn::Space, addr("10.0.0.1:2001"), &[0x8f]).is_empty());
+    }
+
+    /// A bound session keeps its player: claiming another player's id (same
+    /// host) neither moves the session nor steals the other's binding.
+    #[test]
+    fn bound_space_session_cannot_switch_player() {
+        let mut s = server();
+        let a = into_space(&mut s, "10.0.0.1:1000", "10.0.0.1:2000");
+        let b = into_space(&mut s, "10.0.0.1:1001", "10.0.0.1:2001");
+        s.handle(Conn::Space, addr("10.0.0.1:2000"), &report(b, 0));
+        assert_eq!(s.space_addr(a), Some(addr("10.0.0.1:2000")));
+        assert_eq!(s.space_addr(b), Some(addr("10.0.0.1:2001")));
     }
 
     fn login_pw(cs: &str, pw: &str) -> Vec<u8> {
@@ -1479,6 +1917,17 @@ mod tests {
         assert!(out.iter().any(|o| o.msg[0] == 0x04), "password-reuse warning");
     }
 
+    /// A login without a usable callsign gets the client's "username not
+    /// valid" panel rather than silence.
+    #[test]
+    fn login_without_a_callsign_is_refused() {
+        let mut s = server();
+        let out = s.handle(Conn::State, addr("10.0.0.5:4000"), &login_pw("", "pw"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].msg, proto::login_rejection(LoginRejection::InvalidUsername));
+        assert!(s.players.is_empty());
+    }
+
     #[test]
     fn wrong_password_is_refused_without_a_session() {
         let mut s = server();
@@ -1489,7 +1938,7 @@ mod tests {
         let other = addr("10.0.0.9:4000");
         let out = s.handle(Conn::State, other, &login_pw("pilot", "wrong"));
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].msg[0], 0x04);
+        assert_eq!(out[0].msg, proto::login_rejection(LoginRejection::BadPassword));
         assert!(s.players.is_empty());
         assert_eq!(s.state_addr(out[0].to), Some(other), "reply reaches the refused peer");
         s.tick(std::time::Instant::now());

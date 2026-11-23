@@ -332,6 +332,8 @@ for t in range(N):
         size=get(sst, r + 0x144, 'f'), engines=eng, armour=get(sst, r + 0x150, 'i'),
         ext_right=get(sst, r + 0x158, 'f'), ext_up=get(sst, r + 0x15c, 'f'),
         ext_fwd=get(sst, r + 0x160, 'f'),
+        # required pilot rank to buy (market check 0x4791ed vs rank 0xbe5c7c)
+        rank=get(sst, r + 0x1a0, 'b'),
         # v_max = sqrt(engines*thrust/drag); this is the factor that multiplies sqrt(thrust per engine)
         vmax_per_sqrt_thrust=round(math.sqrt(eng / drag), 5) if drag and eng else ''))
 with open(os.path.join(OUT, 'ship_types.csv'), 'w', newline='') as f:
@@ -430,7 +432,7 @@ for a, op, args in disasm(0xa27b30, 0xa72400):
     m = re.match(r'DWORD PTR \[' + R_ + r'\+0x([0-9a-f]+)\],(\S+)$', args)
     if op == 'mov' and m:
         off = int(m.group(2), 16)
-        if m.group(1) in mptr and 0x7f4 <= off < 0x920:
+        if m.group(1) in mptr and 0x2b0 <= off < 0x920:
             v = m.group(3)
             val = int(v, 16) if v.startswith('0x') else regs.get(v)
             if val is not None:
@@ -461,5 +463,64 @@ for mid in sorted(pts):
 with open(os.path.join(OUT, 'station_points.csv'), 'w', newline='') as f:
     w = csv.DictWriter(f, station_points[0].keys()); w.writeheader(); w.writerows(station_points)
 
+# ---------------- collision volumes ----------------
+# 21 blocks of 0x40 per model (physics.md section 6): block 0 = whole model at
+# +0x2b0, blocks 1..20 = sub-volumes at +0x2f0 + 0x40*(k-1). Per block: axis A
+# +0x00, axis B +0x0c (unit, model space; third axis = A x B), full extents
+# +0x18, centre +0x24. The radius (+0x30) and the triangle lists are filled
+# at runtime (0xa61f20: radius = largest |extent|; 0xa612d0 builds the lists).
+VOL_FIELDS = [('a', 0x00), ('b', 0x0c), ('ext', 0x18), ('c', 0x24)]
+volumes = []
+for mid in sorted(pts):
+    d = pts[mid]
+    for k in range(21):
+        base = 0x2b0 + 0x40 * k
+        if not any(base + o in d for o in range(0, 0x30, 4)):
+            continue
+        row = {'model': mid, 'block': k}
+        for name, off in VOL_FIELDS:
+            for j, ax in enumerate('xyz'):
+                row['%s_%s' % (name, ax)] = round(d.get(base + off + 4 * j, 0.0), 4)
+        volumes.append(row)
+with open(os.path.join(OUT, 'collision_volumes.csv'), 'w', newline='') as f:
+    w = csv.DictWriter(f, volumes[0].keys()); w.writeheader(); w.writerows(volumes)
+
+# ---------------- model id -> .x file ----------------
+# Same pattern as jg_static_dump.py model_names(): a loader stores the new
+# model object into 0x14ff690 + id*4, then pushes the file name for its load.
+# Stations also get a second mesh, the tunnel (`*_tun.x`), stored at model
+# +0x934 (e.g. 0xa5f071) and loaded the same way. build_collision_tris
+# (0xa612d0) takes triangles from both meshes.
+models, tunnels, cur, cur_tun, mreg = {}, {}, None, None, {}
+for a, op, args in disasm(0x401000, 0xab0000):
+    m = re.match(r'(?:DWORD PTR )?ds:(0x14f[0-9a-f]{4}),eax$', args)
+    if op == 'mov' and m:
+        cur = int(m.group(1), 16); continue
+    m = re.match(R_ + r',(?:DWORD PTR )?ds:(0x14f[0-9a-f]{4})$', args)
+    if op == 'mov' and m:
+        mreg[m.group(1)] = int(m.group(2), 16); continue
+    m = re.match(r'DWORD PTR \[' + R_ + r'\+0x934\],eax$', args)
+    if op == 'mov' and m and m.group(1) in mreg:
+        cur_tun = mreg[m.group(1)]; continue
+    if op == 'push' and re.match(r'0x[0-9a-f]+$', args):
+        va = int(args, 16)
+        if not (0x400000 <= va < 0x400000 + len(img)):
+            continue
+        try:
+            name = cstr(va)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not name.lower().endswith('.x'):
+            continue
+        if cur_tun is not None and (cur_tun - MODEL_TABLE) % 4 == 0:
+            tunnels.setdefault((cur_tun - MODEL_TABLE) // 4, name); cur_tun = None
+        elif cur is not None and cur >= MODEL_TABLE and (cur - MODEL_TABLE) % 4 == 0:
+            models.setdefault((cur - MODEL_TABLE) // 4, name)
+with open(os.path.join(OUT, 'models.csv'), 'w', newline='') as f:
+    w = csv.writer(f); w.writerow(['model', 'file', 'tunnel'])
+    for mid in sorted(models):
+        w.writerow([mid, models[mid], tunnels.get(mid, '')])
+
+print('%d models (%d with tunnels), %d collision volumes on %d models' % (len(models), len(tunnels), len(volumes), len({v['model'] for v in volumes})))
 print('%d engines, %d missiles, %d guns, %d AI types, %d ship types, %d locations, %d station models; %s' % (len(engines), len(missiles), len(guns), len(ai), len(ships), len(locations), len(station_points),
       ', '.join('%s %d' % (k, len(v)) for k, v in tables.items())))

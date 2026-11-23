@@ -6,7 +6,7 @@ mod orbit;
 
 pub use orbit::Orbit;
 
-use crate::ship::{Hull, ShipView};
+use crate::ship::{Hull, ShipView, DEFAULT_SHIELD_PER_ARMOUR, HULL_PER_ARMOUR};
 
 /// Stable NPC identifier, local to the simulation.
 pub type NpcId = u32;
@@ -49,8 +49,9 @@ impl NpcSim {
             fwd: [0.0, 0.0, 1.0],
             up: [0.0, 1.0, 0.0],
             thrust: 0.0,
-            armour: 1.0,
-            armour_max: hull.armour,
+            shields: hull.armour * DEFAULT_SHIELD_PER_ARMOUR,
+            shields_max: hull.armour * DEFAULT_SHIELD_PER_ARMOUR,
+            hull: hull.armour * HULL_PER_ARMOUR,
             rank: 0,
         };
         let mut npc = Npc { id, hull, ship, brain };

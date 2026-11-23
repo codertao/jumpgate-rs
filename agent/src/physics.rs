@@ -2,7 +2,7 @@
 //! exactly as a real ship would and other clients' dead reckoning (§8, the
 //! same thrust/drag law) tracks it without corrections.
 
-use jumpgate_common::ship::{length, normalize, Hull, ShipView, Vec3};
+use jumpgate_common::ship::{length, normalize, Hull, ShipView, Vec3, Vitals};
 
 /// Fixed simulation step. The client runs per frame; 30 Hz is close enough
 /// for the drag law and keeps the turn steps small.
@@ -145,8 +145,22 @@ impl Flight {
         self.fix_up();
     }
 
-    /// Linear dynamics, `0x429bb0` without afterburner, boost or currents.
+    /// One frame without collisions: [`Self::dynamics`] then [`Self::integrate`].
+    #[cfg(test)]
     pub fn step(&mut self, dt: f32) {
+        self.dynamics(dt);
+        self.integrate(dt);
+    }
+
+    /// `pos += v·dt` (`0x9c7270`), after collisions have had their say.
+    pub fn integrate(&mut self, dt: f32) {
+        self.pos = add(self.pos, scale(self.vel, dt));
+    }
+
+    /// Linear dynamics, `0x429bb0` without afterburner, boost or currents:
+    /// velocity only. The client runs collisions (`0x40d630`) between this
+    /// and the position update (physics.md §2).
+    pub fn dynamics(&mut self, dt: f32) {
         // The push is per client frame; one DT step stands for one 30 fps
         // frame. At 30 fps a Storm leaves the tube at ~170 u/s (faster at
         // higher frame rates, as on a real client).
@@ -174,10 +188,9 @@ impl Flight {
                 self.vel = [0.0; 3];
             }
         }
-        self.pos = add(self.pos, scale(self.vel, dt));
     }
 
-    pub fn view(&self, callsign: &str, loc: u16, hull: &Hull, rank: u8) -> ShipView {
+    pub fn view(&self, callsign: &str, loc: u16, hull: &Hull, rank: u8, vitals: &Vitals) -> ShipView {
         ShipView {
             loc,
             hull_type: hull.type_id,
@@ -188,8 +201,9 @@ impl Flight {
             fwd: self.fwd,
             up: self.up,
             thrust: self.thrust(),
-            armour: 1.0,
-            armour_max: hull.armour,
+            shields: vitals.shields,
+            shields_max: vitals.shields_max,
+            hull: vitals.hull.max(0.0),
             rank,
         }
     }
@@ -212,6 +226,7 @@ mod tests {
             engines: 2,
             tube_offset: 15.0,
             size: 5.74,
+            ext: [11.686, 3.007, 9.632],
         }
     }
 

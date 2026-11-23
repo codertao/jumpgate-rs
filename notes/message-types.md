@@ -24,7 +24,7 @@ Common sub-fields seen across many messages:
 |---|---|---|---|
 | 0x05 | 33 | **Login** | `[05]` + callsign`\0` @1 + password`\0` (ends before +0x16) + version ("2.0127") at +0x16. **Cleartext password.** [capture, 2026-11-17] |
 | 0x05 | 176 | Ship / loadout state (periodic, ~13 s) | `[05][u16?]` + callsign + slot list + floats; also contains some uninitialized client memory (minor info leak) |
-| 0x07 | 12 | **Launch / Dock / Jump** | `[07][action][u16 from_loc][u32 to_loc][u32 player_id]`; action 1=launch, 2=dock, 3=jump |
+| 0x07 | 12 | **Launch / Dock / Jump** | `[07][action][u16 from_loc][u32 to_loc][u32 player_id]`; action 1=launch, 2=dock, 3=jump. **Death is a dock with to_loc 0xfe** (`player_death` `0x9cf168`) |
 | 0x09 | 16 | **Command: market listing, buy, sell, misc** | `[09][cmd][u16 loc][u32 index @4][u32 player_id @8][f32 quantity @12]`. Listing requests, buys and sells: see "Station market" below. Other cmds are slash commands (slash-commands.md). [capture jgcap2, 2026-11-18] |
 | 0x08 | 8 | **Change ship** (sends `0x47932a`, `0x47a708`) | `[08][u8 ship_type][2 bytes uninitialised][u32 player_id]`. Seen switching to type 94 (Hurricane) while docked. The server answered with 13 × 0x45 (the old ship's fittings moved to the item list) and a 0x06. [capture jgcap2] |
 | 0x4B | 60 | **Contract board** | `[4b][3 junk][u32 player_id @4][u8 job @8][u8 op @9]`, rest zero except u8 @0x18 = the board (7 = trade/mining board, 0x0e = the courier/patrol board; echoed in the reply). op 1–3 = view offer n, 0x65 = accept, 0x96+n = close offer n. Answered by S→C 0x4B. [capture jgcap2] |
@@ -32,7 +32,7 @@ Common sub-fields seen across many messages:
 | 0x04 | 27 | Chat line | `[04][05][u16 loc][u32 player_id][callsign\0][text...]` |
 | 0x65 | 36 | Join chat channel ("chat") | `[65][u16 loc?][u32 player_id]["chat"\0]...` |
 | 0x6A | 8 | Player-list / player request | `[6A][...][u32 player_id]` |
-| 0x71 | 52 | Bot state report "botloc" relayed (handler `0x9d6f25`) | Same layout as C→S 0x71: `@8` bot id, `@0xa` loc, `@0xc` type, `@0x20` u32 controller, `@0x24` u32 target, `@0x28` f32×3 position. An unknown id **creates** the bot at that position. See ai.md "Spawning". [static 2026-11-19] |
+| 0x71 | 52 | Bot state report "botloc" relayed (handler `0x9d6f25`) | Same layout as C→S 0x71: `@8` bot id, `@0xa` loc, `@0xc` type, `@0x20` u32 controller, `@0x24` u32 target, `@0x28` f32×3 position. An unknown id **creates** the bot at that position. **The receiver makes the bot's target its controller** (`0x9d7191`): if @0x24 is me, I fly the bot from now on (slot `+2` = 0, pbotloc `+0xc` = me) and answer with a botloc at once (`0x9c9d10`); otherwise the bot is tied to the target's ship slot and pbotloc `+0xc` is set to the target's id, and if that player isn't in my sector the bot is removed. So a hand-off is a 0x71 naming the new pilot in both fields. See ai.md "Spawning" and "Hand-off". [static 2026-11-19/20] |
 | 0x8F | 1 | **Keepalive** | `[8F]` — one per connection every ~16 s |
 | 0xC1 | 12 | Job-list request | `[C1][sub][u16 loc][u32 player_id][u32]` |
 | 0xC8 | 8 | Logout / session end | `[C8][u16 loc?][u32 player_id]` |
@@ -58,7 +58,8 @@ volunteer, 0x9C event/query (sub = u16 @ off 8: 0xEC/0xED...), 0x9D vouch,
 | 0x81 | ~850 | Message of the day | `[81]` + ASCII ("Welcome back! ...") |
 | 0xFE | 321 | **Memory patch** | `[FE]` then records `[01][u32 addr][u16 len][bytes]`. In capture: only award/medal name strings. See network-protocol.md §3. |
 | 0x0A/0x0B/0x0D, 0x50–0x56 | 896 | **Station market, one category per message** | `[type][3 pad]` + N × `(u32 stock, u32 price)` + N flag bytes at +0x31C. Entry i = item i of that category. See "Station market" below. [static + capture jgcap2, 2026-11-18] |
-| 0x45 | 400 | **Credits and item list** (handler `0x9d662a`; previously called "rank") | `[45][7 pad][u64 credits @8 → 0xff7cf8]` then, unless byte @0x10 is `0xfd` (credits-only update), 48 × 8-byte slots @0x10 copied to `0xff7d2c`: `[u8 category][u8 index][cc cc][f32 quantity]`, `fe` = empty. The list holds cargo and unfitted equipment. C→S 0x09 sell names a slot index from it. Sent after every credit change, purchase, fitting, and while mining. [static + capture jgcap2] |
+| 0x45 | 400 | **Credits and item list** (handler `0x9d662a`; previously called "rank") | `[45][7 pad][u64 credits @8 → 0xff7cf8]` then, unless byte @0x10 is `0xfd` (credits-only update), 48 × 8-byte slots @0x10 copied to `0xff7d2c`: `[u8 category][u8 index][cc cc][f32 quantity]`, `fe` = empty. The list holds cargo and unfitted equipment. C→S 0x09 sell names a slot index from it. **The list has no gaps** [capture jgcap2, 2026-11-21]: when a sale or a fit uses up an entry, the classic server removes it and the later entries move up one (the 0x06 after each of five sells shows this, and the client's next sell names the shifted slot). Unfits go to consecutive slots, stacking with a matching entry. Sent after every credit change, purchase, fitting, and while mining. [static + capture jgcap2] |
+| 0x57 | ≥8 | **Set rank** (handler `0x9d6789`) | `[57][3 ?][u32 rank @4]`. Accepted only for 1..50: written to the rank global `0xbe5c7c` (what the market checks), `0xff2a64` (sent as the 0x05 report's +0x14) and `0xba7978`. Otherwise it falls through to the next case [not traced]. The way to change rank mid-session; the 0x06 @2 sets it at login. See items.md "Rank". [static, 2026-11-21] |
 | 0x92 | 8 | **Experience total** (handler `0x9d8120`) | `[92][3 pad][u32 experience @4 → 0xbe5da8]`. Rises by exactly the experience in the reward chat lines. [static + capture jgcap2] |
 | 0x77 | 2 | **Medal awarded** (handler `0x9d7ccb`) | `[77][u8 medal id]`. Followed by a system chat "You receive N experience for the medal." The medal names are what the tri server's 0xFE patches into client memory. [static + capture jgcap2] |
 | 0x70 | 6 | **Bot spawn order** (handler `0x9cbac0`) | `[70][u8 ai_type][u16 spawn#][cc cc]`. **ai_type = bot ship type − 219** (spawn_bot reads `0xbeb63c + t·64` = ai_types.csv row 219 + t, whose +0x38 holds that ship type; capture jgcap2: ai_type 0x0d/0x0e came back in botloc @0xc as ships 232/233, C2/C3 'Squid'). So 1–6 = defenders 220–225, 11 = Jellyfish, 12–38 = C1–C27, 39/40 = turrets. spawn# = the bot id in botloc @8 and C→S 0x44 (captured: 0, 1 per sector). Queued in a 40-entry table at `0xba7ad0`. If the table is full, the client sends it back as **C→S 0x16 RejectSpawn** (same bytes, type changed). Sent on sector entry, right after 0x73. **No position or target**: the client picks the spawn point (station launch point, structure hard-point = spawn# /100 and %100, nav marker, repulsor, or random ±16 km around the player), and the target is the receiving player (ai.md "Spawning"). The client then flies the bot (C→S 0x71 botloc) and reports its death with C→S 0x44. No S→C 0x71 was seen in this solo session. [static + capture jgcap2] |
@@ -151,12 +152,16 @@ Client → server in space (also see reversing-map "Weapon hits & damage": C→S
 | 0x33 | 56 | **"small loc" fast position update** (only when another ship is within 10,000 units) | `[33][flags@1][state@2][salt@3][u16 loc@4]` + 6×i16 orientation (fwd+up unit vectors ×10000) @6 + 3×i16 **velocity ×10** @0x12 [static, 2026-11-11: packed from snapshot `0xff2ad0..d8` × 10.0 @`0xb05ac8`] + `u32@0x18` + **f32 X/Y/Z @0x1c** + f32 throttle·speed @0x28 + f32 @0x2c, @0x30 + **f32 clock_s @0x34** [static] |
 | 0x34 | 52 | **"mini loc" fast position update** (alternates with 0x33, same gating) | same as 0x33 minus the three ×10 shorts: 6×i16 orientation @6, `u32@0x14`, **f32 X/Y/Z @0x18**, f32 @0x24/0x28/0x2c, **f32 clock_s @0x30** [static] |
 | 0x17 | 10 | Compact companion report (1:1 with 0x05; sent by `0x9cb330` right after it, on the *state* connection) | `[17]` + 9 bytes that change every send — compact heading/input or state-hash [inferred]. |
-| 0x71 | 52 | **Bot (conflux) state report "botloc"** — sent by the bot's controlling client | `[71][state][hull%][shield%][b][b][u16 id]…[u16 loc]` + i16 vel/orientation + `u32 player` + f32 pos. One per bot this client controls, after every 0x05; empty when you control none (so all-zero in the solo capture). See reversing-map "Conflux / bot AI". |
-| 0x2C | 12 | "bxr" bot handoff request | sent when I'm closer to a bot than its current controller |
+| 0x71 | 52 | **Bot (conflux) state report "botloc"** — sent by the bot's controlling client (`0x9c9d10`, space link) | `[71][state @1][shield % @2][hull % @3][pbotloc +2 @4][+3 @5][u16 +6 target slot @6][u16 id @8][u16 loc @0xa][u16 type @0xc]` + i16×3 velocity ×10 @0xe + i16×3 fwd ×10⁴ @0x14 (slot +0x74) + i16×3 up ×10⁴ @0x1a (slot +0x68) + `u32 controller = me @0x20` + `u32 target @0x24` (pbotloc +0x10) + f32×3 pos @0x28. Percentages are value / max × 100 (`0xac2aa0`; shields = slot +0x15f8/+0x15fc, hull = +0x1600/+0x1604; the receiver multiplies by 0.01 × its max). One per bot this client controls, after every 0x05, and one at once when a bot becomes ours; empty when you control none (so all-zero in the solo capture). (An older version of this row had shields and hull swapped.) [static 2026-11-20] |
+| 0x2C | 12 | **"bxr" bot hand-off request** (online_bot_ai `0x436651`, space link) | `[2C][? @1, never written][u16 bot id @2][u16 0 @4][u16 loc @6][u32 me @8]`. Sent for a bot someone else controls when my score is inside the type's hand-off range and the controller's score is worse; the score is distance − (v·(pos − bot)/distance)·T, T = the lifetime of the bot's first gun's shot (ai.md "Hand-off"). What the classic server answered isn't recorded; the client's 0x71 handler makes a botloc naming the new pilot as target hand the bot over. [static 2026-11-20] |
+| 0x16 | 6 | **Bot gone** (two senders, one layout `[16][u8][u16 id][u16 ?]`, state link) | **Spawn bounce** (`0x9cb930`, queue or table full, or a sector change flushing the queue): `[16][ai_type][u16 spawn#]`. **Bot removed by its controller** (`remove_bot` `0x9cb9c0` with report = 1, only when I'm the controller, online and not in loc 1005): `[16][slot +1 "dead" byte][u16 bot id]`; bytes 4–5 are stack garbage. Called when a bot despawns (target gone, defender docked) [static 2026-11-20] |
+| 0x0C | 20 | **Impact death** (`0x40ea4c`, state link) | `[0C][FE][u16 0xff2a92 @2][u32 me @4]` + three dwords from the collision code's locals (not identified). Sent when a collision kills me, only if online (`0xbe5b90`), and followed by `player_death(0)` (0x44, 0x07). @2 is likely the location [inferred] (physics.md §6) [static 2026-11-20] |
 | 0x74 | 16 | **Mining report** (sender in `0x43b1b0` @`0x43d525`, every ≥10 s while mining) | `[74][junk][u16 asteroid id @2][u16 loc @4][2 junk][f32 ore mined since last report @8][u32 player_id @0x0c]`. Bytes 1 and 6–7 are uninitialised stack. The amount is the accumulator `0xbe5e10`, reset after each send. See "Asteroid ore levels" [static + capture jgcap2] |
 | 0x0F | 392 | **Cargo report** (sender `0x439f16`; named "building" in the error strings) | `[0f][u8 flag][2 bytes uninitialised][48 × 8-byte item-list slots @4, copied from 0xff7d2c][u32 player_id @0x184]`. Sent every ~10 s while the mined-amount accumulator `0xbe5e10` is non-zero (it's reset after each send), and once just before docking. flag was 1 during mining and 0 in the final pre-dock report. **The client reports its own mined ore**: the classic server accepted these amounts (0x45 echoed them), so ore is client-authoritative unless the server checks it. [static + capture jgcap2] |
-| 0x44 | 16 | **Bot destroyed** ("who killed me", sent by the bot's controlling client) | `[44][u8][u16 bot spawn#][u32 killer pid][u32 reporter pid][4 zero]`. The server answered with "Received 3000 credits and 320 experience" (3300/350 for the second), "<callsign> destroyed a member of the Conflux", 0x92, 0x45. [capture jgcap2] |
-| 0x32 | 40 | **Missile** create/remove | `[32][u8 missile id][u16 type @2]` (missile index, e.g. 7 = Purgatory; **0xfa = removed**, the same value as a 0x05 ship removal) … `u32 owner pid @0x14`, `@0x18`, `f32×3 position @0x1c`. One create and one remove per missile fired. [capture jgcap2] |
+| 0x44 | 16 | **"Who killed me"**: a bot's death (sent by its controlling client) or **the sender's own death** (state link, sender `0x9cab20`) | `[44][u8][u16 bot id @2][u32 reporter pid @4][i32 killer @8][i32 extra @0xc]`. Own death: bot id 0xfe, killer = attacker of the last S→C 0x03 (`0xbe5ca0`), extra −2. Bot death (`0x9ce69e`): the bot's id, the killer passed to `0x9ce490`, extra 0. **The client sign-extends the killer from 16 bits** (`movsx`), so pids above 0x7fff don't survive. Earlier versions of this row had killer and reporter swapped; the capture couldn't tell (both were the same pilot). Bot death answered with "Received 3000 credits and 320 experience" (3300/350 for the second), "<callsign> destroyed a member of the Conflux", 0x92, 0x45. [static 2026-11-20 + capture jgcap2] |
+| 0x1D | 32 | **Hit report** (one per hit-queue entry; see "Combat: hits, damage, death" below) | `[1D][3 pad][u32 shooter @4][u16 loc @8][2 pad][u32 victim pid @0xc][u16 bot id @0x10][u16 count @0x12][u8 kind @0x14][u8 weapon @0x15][2 pad][f32 value @0x18][u8 class @0x1c]` [static 2026-11-20] |
+| 0x32 | 40 | **Missile** create/remove (same layout both ways; S→C handler `0x9d4686`) | `[32][u8 missile id @1][u8 type @2 (missile index, e.g. 7 = Purgatory; **0xfa = removed**)][0 @3][u16 target bot id @4, 0xfe = not a bot][u16 @6 → slot +0x15ae, ?][i16×3 velocity ×10 @8][i16×3 fwd ×10⁴ @0xe][u32 target pid @0x14][u32 owner pid @0x18][f32×3 position @0x1c]`. One create and one remove per missile fired. Receivers key it by (owner, id), put it in a free ship slot and the `0x14fd998` table, and fly it for display. **Target** (`0x9d557c`): target pid == me and @4 = 0xfe → it's on me (lock warning sound, and my last attacker becomes the owner if unset); @4 ≠ 0xfe → the bot with that id; else a target pid ≤ 0x7fff is a player, 0x8000–0x83e7 a slot (pid − 0x8000), above that an object. Captured: @4 = 1 (a conflux), target pid = the shooter's own id. A remove carries the final position; types 18–21 get the big explosion. [static + capture jgcap2, 2026-11-20] |
+| 0x1A | 16 | **"mkill"**: I shot down someone's missile (`0x43aedf`, space link) | `[1A][missile id @1][u16 @2 = that missile's 0x32 @4][u16 loc @4][? @6][i32 its target slot on my client @8][u32 owner pid @0xc]`. Server handling unknown [static 2026-11-20] |
 | 0x4F | 20 | **Artifact pickup** ("teleportPacket", sender `0x43c8a9`) | `[4f][3 junk][u32 player_id @4][f32 own position ×3 @8]`. Sent after 4 s of InSight beam on an artifact with a Displacer or Burglar fitted. No artifact id. See "Mineral vein and artifact". [static 2026-11-19, never captured] |
 | 0x64 | 8 | **Beacon / contract event** (sender `0x9cad80`) | `[64][u8 arg][2 bytes uninitialised stack][u32 player_id]`. Three callers: beacon tuned (`0x41006f`; arg = the faction the beacon now belongs to, set in the location table `0xfd925c + loc*0x64`; the server confirms with 0x61 state = arg), job-3 waypoint reached (arg 8), and a job-0x0d event (arg 9). [static + capture jgcap2] |
 | 0x43 | 12 | **Combat stats**, every 30 s in space if any are non-zero (sender `0x9caa30`) | `[43][u8 missiles fired @1][u8 missile hits @2][pad][u16 gun shots @4][u16 gun hits on ships @6][u32 player_id]`. Counters: `0xff266d` (launch, `0x436e38`), `0xff266e` (missile impact on a ship/bot slot, `0x42d4db`), `0xff2670` (gun fired, `0x4375a5`), `0xff2672` (gun hit on hull types 30–119 or bots 219–259, `0x43f60a`). Reset after sending. [static + capture jgcap2] |
@@ -219,6 +224,33 @@ timer in `0x9ce1c0..0x9ce2f6`; all three types go on the **space** connection.
   orientation `0xff2ab8..cc`, **velocity** `0xff2ad0..d8` (copied from the
   velocity cells), position `0xff2aac..b4`,
   clock `0xff2aa0`.
+
+### 0x06 login rejection  [static + capture of the text table, 2026-11-21]
+
+The classic server refused a login with a **0x06 whose byte @0x42 (the ship
+type in a real record) is an error code**. The handler checks it first
+(`0x9d207f`, reading `0xba8e62`). On a match it calls `0x403010(text)`, which opens the
+"Connection Error!" panel (`opt_conerror`, art `interface/opt_conerror.bmp`)
+with the text in its box (`opt_context`) and a "Quit Jumpgate" button
+(`opt_conquit`). It then clears the session flag `0xbe5b90` and skips the rest
+of the record. The texts are UI text slots `0xb549a8 + i*0x384`, where slot i
+is line i of the client's text table `sampleslarge.txt`:
+
+| code @0x42 | slot / line | text |
+|---|---|---|
+| 0xc8 | 120 | "You are running an incorrect version of Jumpgate…" |
+| 0xc9 | 121 | "Check the spelling and case of your username. This username is not valid:" |
+| 0xcb | 119 | "Your pilot is already connected to the Jumpgate universe" |
+| 0xcc, 0xcf | 111 | "Your account has expired…" |
+| 0xcd | 118 | "Your account is not enabled for use…" |
+| 0xce | 117 | "Password or username incorrect" |
+| 0xd0 | 116 | "Expired command line" |
+| 0xd1 | 122 | "Your account is temporarily disabled." + " Remaining time: %.2f hours." (f32 @0x60; German variant if `0x14ff650` == 1) |
+
+0xca is not handled, so it is parsed as a normal record. Nothing else in the
+record is read on this path. The panel's text-slot ↔ line mapping is inferred
+from these eight matching meanings (e.g. 0xd1 is the only code with a time,
+and it lands on "temporarily disabled"). Not yet seen live.
 
 ### 0x06 character record  [static 2026-11-19, handler `0x9d205f`]
 
@@ -667,3 +699,57 @@ capture's 8 snapshots each cloud moved exactly along its drift vector
 (strength 1: 17.4 in 343 s; strength 2: twice that). Radius stayed constant.
 The capture's 4th record (strength 0, non-unit vector (5, 0, 2), r 23) never
 moved and has zero intensity, so it's dormant.
+
+## Combat: hits, damage, death  [static 2026-11-20]
+
+### Hit queue → C→S 0x1D
+The shooter's client collects hits in a 16-entry queue at `0xb34660`
+(0x14-byte entries: `+0 victim pid, +4 u16 bot id, +6 u16 count, +8 kind,
++9 weapon, +0xc f32 value, +0x10 class`). `0x43a3d0` flushes it from the
+location tick (`0x9cdcd9`), one 0x1D per entry on the **space** link
+(`0x9c9c90`), then clears it. Hits count up to 40 per entry
+(`0x43a0a1`). The adders:
+
+| adder | caller | class | kind | value | meaning |
+|---|---|---|---|---|---|
+| `0x43a060` | gun hit test `0x43fbe6` | 0 | 0 | 0 | direct gun hits × count; weapon = gun index (shot `+8`) |
+| `0x43a1a0` | `0x43e900` in splash `0x43e650` | 0 | 0 | damage | gun splash; the shooter already subtracted it locally |
+| `0x43efc0` | missile update `0x42d86f` | 0 | 1 | 0 | direct missile hits × count; weapon = missile type (`0x14fd090`), **0xfe if the missile's damage arg ≤ 1.0** |
+| `0x43a130` | `0x43eda4` in splash `0x43eb30` | 0 | 1 | damage | missile splash |
+| `0x43a210` | `0x43c71d` | 1 | 0 | accumulated | weapons 0x2b–0x2e on objects 300–349: victim 0x7fff, bot id = object − 300 (not ship damage) |
+| `0x43a2c0` | beam `0x43be1e`/`0x43bee3` | 2 | 0 | accumulated | beam damage |
+| `0x43a360` | `0x43c209` | 3 | 0 | 0 | special-weapon hit, count 1 |
+
+Victim = the target slot's player id (`+0x15b4`), bot id = slot `+0x32`
+(0xfe when the slot isn't a bot). **A hit on a bot the shooter itself
+controls is never queued** (the adders' callers skip it when slot `+2` == 0):
+the controlling client applies it locally. So only hits on other players and
+on other clients' bots reach the server.
+
+### S→C 0x03 damage (handler `0x9d1463`)
+`[03][?][u16 bot id @2][u32 attacker @4][f32 damage @8]`.
+- Bot id 0xfe: the receiver's own ship. Skipped while dead (`0xbe5bbc`) or not
+  in space (`0xbe5af6` ≠ 1). Saves the attacker in `0xbe5ca0` (named later in
+  0x44). `shields −= damage`; if negative, the overflow comes off the hull and
+  shields are 0; hull ≤ 0 → `player_death(1)`.
+- Otherwise: the pbotloc entry with controller == me and that bot id. The
+  attacker's ship slot becomes the bot's target (only hull types 30–229), then
+  the damage goes to the bot ship's shields (`+0x15f8`) and hull.
+- Attacker ≤ −1 takes another branch (not traced; environment damage?).
+
+### Player death (`player_death` `0x9cec40`)
+Sends, in order: an mloc (`0x9ca840`); **0x44** (bot id 0xfe, killer, −2);
+0x4C mission packets if on a mission; **0x07 action 2 with to_loc 0xfe** on
+the state link. Then sets `0xbe5bbc = 1`, which makes the client ignore
+further 0x03. `snapshot_consumables` runs with the total-loss flag, so the
+0x0E sent on the next station 0x08 reports fuel, hull and magazines all used.
+What the classic server answered isn't captured. The client is waiting for a
+0x08 to some station.
+
+### Shield regeneration of remote ships (`0x433309`)
+Every client regenerates *other* ships' shields locally between reports: it
+finds the shield item whose capacity equals the slot's max shields (0x05
+@0xa0) and adds its **regen × dt**, capped at the max. No efficiency factor.
+If no shield matches, it uses 1000/s (`0xaeaf08`). Applied only when
+`max > 0xac2aa0` and `current < max`. The own-ship rule wasn't traced.
+

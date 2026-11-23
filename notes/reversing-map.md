@@ -32,6 +32,10 @@ Built with MSVC 7.1 (VS2003, linker 7.10). Bands, see `functions.csv`:
 | `0xa62c10` | wrapper poll loop |
 | `0xa631d0`,`0xa63200` | wrapper send (state / space) |
 | `0xa63710` | prepend 0x51, hand to RakNet send |
+| `0xa62fe0` | wrapper connect space (refuses if already connected) |
+| `0xa631b0` | wrapper disconnect space → `0xa636d0(conn, 1, 0)` |
+| `0xa6adc0` | RakPeer::CloseConnection (vtable `0xb0dda8` +0x58 → `0xa6c690`); notify → `0xa6a630` sends 0x14 |
+| `0xa21ab5` | WndProc WM_DESTROY → shutdown `0xa215e0` ("Last Code" = whatever checkpoint `0x14ff668` held) |
 | `0xba7cd4` | wrapper object (state conn +0x08, space conn +0x28) |
 | global `0xbe5b3e` | u16 current location/sector id |
 | global `0xbe5da0` | u32 player/session id |
@@ -213,7 +217,8 @@ Ownership moves to whichever player is nearest.
 | `0x42f360` | offline-sim AI (loc 1005, `/ai #` "Spawns a flux ... offline sim mode") |
 | `0x9c9d10` | botloc sender: 0x71 (52 B) per controlled bot (hull%, shield%, position, velocity, orientation). Runs after every 0x05 and on assignment. |
 | C→S `0x71` sub 3 | "botloc 3" — sent from the AI when a condition fires within 60 units [inferred: arrival/attack] |
-| C→S `0x2C` (12 B) "bxr" | handoff request: sent when a bot's controller is another player but **I** am closer to it (range scaled by ship radar) |
+| C→S `0x2C` (12 B) "bxr" | hand-off request: sent when a bot's controller is another player but **I** score closer to it (distance projected over the bot's first gun's shot lifetime, within the type's hand-off range; ai.md "Hand-off"). An earlier note said "range scaled by ship radar"; the code doesn't show that |
+| C→S `0x16` (6 B) | bot gone: spawn bounce `[16][ai_type][spawn#]`, or `remove_bot` `0x9cb9c0` by the controller `[16][dead][bot id]` |
 | C→S `0xB0` (20 B) sub 3 | controller-only, 1-in-32000 rand per frame for ship types 230–233 within 1–200 units of the target: random event with client-rand payload [inferred: drop/spawn] |
 | `0x1042118 + slot*0x160c` | ship table: +0 active, +1 dead, **+2 controlling/target slot (0 = local, 0xfe = none)**, +3 0xff = valid, +0x94 distance, +0x15f8.. shields. ⚠ An earlier version said "+0x15c8/+0x15cc hull"; physics.md shows +0x15c8/cc/d0 is the **position** (+0x15ec.. velocity, +0x15c0 mass). Hull offset to re-check. |
 
@@ -230,8 +235,8 @@ the controlling client. Leads: missile update `0x42ca30` and hit processing
 | `0x437590` | local player fires (callers `0x43da3e`/`0x43db90`, input) |
 | `0x439260` | every frame: re-creates *other* ships' shots from their firing bitmask (`ship+0x156f`) and weapon slots. Bot shots get class 2 + shooter slot. **Aim/lead for bots is computed only when `ship+2 == 0` (I control the bot).** |
 | `0x43f0c0` | gun hit test (shot vs ships slot ≥5) → hit queue |
-| `0x43a4a0` | bot-shot / beam / missile hit processing; bot shot hitting **slot 0 (me)** → local damage, `shields -= weapon[+0x50]` (×mods), overflow to hull, hull ≤ 0 → death `0x9cec40`; last attacker `0xbe5ca0 = 0x8000+bot slot` |
-| `0xb34660` | **hit queue** (16 × 20 B: u32 victim id, u16 bot id or 0xfe, u16 hit count (guns merged, ≤40), u8 kind, u8 weapon, f32 value (beam time / splash), u8 class 0 gun/1 missile splash/2 beam/3 special/…). Adders `0x43a060` gun, `0x43a130` missile splash, `0x43a1a0` mortar, `0x43a210` bldg repair, `0x43a2c0` beam, `0x43a360` special, `0x43efc0` missile dmg |
+| `0x43a4a0` | bot-shot / beam / missile hit processing; bot shot hitting **slot 0 (me)** → local damage, `shields -= weapon[+0x50]` (×mods), overflow to hull, hull ≤ 0 → death `0x9cec40`; last attacker `0xbe5ca0 = 0x8000+bot slot` (which is why 0x44 sign-extends the killer from 16 bits: a bot killer comes out negative) |
+| `0xb34660` | **hit queue** (16 × 20 B: u32 victim id, u16 bot id or 0xfe, u16 hit count (≤40), u8 kind 0 gun / 1 missile, u8 weapon, f32 value, u8 class 0 ship / 1 object 300–349 / 2 beam / 3 special). Per-adder table in message-types "Combat: hits, damage, death" (2026-11-20; supersedes the old class list here) |
 | `0x43a3d0` | flush: one **C→S `0x1D`** (32 B) per entry, `[1D][pad3][u32 shooter=me][u16 loc][pad2][u32 victim][u16 id][u16 count][u8 kind][u8 weapon][pad2][f32 value][u8 class]`, called after each 0x33/0x34 tick |
 | S→C `0x03` handler `0x9d1463` | **damage delivery** `[03][?][u16 bot id or 0xfe @2][u32 attacker @4][f32 damage @8]`. 0xfe = me: subtract from own shields → hull, die locally. Bot id: only if I control that bot → damage it, retarget it at the attacker (aggro), botloc/killed. |
 | C→S `0x1A` (16 B) "mkill" | I shot down a missile (missile table `0x14fd990`) |

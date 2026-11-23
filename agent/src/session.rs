@@ -11,10 +11,15 @@
 //! server it was pointed at.
 
 use crate::ai::{Order, Patrol, Route};
+use crate::bots::{self, Bots};
+use crate::collide::{self, FieldState, Surroundings};
+use crate::missiles::Missiles;
 use crate::physics::{Flight, DT};
+use crate::sector::Sector;
 use jumpgate_common::character::Character;
+use jumpgate_common::mesh::Models;
 use jumpgate_common::proto::{self, ACT_DOCK, ACT_LAUNCH};
-use jumpgate_common::ship::Hull;
+use jumpgate_common::ship::{Hull, Vitals};
 use jumpgate_common::world::World;
 use raknet::ids::Reliability;
 use raknet::session::{Endpoint, Event};
@@ -112,6 +117,21 @@ impl Link {
     }
 }
 
+/// Dropping a link closes it as the stock client does: on dock or redirect
+/// its wrapper calls RakPeer::CloseConnection with sendDisconnectionNotification
+/// set (`0xa631b0` → vtable +0x58 `0xa6c690` → `0xa6adc0`), so the server sees
+/// ID_DISCONNECTION_NOTIFICATION (0x14) at once instead of timing the peer out.
+impl Drop for Link {
+    fn drop(&mut self) {
+        if self.ep.is_connected() {
+            self.ep.disconnect();
+            for dg in self.ep.flush() {
+                let _ = self.sock.send(&dg);
+            }
+        }
+    }
+}
+
 enum Phase {
     LoggingIn { sent: bool },
     Docked { since: Instant },
@@ -123,6 +143,13 @@ enum Phase {
 struct Sortie {
     flight: Flight,
     hull: Hull,
+    vitals: Vitals,
+    /// Attacker of the last 0x03, named as the killer in 0x44.
+    last_attacker: u32,
+    surroundings: Surroundings,
+    /// Own model size for the push test.
+    size: f32,
+    fields: FieldState,
     ai: Option<Patrol>,
     started: Instant,
     last_full: Option<Instant>,
@@ -133,7 +160,16 @@ struct Sortie {
 
 pub struct Agent {
     cfg: Config,
+    /// Set when the server refuses our login (0x06 rejection code).
+    refused: Option<u8>,
     world: Arc<World>,
+    models: Arc<Models>,
+    /// Other ships in our sector, from the relayed reports.
+    sector: Sector,
+    /// Stock bots in our sector, some flown by us.
+    bots: Bots,
+    /// Other pilots' missiles in our sector (for bot dodging).
+    missiles: Missiles,
     state: Link,
     space: Option<Link>,
     phase: Phase,
@@ -144,6 +180,8 @@ pub struct Agent {
     /// Launch tube from the last 0x08 (sub 6).
     tube: u8,
     engine: u8,
+    /// Fitted shield index (0x06 fittings, 0xfe = none).
+    shield: u8,
     clock0: Instant,
     /// Last time another ship's report reached us in our sector.
     company: Option<Instant>,
@@ -151,11 +189,16 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn connect(cfg: Config, world: Arc<World>) -> io::Result<Agent> {
+    pub fn connect(cfg: Config, world: Arc<World>, models: Arc<Models>) -> io::Result<Agent> {
         let state = Link::open("state", SocketAddr::new(cfg.server, cfg.state_port))?;
         Ok(Agent {
             cfg,
+            refused: None,
             world,
+            models,
+            sector: Sector::default(),
+            missiles: Missiles::default(),
+            bots: Bots::new(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64)),
             state,
             space: None,
             phase: Phase::LoggingIn { sent: false },
@@ -165,6 +208,7 @@ impl Agent {
             rank: 0,
             tube: 0,
             engine: 0xfe,
+            shield: 0xfe,
             clock0: Instant::now(),
             company: None,
             cycles_done: 0,
@@ -189,6 +233,9 @@ impl Agent {
                     Event::Disconnected => return Err(io::Error::new(io::ErrorKind::ConnectionReset, "server closed state")),
                 }
             }
+            if let Some(code) = self.refused {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("login refused (code 0x{code:02x})")));
+            }
             let space_events = match self.space.as_mut() {
                 Some(l) => l.poll(),
                 None => Ok(Vec::new()),
@@ -198,7 +245,7 @@ impl Agent {
                     for ev in evs {
                         match ev {
                             Event::Connected => self.on_space_connected(),
-                            Event::Message(_) => {} // keepalive answers
+                            Event::Message(m) => self.on_space(&m.body),
                             Event::Disconnected => {
                                 self.log("space closed by server");
                                 self.space = None;
@@ -227,11 +274,15 @@ impl Agent {
     fn on_state(&mut self, m: &[u8]) {
         match m.first() {
             Some(0x06) => {
-                if let Some(c) = proto::parse_char_record(m) {
+                if let Some(code) = proto::parse_login_rejection(m) {
+                    self.log(&format!("login refused (0x06 code 0x{code:02x}; 0xce = wrong password)"));
+                    self.refused = Some(code);
+                } else if let Some(c) = proto::parse_char_record(m) {
                     self.pid = c.pid;
                     self.ship_type = c.ship_type;
                     self.rank = c.rank;
                     self.engine = c.fittings[24];
+                    self.shield = c.fittings[28];
                     if let Phase::LoggingIn { .. } = self.phase {
                         self.loc = c.loc;
                         self.log(&format!("logged in: player {} at {} in ship {}, {} credits", c.pid, c.loc, c.ship_type, c.credits));
@@ -255,13 +306,114 @@ impl Agent {
                 if proto::u16_at(m, proto::LOC_LOC_OFF) == self.loc && proto::u16_at(m, proto::LOC_SHIP_OFF) != proto::SHIP_GONE {
                     self.company = Some(Instant::now());
                 }
+                let now = self.clock();
+                self.sector.on_message(m, self.loc, self.pid, now);
             }
-            Some(0x33 | 0x34) => self.company = Some(Instant::now()),
+            Some(0x33 | 0x34) => {
+                self.company = Some(Instant::now());
+                let now = self.clock();
+                self.sector.on_message(m, self.loc, self.pid, now);
+            }
+            Some(0x03) => self.on_damage(m),
+            Some(0x70) => {
+                // A spawn order: only a pilot in space takes one.
+                let (loc, now) = (self.loc, self.clock());
+                let bounce = match self.phase {
+                    Phase::Flying(_) => self.bots.on_spawn_order(m, loc, now),
+                    _ if m.len() >= 4 => Some(proto::bot_gone(m[1], proto::u16_at(m, 2))),
+                    _ => None,
+                };
+                if let Some(b) = bounce {
+                    self.state.send(&b);
+                } else if self.cfg.verbose {
+                    self.log(&format!("spawn order: bot type {}", 219 + m[1] as u16));
+                }
+            }
+            Some(0x32) => {
+                if matches!(self.phase, Phase::Flying(_)) && self.missiles.on_message(m, self.pid) && self.cfg.verbose {
+                    self.log("missile lock warning");
+                }
+            }
+            Some(0x71) => {
+                if !matches!(self.phase, Phase::Flying(_)) {
+                    return;
+                }
+                let (pid, loc, now) = (self.pid, self.loc, self.clock());
+                let before = self.bots.flown();
+                if let Some(reply) = self.bots.on_botloc(m, pid, loc, &self.world, now) {
+                    if let Some(sp) = self.space.as_mut() {
+                        sp.send(&reply);
+                    }
+                }
+                if self.bots.flown() != before {
+                    self.log(&format!("now flying {} bot(s)", self.bots.flown()));
+                }
+            }
             _ => {}
         }
     }
 
+    /// Space-link messages: the same dispatcher as the state link's on the
+    /// stock client; the server relays on state, so only damage matters here.
+    fn on_space(&mut self, m: &[u8]) {
+        if m.first() == Some(&0x03) {
+            self.on_damage(m);
+        }
+    }
+
+    /// S→C 0x03 for our own ship (bot id 0xfe): shields first, overflow to
+    /// hull, hull ≤ 0 is death. Ignored unless flying, as the client ignores
+    /// it once dead or docked (`0xbe5bbc`, `0xbe5af6`).
+    fn on_damage(&mut self, m: &[u8]) {
+        let Some(d) = proto::parse_damage(m) else { return };
+        if d.bot != proto::NOT_A_BOT {
+            for m in self.bots.on_damage(d.bot, d.attacker, d.amount, self.pid) {
+                if m[0] == 0x44 {
+                    self.log(&format!("bot #{} destroyed by {}", d.bot, d.attacker));
+                }
+                self.state.send(&m);
+            }
+            return;
+        }
+        let Phase::Flying(s) = &mut self.phase else { return };
+        s.last_attacker = d.attacker;
+        let killed = s.vitals.damage(d.amount);
+        let v = s.vitals;
+        if self.cfg.verbose || killed {
+            self.log(&format!(
+                "hit by {} for {:.0}: shields {:.0}/{:.0}, hull {:.0}/{:.0}",
+                d.attacker, d.amount, v.shields, v.shields_max, v.hull.max(0.0), v.hull_max
+            ));
+        }
+        if killed {
+            self.die();
+        }
+    }
+
+    /// `player_death` (`0x9cec40`) on the wire: 0x44 naming the killer, then a
+    /// dock with target 0xfe. The server sends us home (0x08 to our last base,
+    /// no space), and the usual docked wait → relaunch follows.
+    fn die(&mut self) {
+        let Phase::Flying(s) = &self.phase else { return };
+        let killer = s.last_attacker;
+        self.log(&format!("destroyed by {killer} in {}", self.loc));
+        self.drop_bots();
+        self.state.send(&proto::kill_report(proto::NOT_A_BOT, self.pid, killer, -2));
+        self.state.send(&proto::travel(ACT_DOCK, self.loc, proto::DEATH_DOCK_ARG, self.pid));
+        self.phase = Phase::Docking;
+    }
+
+    /// Our ship leaves space: the bots we fly lose their target and go, and
+    /// queued spawn orders bounce (as the client's `0x9cb9c0` / `0x9cb930`).
+    fn drop_bots(&mut self) {
+        self.missiles.clear();
+        for m in self.bots.clear() {
+            self.state.send(&m);
+        }
+    }
+
     fn on_location_change(&mut self, lc: proto::LocationChange) {
+        self.drop_bots();
         match lc.space_ip {
             Some(ip) => {
                 if ip.parse::<IpAddr>().ok() != Some(self.cfg.server) {
@@ -270,6 +422,7 @@ impl Agent {
                 self.loc = lc.loc;
                 self.tube = lc.tube;
                 self.company = None;
+                self.sector.clear();
                 match Link::open("space", SocketAddr::new(self.cfg.server, self.cfg.space_port)) {
                     Ok(l) => self.space = Some(l),
                     Err(e) => self.log(&format!("space connect: {e}")),
@@ -318,11 +471,29 @@ impl Agent {
                 (Flight::new(&hull, thrust, [0.0; 3], [0.0, 0.0, 1.0]), None)
             }
         };
-        self.log(&format!("launched into {} ({})", self.loc, self.world.name(self.loc)));
+        let shield = self.world.shield(self.shield);
+        let vitals = Vitals::new(&hull, shield);
+        let surroundings = Surroundings::new(&self.world, &self.models, self.loc);
+        let size = collide::model_size(&self.models, hull.type_id);
+        if self.cfg.verbose {
+            self.log(&format!("{} collidable objects here", surroundings.obstacles.len()));
+        }
+        self.log(&format!(
+            "launched into {} ({}); shields {:.0}, hull {:.0}",
+            self.loc,
+            self.world.name(self.loc),
+            vitals.shields_max,
+            vitals.hull_max
+        ));
         let now = Instant::now();
         self.phase = Phase::Flying(Box::new(Sortie {
             flight,
             hull,
+            vitals,
+            last_attacker: 0,
+            surroundings,
+            size,
+            fields: FieldState::default(),
             ai,
             started: now,
             last_full: None,
@@ -372,13 +543,18 @@ impl Agent {
         let (pid, loc, rank) = (self.pid, self.loc, self.rank);
         let callsign = self.cfg.callsign.clone();
         let company = self.company.is_some_and(|t| t.elapsed() < COMPANY_TIMEOUT);
+        let (sector, models, world, bots_tbl, missiles) = (&mut self.sector, &self.models, &self.world, &mut self.bots, &mut self.missiles);
+        let mut bot_out = bots::Out::default();
         let Phase::Flying(s) = &mut self.phase else { return };
 
         s.acc += (now - s.last_step).as_secs_f32().min(0.5);
         s.last_step = now;
         let mut dock = false;
+        let mut crashed = false;
+        let mut bumped = None;
         while s.acc >= DT {
             s.acc -= DT;
+            s.vitals.regenerate(DT);
             let order = match s.ai.as_mut() {
                 Some(ai) => ai.think(&s.flight),
                 None if s.started.elapsed() > Duration::from_secs(10) => Order::Dock,
@@ -388,7 +564,37 @@ impl Agent {
                 Order::Fly { toward, throttle } => {
                     s.flight.throttle = throttle;
                     s.flight.turn_toward(toward, DT);
-                    s.flight.step(DT);
+                    // The client's frame: velocity, collisions, then position.
+                    s.flight.dynamics(DT);
+                    let fr = collide::step(&mut s.flight, s.hull.ext, s.size, &s.surroundings, sector, models, &mut s.fields, DT);
+                    if fr.hit.is_some() {
+                        bumped = fr.hit.map(|k| (k, fr.impact));
+                    }
+                    if s.vitals.damage(fr.impact + fr.burn) {
+                        crashed = true;
+                        break;
+                    }
+                    s.flight.integrate(DT);
+                    sector.advance(DT, clock);
+                    let me = bots::Me {
+                        pid,
+                        pos: s.flight.pos,
+                        vel: s.flight.vel,
+                        radius: s.hull.ext.iter().fold(0.0f32, |a, &e| a.max(e)) * 0.5,
+                    };
+                    missiles.step(DT, world, Some((pid, me.pos, me.vel)), sector, |id| bots_tbl.motion(id));
+                    let o = bots_tbl.step(DT, clock, Some(me), loc, world, &s.surroundings, sector, missiles);
+                    bot_out.state.extend(o.state);
+                    bot_out.space.extend(o.space);
+                    if o.hit_me > 0.0 {
+                        if let Some(a) = o.attacker {
+                            s.last_attacker = a;
+                        }
+                        if s.vitals.damage(o.hit_me) {
+                            bot_out.hit_me = -1.0; // killed by a bot
+                            break;
+                        }
+                    }
                 }
                 Order::Dock => {
                     dock = true;
@@ -396,14 +602,41 @@ impl Agent {
                 }
             }
         }
+        for m in &bot_out.state {
+            self.state.send(m);
+        }
+        if let Some(sp) = self.space.as_mut() {
+            for m in &bot_out.space {
+                sp.send(m);
+            }
+        }
+        let Phase::Flying(s) = &mut self.phase else { return };
+        if bot_out.hit_me < 0.0 {
+            self.die();
+            return;
+        }
+        if let Some((kind, dmg)) = bumped {
+            let v = s.vitals;
+            eprintln!("[{callsign}] hit {kind:?} for {dmg:.0}: shields {:.0}, hull {:.0}", v.shields, v.hull.max(0.0));
+        }
+        if crashed {
+            // As the client: the impact packet, then player_death.
+            self.state.send(&proto::impact_death(loc, pid));
+            self.die();
+            return;
+        }
 
         let space_up = self.space.as_ref().is_some_and(|l| l.ep.is_connected());
         if space_up {
-            let view = s.flight.view(&callsign, loc, &s.hull, rank);
+            let view = s.flight.view(&callsign, loc, &s.hull, rank, &s.vitals);
             let space = self.space.as_mut().unwrap();
             if s.last_full.map_or(true, |t| t.elapsed() >= FULL_REPORT_EVERY) {
                 s.last_full = Some(now);
                 space.send(&proto::ship_report(&view, pid, clock));
+                // As the client: a botloc for each bot we fly after each 0x05.
+                for m in self.bots.botlocs(pid, loc) {
+                    space.send(&m);
+                }
                 self.state.send(&proto::companion_report());
             } else if company && s.last_fast.elapsed() >= FAST_REPORT_EVERY {
                 s.last_fast = now;
@@ -424,6 +657,7 @@ impl Agent {
                 experience: 0,
             };
             self.state.send(&proto::cargo_report(&empty, pid, 0));
+            self.drop_bots();
             self.state.send(&proto::travel(ACT_DOCK, loc, 0, pid));
             self.log(&format!("docking at {loc}"));
             self.phase = Phase::Docking;

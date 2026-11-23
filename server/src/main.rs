@@ -23,6 +23,7 @@
 //! `jumpgate-agent` processes that log in like players.
 
 mod accounts;
+mod bots;
 mod feed;
 mod game;
 mod net;
@@ -42,7 +43,7 @@ use world::World;
 fn usage() -> ! {
     eprintln!(
         "usage: jumpgate-server [--templates <jgcap.bin>] [--data <dir>] [--listen ip] [--advertise ip] \
-         [--state-port 5150] [--space-port 5151] [--home-station 7] [--accounts accounts.json] [--npcs] [--verbose]"
+         [--state-port 5150] [--space-port 5151] [--home-station 7] [--accounts accounts.json] [--bots <population file>] [--npcs] [--verbose]"
     );
     std::process::exit(2);
 }
@@ -59,6 +60,7 @@ fn main() {
     let mut verbose = false;
     let mut npcs_on = false;
     let mut accounts_path = String::from("accounts.json");
+    let mut bots_path: Option<String> = None;
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -72,6 +74,7 @@ fn main() {
             "--npcs" => npcs_on = true,
             "--no-npcs" => npcs_on = false,
             "--accounts" => accounts_path = val(),
+            "--bots" => bots_path = Some(val()),
             "--verbose" | "-v" => verbose = true,
             _ => usage(),
         }
@@ -120,6 +123,14 @@ fn main() {
         std::process::exit(1)
     });
     eprintln!("[server] {} accounts from {accounts_path}", server.accounts.len());
+    if let Some(p) = &bots_path {
+        let rules = std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|t| bots::parse_rules(&t)).unwrap_or_else(|e| {
+            eprintln!("[server] can't load bot population {p}: {e}");
+            std::process::exit(1)
+        });
+        eprintln!("[server] {} bot population rules from {p}", rules.len());
+        server.bots = bots::Bots::with_rules(rules);
+    }
     let mut state = Listener::bind("state", SocketAddr::new(listen, state_port)).unwrap_or_else(|e| {
         eprintln!("bind state: {e}");
         std::process::exit(1)
@@ -141,6 +152,7 @@ fn main() {
             sim.tick((now - last_tick).as_secs_f32());
             last_tick = now;
             outs.extend(server.present_ships(sim.ships(), (now - start).as_secs_f32()));
+            outs.extend(server.bots_tick((now - start).as_secs_f32()));
         }
         for (conn, ev) in state
             .poll()
@@ -150,10 +162,9 @@ fn main() {
         {
             match ev {
                 NetEvent::Connected(a) => {
+                    // A space session is bound to its player later, by the
+                    // player id in its first location report (Server::space_player).
                     eprintln!("[{conn:?}] {a} connected");
-                    if conn == Conn::Space {
-                        server.space_connected(a);
-                    }
                 }
                 NetEvent::Message(a, m) => {
                     if verbose && !is_high_rate(&m) {

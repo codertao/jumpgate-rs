@@ -3,6 +3,8 @@
 //! (`world`). No sockets and no game logic.
 
 pub mod character;
+pub mod mesh;
+pub mod missile;
 pub mod proto;
 pub mod ship;
 pub mod world;

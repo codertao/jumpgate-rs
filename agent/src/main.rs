@@ -10,16 +10,26 @@
 //! Usage:
 //!   jumpgate-agent [--server 127.0.0.1] [--state-port 5150] [--space-port 5151]
 //!                  [--name Agent] [--count 1] [--laps 1] [--dock-wait 20]
-//!                  [--cycles 0] [--data <notes/extracts>] [--verbose]
+//!                  [--cycles 0] [--data <notes/extracts>] [--client-dir <Jumpgate install>]
+//!                  [--verbose]
+//!
+//! `--client-dir` points at your own Jumpgate install: the agents read the
+//! game's `.x` meshes from it for collisions (nothing is copied). Without it
+//! they fly with no collisions against stations, gates or asteroids.
 //!
 //! The password comes from `JG_AGENT_PASSWORD` (or `--password`, which other
 //! users on the machine can see in the process list). Callsigns are
 //! `<name>01`, `<name>02`, …; the server provisions each on first login.
 
 mod ai;
+mod bots;
+mod collide;
+mod missiles;
 mod physics;
+mod sector;
 mod session;
 
+use jumpgate_common::mesh::Models;
 use jumpgate_common::world::World;
 use session::{Agent, Config};
 use std::net::IpAddr;
@@ -31,7 +41,7 @@ const RETRY_AFTER: Duration = Duration::from_secs(10);
 fn usage() -> ! {
     eprintln!(
         "usage: jumpgate-agent [--server ip] [--state-port 5150] [--space-port 5151] [--name Agent] \
-         [--count 1] [--laps 1] [--dock-wait 20] [--cycles 0] [--data dir] [--password pw] [--verbose]\n\
+         [--count 1] [--laps 1] [--dock-wait 20] [--cycles 0] [--data dir] [--client-dir dir] [--password pw] [--verbose]\n\
          password: set JG_AGENT_PASSWORD (preferred) or pass --password"
     );
     std::process::exit(2);
@@ -47,6 +57,7 @@ fn main() {
     let mut dock_wait = 20u64;
     let mut cycles = 0usize;
     let mut data_dir: Option<String> = None;
+    let mut client_dir: Option<String> = None;
     let mut password = std::env::var("JG_AGENT_PASSWORD").ok();
     let mut verbose = false;
     while let Some(a) = args.next() {
@@ -61,6 +72,7 @@ fn main() {
             "--dock-wait" => dock_wait = val().parse().unwrap_or_else(|_| usage()),
             "--cycles" => cycles = val().parse().unwrap_or_else(|_| usage()),
             "--data" => data_dir = Some(val()),
+            "--client-dir" => client_dir = Some(val()),
             "--password" => password = Some(val()),
             "--verbose" | "-v" => verbose = true,
             _ => usage(),
@@ -78,6 +90,16 @@ fn main() {
         std::process::exit(1)
     }));
 
+    let models = Arc::new(
+        Models::load(std::path::Path::new(&data_dir), client_dir.as_deref().map(std::path::Path::new)).unwrap_or_else(|e| {
+            eprintln!("can't read the client folder {}: {e}", client_dir.as_deref().unwrap_or(""));
+            std::process::exit(1)
+        }),
+    );
+    if !models.has_meshes() {
+        eprintln!("no --client-dir: agents fly without collisions");
+    }
+
     let threads: Vec<_> = (1..=count)
         .map(|i| {
             let cfg = Config {
@@ -92,12 +114,17 @@ fn main() {
                 cycles,
                 verbose,
             };
-            let world = world.clone();
+            let (world, models) = (world.clone(), models.clone());
             std::thread::spawn(move || loop {
-                let result = Agent::connect(cfg.clone(), world.clone()).and_then(|mut a| a.run());
+                let result = Agent::connect(cfg.clone(), world.clone(), models.clone()).and_then(|mut a| a.run());
                 match result {
                     Ok(()) => {
                         eprintln!("[{}] done", cfg.callsign);
+                        return;
+                    }
+                    // Retrying won't change the answer (e.g. a wrong password).
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        eprintln!("[{}] {e}; giving up", cfg.callsign);
                         return;
                     }
                     Err(e) => {

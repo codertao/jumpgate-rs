@@ -109,6 +109,23 @@ The split is clean. State is the persistent, reliable traffic: account, inventor
 market, chat, missions, docking. Space is the real-time sector simulation:
 positions, bots, shots, kills, and in-space effects like PWD.
 
+**Space session identity** [static + capture, 2026-11-21]: the space link is a
+bare RakNet connection to `<addr>:5151` with no login or token of its own. The
+first game message the client sends on it is a 0x05 location report, which names
+its player id @0x5c (the id from the state server's 0x06). That is the only thing
+tying a space connection to a state session. How the classic server checked it
+is unknown.
+
+**Closing space** [static, 2026-11-21]: when an S→C 0x08 changes the space address
+(dock sends "none"), handler `0x9d30c6` calls `0xa631b0` before reconnecting.
+It calls `0xa636d0(conn, 1, 0)`: vtable +0x60 (`0xa6a120`) resolves the
+PlayerID, then vtable +0x58 (`0xa6c690`, RakPeer vtable `0xb0dda8`) calls
+`CloseConnection` `0xa6adc0` with sendDisconnectionNotification = 1. That sends
+ID_DISCONNECTION_NOTIFICATION 0x14 (`0xa6a630`, priority/reliability 3/3). So the stock
+client tells the space server it is leaving instead of just going quiet.
+`0xa62fe0` (connect space) refuses while a space connection exists ("Attempted
+to connect to space server, already connected").
+
 **Receiving:** both sockets feed one queue. The poll loop `0xa62c10` compares the
 sender address with the state peer (`+0x08`). It then tags the queued packet
 `[pkt+0x10]` = 0 for state or 1 for space, and stamps that connection's last-heard

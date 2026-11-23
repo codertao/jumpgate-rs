@@ -310,13 +310,23 @@ at `+0x68/+0x74/+0x80`, position `+0x15c8`). Nothing is volume-vs-volume.
   (18, 13, 16), 381–383 (7, 8, 12), and player buildings 349–375 (2–7).
   Afterwards `0xa61f20` sets each radius to the largest |extent| and calls
   `0xa612d0` for every model.
+  **Extracted** (2026-11-20) by `tools/jg_tables.py` into
+  `extracts/collision_volumes.csv`: 440 blocks on 206 models (model, block
+  0–20, axis A, axis B, extents, centre; same register tracking as the station
+  points). `extracts/models.csv` maps model id → `.x` file (239 models) and, for
+  26 models, a second mesh: **model `+0x934` is the station's tunnel mesh**
+  (`*_tun.x`, stored e.g. at `0xa5f071`; also `beaconrings.x` for the
+  beacon). `0xa612d0` walks that mesh too, appending its triangles to the
+  same lists, so tunnels collide like the body.
 - `0xa612d0` build_collision_tris. It walks the render mesh's 16-bit index
   buffer (32-byte vertices, position first). If sub-volume 0 is empty
   (`+0x308 == 0`), each triangle with **at least one vertex inside the
   whole-model volume** (`0x408130`) is copied into a 0x28-byte node:
   next, then x[3] @+4, y[3] @+0x10, z[3] @+0x1c in model space. The node is
   pushed onto `+0x2e8`. Otherwise the same test runs per non-empty
-  sub-volume, and the triangle goes onto that volume's list `+0x38`.
+  sub-volume (**empty = extent x is 0**, `0xa61516`, so a sub-volume with a
+  zero x extent is skipped even if the rest is set; model 414 block 2 is one),
+  and the triangle goes onto that volume's list `+0x38`.
   A triangle can land in several lists, and one outside every volume is
   dropped. Models with no hard-coded volume probably have no collision
   triangles at all [inferred].
@@ -356,7 +366,9 @@ at `+0x68/+0x74/+0x80`, position `+0x15c8`). Nothing is volume-vs-volume.
 of length |v·dt|) against triangles. There is no model-vs-model, sphere or
 box sweep. The movers are:
 - **Own ship:** 7 points, the centre plus the centre ±½ of the type's
-  collision extents (`+0x158/15c/160`) along right, up and forward. Each
+  collision extents (`+0x158/15c/160`) along right, up and forward. The ½ is
+  the constant `0xac276c` (0.5) applied to each extent (`0x40aa1a`), so the
+  ship-type extents are full sizes. Each
   point is swept by v·dt. A thin spar can slip between the points.
 - **Bots I control:** the centre point only.
 - **Missiles:** the centre point. Small models that don't get the mesh
@@ -373,7 +385,9 @@ v   = -0.8 * v + 5 * n                    // 80 % restitution plus a 5 u/s kick
 shields -= E; overflow -> hull; hull < 0 -> death (0x9cec40)
 ```
 If you die from an impact, the client sends a `0x0C` "impact" packet
-(`"Failed to send impact packet"`). The `0xbe6e30` counter accumulates
+(`"Failed to send impact packet"`, `0x40ea4c`, state link, 20 B:
+`[0C][FE][u16 0xff2a92 @2][u32 pid @4]` + three dwords from locals, not
+identified) and then calls `player_death(0)` (message-types "Combat"). The `0xbe6e30` counter accumulates
 E × 1e-6.
 
 **Mass-ratio "elastic" bounce: slots 1–5 and world objects only, not ships.**
@@ -382,7 +396,11 @@ ship. That is wrong. The formula is real, but it only runs in two loops, and
 neither one visits the ship slots (10–199):
 1. **Contact slots 1–5.** These are the gate slots plus slot 5. The loop is
    `esi = 1 … < 6` at `0x40f9ab` / `0x41062e`. Response:
-   - `e = (m − m2)/(m + m2)`, using m2 = slot `+0x15c0`
+   - `e = (m − m2)/(m + m2)`, using m2 = slot `+0x15c0`. Set on location
+     change (`0x4ba9a3`): **50,000 for gate model 11; 500,000 for the beacon
+     (2), asteroids (15–29) and huge rocks (305–319)**; other contact models
+     get none (0, so e = 1 and they don't bounce you; this includes the pull
+     gate 414) [static 2026-11-20]
    - `v' = v2 + (v − v2)·e`
    - `pos += 0.1·n`
    - damage E = 0.1·m·|Δv|² to shields, then hull
@@ -391,6 +409,8 @@ neither one visits the ship slots (10–199):
    Gates have v2 = 0, so this is effectively a bounce off a fixed body.
 2. **The sector world-object table** at `0x140ad48 + i*0xdc`, 1000 entries.
    Each entry holds a model at `+0`, mass at `+0x58` and active at `+0xa8`.
+   **Every entry's mass is 500,000** (`0x4badb8`, stored as an integer);
+   the velocity at `+0x84` isn't set there (0).
    The table is filled on location change by `0x4ba420` and covers asteroids,
    debris and the like. Entry 969 is skipped; it is a special model-`0x1ad`
    object set up by `0x9c99ef`. Tests are `0x4083f0` / `0x40a3f0`. Response:
@@ -524,6 +544,11 @@ position to complete transaction". The transaction packet `0x79` goes out.
 After 14 s it pushes you out at 10 u/s² along the pad axis.
 
 ## 7. Sector fields
+
+Nothing in the static data sets these per location: the location initialiser
+only zeroes loc 0's (`0x4a8d28`), and no indexed writer was found. They must
+arrive at runtime [inferred: from a server message; not identified]. So the
+extracts can't say which sectors have currents.
 
 The location struct `0xfd9220 + loc*100` gains three physics fields:
 - `+0x4c` byte: the sector has a field.

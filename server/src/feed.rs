@@ -111,8 +111,9 @@ mod tests {
             fwd: [0.0, 0.0, 1.0],
             up: [0.0, 1.0, 0.0],
             thrust: 736000.0,
-            armour: 1.0,
-            armour_max: 62500.0,
+            shields: 62.5e6,
+            shields_max: 62.5e6,
+            hull: 187.5e6,
             rank: 0,
         }
     }

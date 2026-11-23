@@ -14,8 +14,11 @@
 //!   `+0x814`) and up to four launch tubes (inner end `+0x834 + 0x20k`, outer
 //!   end `+0x8b4 + 0x20k`), in model space.
 //! - `engines.csv`: engine thrust by index.
+//! - `guns.csv`, `missiles.csv`, `shields.csv`: per-index weapon damage, gun
+//!   magazine size, and shield regen/capacity (index = position in the
+//!   category, the byte fittings and the 0x1D weapon field use).
 
-use crate::ship::{Hull, Vec3};
+use crate::ship::{Hull, Shield, Vec3};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -43,6 +46,100 @@ pub struct World {
     pub station_points: HashMap<u16, StationPoints>,
     /// Engine index → thrust per engine.
     pub engine_thrust: Vec<f32>,
+    /// Gun index → stats.
+    pub guns: Vec<Gun>,
+    /// Missile index → damage per direct hit.
+    pub missile_damage: Vec<f32>,
+    /// Missile index → flight and guidance stats (missiles.csv).
+    pub missile_types: Vec<crate::missile::MissileType>,
+    /// Shield index → stats.
+    pub shields: Vec<Shield>,
+    /// Location id → everything placed in the sector that can be collided
+    /// with: contact slots 1–6 (gates, beacon, station) and world objects
+    /// (asteroids, debris).
+    pub objects: HashMap<u16, Vec<Placed>>,
+    /// Bot ship type (220–259) → the client's AI-table row (ai_types.csv).
+    pub bot_types: HashMap<u16, BotType>,
+}
+
+/// One row of the client's per-type bot table (`0xbe7f7c + type·0x40`,
+/// ai.md "Per-type AI table").
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct BotType {
+    pub type_id: u16,
+    /// Thrust at full throttle.
+    pub thrust: f32,
+    pub mass: f32,
+    pub hull: f32,
+    pub shield_max: f32,
+    /// Shield points per second.
+    pub shield_regen: f32,
+    /// The "bxr" hand-off range (`+0x14`).
+    pub handoff_range: f32,
+    /// Gun indices of the fitted weapon slots (empty slots left out; some
+    /// slots the extractor couldn't resolve are missing too).
+    pub weapons: Vec<u8>,
+    /// 1–4: ≥ 3 dodges and flanks; even = full lead, odd = half lead.
+    pub skill: u8,
+}
+
+impl BotType {
+    /// Faction defenders (220–225), which go home and dock when their target
+    /// is gone instead of despawning.
+    pub fn is_defender(&self) -> bool {
+        (220..=225).contains(&self.type_id)
+    }
+    /// Conflux (230–257), which hang around a target inside weapon range.
+    pub fn is_conflux(&self) -> bool {
+        (230..=257).contains(&self.type_id)
+    }
+    /// Turrets (258–259) never move.
+    pub fn is_turret(&self) -> bool {
+        self.thrust == 0.0
+    }
+}
+
+/// One placed object (sector_objects_all.csv).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Placed {
+    /// Contact slot 1–6 (`nav` 1), or None for a world-object table entry.
+    pub contact_slot: Option<u8>,
+    pub model: u16,
+    pub pos: Vec3,
+    pub fwd: Vec3,
+    pub up: Vec3,
+}
+
+/// Masses the client gives placed objects (`0x4ba420`): gate model 11 weighs
+/// 50,000; beacons, asteroids (15–29) and huge rocks (305–319) 500,000, and
+/// so does every world-object table entry. Other contact models get none (0).
+pub fn placed_mass(p: &Placed) -> f32 {
+    match (p.contact_slot, p.model) {
+        (None, _) => 500_000.0,
+        (Some(_), 11) => 50_000.0,
+        (Some(_), 2 | 15..=29 | 305..=319) => 500_000.0,
+        _ => 0.0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Gun {
+    /// Shield/hull points per hit (weapon +0x50).
+    pub damage: f32,
+    /// Magazine size; 0 = energy weapon.
+    pub ammo: i32,
+    /// Projectile lifetime in seconds (`+0x58`), projectile speed (`+0x5c`)
+    /// and refire interval (`+0x60`).
+    pub lifetime: f32,
+    pub speed: f32,
+    pub refire: f32,
+}
+
+impl Gun {
+    /// How far a shot carries: speed × lifetime.
+    pub fn range(&self) -> f32 {
+        self.speed * self.lifetime
+    }
 }
 
 /// A station placed in a sector.
@@ -122,6 +219,7 @@ impl World {
         let objs = std::fs::read_to_string(dir.join("sector_objects_all.csv"))?;
         w.load_gates(&objs);
         w.load_stations(&objs);
+        w.load_placed(&objs);
         let ships = std::fs::read_to_string(dir.join("ship_types.csv"))?;
         w.load_hulls(&ships);
         // Optional for older extract sets.
@@ -142,7 +240,79 @@ impl World {
                 }
             }
         }
+        if let Ok(t) = std::fs::read_to_string(dir.join("guns.csv")) {
+            w.guns = indexed(&t, "gun", |r| {
+                let f = |k: &str| r.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                Gun {
+                    damage: f("damage"),
+                    ammo: r.get("ammo").and_then(|v| v.parse().ok()).unwrap_or(0),
+                    lifetime: f("lifetime_s"),
+                    speed: f("speed"),
+                    refire: f("refire_s"),
+                }
+            });
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("ai_types.csv")) {
+            let mut csv = Csv::new(&t);
+            while let Some(r) = csv.next_row() {
+                let f = |k: &str| r.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                let Some(type_id) = r.get("type").and_then(|v| v.parse().ok()) else { continue };
+                let weapons = r.get("weapons").unwrap_or("").split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                let skill = r.get("skill").and_then(|v| v.parse().ok()).unwrap_or(1);
+                w.bot_types.insert(
+                    type_id,
+                    BotType {
+                        type_id,
+                        thrust: f("thrust"),
+                        mass: f("mass"),
+                        hull: f("hull"),
+                        shield_max: f("shield_max"),
+                        shield_regen: f("shield_regen"),
+                        handoff_range: f("handoff_range"),
+                        weapons,
+                        skill,
+                    },
+                );
+            }
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("missiles.csv")) {
+            w.missile_damage = indexed(&t, "idx", |r| r.get("damage").and_then(|v| v.parse().ok()).unwrap_or(0.0));
+            w.missile_types = indexed(&t, "idx", |r| {
+                let f = |k: &str| r.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                crate::missile::MissileType {
+                    pitch: f("pitch_rate"),
+                    yaw: f("yaw_rate"),
+                    thrust: f("thrust"),
+                    drag: f("drag"),
+                    mass: f("mass"),
+                    damage: f("damage"),
+                    lifetime: f("lifetime_s"),
+                    guidance: r.get("guidance").and_then(|v| v.parse().ok()).unwrap_or(0),
+                }
+            });
+        }
+        if let Ok(t) = std::fs::read_to_string(dir.join("shields.csv")) {
+            // Item ids 106–130; the category index is the row order.
+            let mut csv = Csv::new(&t);
+            while let Some(r) = csv.next_row() {
+                let f = |k: &str| r.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                w.shields.push(Shield { regen: f("regen"), capacity: f("capacity") });
+            }
+        }
         Ok(w)
+    }
+
+    /// Damage of one direct hit by gun (kind 0) or missile (kind 1) `idx`.
+    pub fn weapon_damage(&self, kind: u8, idx: u8) -> Option<f32> {
+        match kind {
+            0 => self.guns.get(idx as usize).map(|g| g.damage),
+            1 => self.missile_damage.get(idx as usize).copied(),
+            _ => None,
+        }
+    }
+
+    pub fn shield(&self, idx: u8) -> Option<Shield> {
+        self.shields.get(idx as usize).copied()
     }
 
     fn load_gates(&mut self, text: &str) {
@@ -181,6 +351,42 @@ impl World {
                 self.stations.insert(loc, st);
             }
         }
+    }
+
+    fn load_placed(&mut self, text: &str) {
+        let mut csv = Csv::new(text);
+        while let Some(row) = csv.next_row() {
+            let f = |k: &str| row.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+            let (Some(loc), Some(model)) =
+                (row.get("loc_id").and_then(|v| v.parse::<u16>().ok()), row.get("type").and_then(|v| v.parse::<u16>().ok()))
+            else {
+                continue;
+            };
+            // 339: invisible placeholders with no mesh.
+            if model == 339 || row.get("model").is_none_or(|m| m.is_empty()) {
+                continue;
+            }
+            let contact_slot = if row.get("nav") == Some("1") {
+                match row.get("object_id").and_then(|v| v.parse::<u8>().ok()) {
+                    Some(s @ 1..=6) => Some(s),
+                    _ => continue, // parked ship models in contact slots 60+
+                }
+            } else {
+                None
+            };
+            self.objects.entry(loc).or_default().push(Placed {
+                contact_slot,
+                model,
+                pos: [f("x"), f("y"), f("z")],
+                fwd: [f("fwd_x"), f("fwd_y"), f("fwd_z")],
+                up: [f("up_x"), f("up_y"), f("up_z")],
+            });
+        }
+    }
+
+    /// Everything collidable in `loc`.
+    pub fn placed(&self, loc: u16) -> &[Placed] {
+        self.objects.get(&loc).map(Vec::as_slice).unwrap_or(&[])
     }
 
     fn load_station_points(&mut self, text: &str) {
@@ -230,6 +436,7 @@ impl World {
                     engines: row.get("engines").and_then(|v| v.parse().ok()).unwrap_or(1),
                     tube_offset: f("f142").unwrap_or(0.0),
                     size: f("size").unwrap_or(0.0),
+                    ext: [f("ext_right").unwrap_or(0.0), f("ext_up").unwrap_or(0.0), f("ext_fwd").unwrap_or(0.0)],
                 };
                 self.hulls.insert(id, hull);
             }
@@ -248,6 +455,21 @@ impl World {
     pub fn name(&self, loc: u16) -> &str {
         self.names.get(&loc).map(|s| s.as_str()).unwrap_or("?")
     }
+}
+
+/// Rows keyed by an integer index column, as a dense vector.
+fn indexed<T: Default + Clone>(text: &str, key: &str, f: impl Fn(&Row<'_>) -> T) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut csv = Csv::new(text);
+    while let Some(r) = csv.next_row() {
+        if let Some(i) = r.get(key).and_then(|v| v.parse::<usize>().ok()) {
+            if out.len() <= i {
+                out.resize(i + 1, T::default());
+            }
+            out[i] = f(&r);
+        }
+    }
+    out
 }
 
 /// Minimal CSV reader: header row, comma separated, double-quoted fields with
@@ -335,6 +557,37 @@ mod tests {
 
     /// Every captured launch (S→C 0x08 sub 6, tube @2) is followed by a
     /// report at rest at tube inner end + dir × launch depth (notes/launch.md).
+    #[test]
+    fn real_extract_placed_objects() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"));
+        let w = World::load(dir).unwrap();
+        let p = w.placed(107);
+        let station = p.iter().find(|o| o.contact_slot == Some(6)).unwrap();
+        assert_eq!((station.model, station.pos), (323, [-23.37, 0.0, 0.0]));
+        assert_eq!(p.iter().filter(|o| o.contact_slot.is_some_and(|s| s <= 4)).count(), 4);
+        assert!(p.iter().filter(|o| o.contact_slot.is_none()).count() > 100, "asteroids");
+        assert_eq!(placed_mass(station), 0.0);
+        assert_eq!(w.hull(90).unwrap().ext, [11.686, 3.007, 9.632]);
+    }
+
+    #[test]
+    fn real_extract_weapons_and_shields() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"));
+        let w = World::load(dir).unwrap();
+        assert_eq!(w.weapon_damage(0, 0), Some(251000.0)); // Liar
+        assert_eq!(w.weapon_damage(1, 0), Some(6.0e6)); // Spear
+        assert_eq!(w.weapon_damage(2, 0), None);
+        assert_eq!(w.shield(0), Some(Shield { regen: 73500.0, capacity: 7.0e6 })); // Flatiron
+        assert_eq!(w.shields.len(), 25);
+        assert_eq!(w.guns[0].range(), 1000.0);
+        assert_eq!(w.missile_types[2].guidance, 2); // Rapier
+        assert_eq!(w.missile_types[2].top_speed().round(), 701.0);
+        let jelly = &w.bot_types[&230];
+        assert_eq!((jelly.thrust, jelly.mass, jelly.handoff_range, jelly.skill), (594000.0, 15000.0, 50000.0, 1));
+        assert_eq!(w.bot_types[&236].weapons, vec![57, 57]);
+        assert!(w.bot_types[&220].is_defender() && w.bot_types[&259].is_turret());
+    }
+
     #[test]
     fn real_extract_station_points() {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../notes/extracts"));

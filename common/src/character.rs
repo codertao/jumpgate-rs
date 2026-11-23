@@ -120,15 +120,20 @@ pub struct Character {
 
 impl Character {
     /// The item list as exactly [`ITEM_SLOTS`] slots.
+    /// Always gapless (see [`take_item`](Self::take_item)), so a list saved
+    /// with holes by an older server is shown closed up.
     pub fn item_slots(&self) -> [Item; ITEM_SLOTS] {
         let mut s = [Item::NONE; ITEM_SLOTS];
-        for (d, i) in s.iter_mut().zip(&self.items) {
+        for (d, i) in s.iter_mut().zip(self.items.iter().filter(|i| !i.is_empty())) {
             *d = *i;
         }
         s
     }
 
+    /// Exactly [`ITEM_SLOTS`] slots, items first with no gaps, so slot
+    /// numbers agree with what [`item_slots`](Self::item_slots) sent.
     fn ensure_slots(&mut self) {
+        self.items.retain(|i| !i.is_empty());
         self.items.resize(ITEM_SLOTS, Item::NONE);
     }
 
@@ -166,7 +171,11 @@ impl Character {
         }
     }
 
-    /// Take up to `qty` from a slot; returns the item and amount taken.
+    /// Take up to `qty` from a slot; returns the item and amount taken. A slot
+    /// that empties is removed and the later items move up one, as the classic
+    /// server's list does and the client assumes: in jgcap2 the player sold
+    /// slot 1 out, then sold "slot 1" again with the next item's exact
+    /// quantity, and each 0x06 that followed showed the list closed up.
     pub fn take_item(&mut self, slot: usize, qty: f32) -> Option<(Item, f32)> {
         self.ensure_slots();
         let i = self.items.get_mut(slot)?;
@@ -177,7 +186,8 @@ impl Character {
         let item = *i;
         i.qty -= took;
         if i.qty <= 1e-4 {
-            *i = Item::NONE;
+            self.items.remove(slot);
+            self.items.push(Item::NONE);
         }
         Some((item, took))
     }
@@ -238,25 +248,30 @@ mod tests {
         assert_eq!(c.take_item(0, 1.0), None);
     }
 
-    /// The capture's ship change: 4 guns unfitted into one stacked slot, then
-    /// one fitted back.
+    /// The capture's ship change (jgcap2 #1361..1399, trimmed): the client
+    /// unfits into consecutive list slots (the guns stack in one), fits a gun
+    /// back from the stack, then fits the engine from slot 0, after which the
+    /// rest of the list moves up.
     #[test]
     fn fit_and_unfit() {
         let mut c = pilot();
         c.fittings.guns[..4].copy_from_slice(&[7; 4]);
         c.fittings.engine = 2;
-        for s in 0..4 {
-            assert!(c.unfit(5, CAT_GUN, s));
-        }
         assert!(c.unfit(0, CAT_ENGINE, 0));
-        assert_eq!(c.items[5], Item { cat: 0, idx: 7, qty: 4.0 });
+        for s in 0..4 {
+            assert!(c.unfit(1, CAT_GUN, s));
+        }
         assert_eq!(c.items[0], Item { cat: 5, idx: 2, qty: 1.0 });
+        assert_eq!(c.items[1], Item { cat: 0, idx: 7, qty: 4.0 });
         assert_eq!(c.fittings, Fittings::default());
-        assert!(c.fit(5, CAT_GUN, 1));
+        assert!(c.fit(1, CAT_GUN, 1));
         assert_eq!(c.fittings.guns[1], 7);
-        assert_eq!(c.items[5].qty, 3.0);
-        assert!(!c.fit(5, CAT_ENGINE, 0), "category must match");
-        assert!(!c.unfit(1, CAT_GUN, 0), "empty slot");
+        assert_eq!(c.items[1].qty, 3.0);
+        assert!(!c.fit(1, CAT_ENGINE, 0), "category must match");
+        assert!(!c.unfit(2, CAT_GUN, 0), "empty slot");
+        assert!(c.fit(0, CAT_ENGINE, 0));
+        assert_eq!(c.fittings.engine, 2);
+        assert_eq!(c.items[0], Item { cat: 0, idx: 7, qty: 3.0 }, "the guns moved up to slot 0");
     }
 
     #[test]
@@ -268,5 +283,38 @@ mod tests {
         f.capacitor = 8;
         let b = f.to_bytes();
         assert_eq!((b[0], b[16], b[24], b[29], b[27]), (7, 4, 7, 8, EMPTY));
+    }
+    fn listed(c: &Character) -> Vec<(u8, f32)> {
+        c.item_slots().iter().take_while(|i| !i.is_empty()).map(|i| (i.idx, i.qty)).collect()
+    }
+
+    /// The jgcap2 sell sequence: selling a slot out closes the list up.
+    #[test]
+    fn selling_a_slot_out_moves_the_rest_up() {
+        let mut c = pilot();
+        for (idx, q) in [(7, 4.0), (175, 41.0), (176, 0.5), (179, 1.0)] {
+            c.add_item(3, idx, q);
+        }
+        assert_eq!(c.take_item(1, 41.0).map(|(i, t)| (i.idx, t)), Some((175, 41.0)));
+        assert_eq!(listed(&c), vec![(7, 4.0), (176, 0.5), (179, 1.0)]);
+        // Slot 1 is now the next item.
+        assert_eq!(c.take_item(1, 0.5).map(|(i, _)| i.idx), Some(176));
+        assert_eq!(listed(&c), vec![(7, 4.0), (179, 1.0)]);
+        // A partial sale keeps the slot.
+        c.take_item(0, 1.0);
+        assert_eq!(listed(&c), vec![(7, 3.0), (179, 1.0)]);
+        // A purchase goes after the last item.
+        c.add_item(3, 200, 2.0);
+        assert_eq!(listed(&c), vec![(7, 3.0), (179, 1.0), (200, 2.0)]);
+    }
+
+    /// A list saved with holes (older server) is shown and indexed closed up.
+    #[test]
+    fn holes_from_old_saves_are_closed() {
+        let mut c = pilot();
+        c.items = vec![Item::NONE, Item { cat: 3, idx: 9, qty: 1.0 }, Item::NONE, Item { cat: 3, idx: 8, qty: 2.0 }];
+        assert_eq!(listed(&c), vec![(9, 1.0), (8, 2.0)]);
+        assert_eq!(c.take_item(1, 2.0).map(|(i, _)| i.idx), Some(8));
+        assert_eq!(listed(&c), vec![(9, 1.0)]);
     }
 }

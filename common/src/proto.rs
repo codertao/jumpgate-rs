@@ -259,6 +259,185 @@ pub fn parse_botloc(m: &[u8]) -> Option<Botloc> {
     })
 }
 
+/// Everything a botloc carries, as the controller's sender `0x9c9d10` fills
+/// it and the handler `0x9d6f25` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BotState {
+    /// pbotloc `+1`: AI state (0 attack, 1 home, 2 approach dock, 3 dock, 8 jink).
+    pub state: u8,
+    /// Shields and hull as fractions of their maxima (sent as whole percent).
+    pub shields: f32,
+    pub hull: f32,
+    pub id: u16,
+    pub loc: u16,
+    pub ship_type: u16,
+    pub vel: Vec3,
+    pub fwd: Vec3,
+    pub up: Vec3,
+    pub controller: u32,
+    pub target: u32,
+    pub pos: Vec3,
+}
+
+fn i16_at(m: &[u8], o: usize) -> i16 {
+    i16::from_le_bytes([m[o], m[o + 1]])
+}
+fn put_i16(m: &mut [u8], o: usize, v: f32) {
+    m[o..o + 2].copy_from_slice(&(v.round().clamp(-32768.0, 32767.0) as i16).to_le_bytes());
+}
+
+/// Full botloc: `@1` state, `@2` shields %, `@3` hull %, `@4/@5` pbotloc
+/// `+2/+3` and `@6` u16 `+6` (target slot; receivers recompute it, sent 0),
+/// `@8` id, `@0xa` loc, `@0xc` type, `@0xe` velocity i16 × 10, `@0x14` fwd
+/// i16 × 10⁴, `@0x1a` up i16 × 10⁴, `@0x20` controller, `@0x24` target,
+/// `@0x28` position f32×3.
+pub fn botloc(b: &BotState) -> Vec<u8> {
+    let mut m = vec![0u8; BOTLOC_LEN];
+    m[0] = 0x71;
+    m[1] = b.state;
+    m[2] = (b.shields * 100.0).round().clamp(0.0, 100.0) as u8;
+    m[3] = (b.hull * 100.0).round().clamp(0.0, 100.0) as u8;
+    put_u16(&mut m, 8, b.id);
+    put_u16(&mut m, 0xa, b.loc);
+    put_u16(&mut m, 0xc, b.ship_type);
+    for k in 0..3 {
+        put_i16(&mut m, 0xe + 2 * k, b.vel[k] * 10.0);
+        put_i16(&mut m, 0x14 + 2 * k, b.fwd[k] * 10_000.0);
+        put_i16(&mut m, 0x1a + 2 * k, b.up[k] * 10_000.0);
+        put_f32(&mut m, 0x28 + 4 * k, b.pos[k]);
+    }
+    put_u32(&mut m, 0x20, b.controller);
+    put_u32(&mut m, 0x24, b.target);
+    m
+}
+
+pub fn parse_bot_state(m: &[u8]) -> Option<BotState> {
+    (m.len() == BOTLOC_LEN && m[0] == 0x71).then(|| {
+        let v = |o: usize, k: f32| [i16_at(m, o) as f32 * k, i16_at(m, o + 2) as f32 * k, i16_at(m, o + 4) as f32 * k];
+        BotState {
+            state: m[1],
+            shields: m[2] as f32 * 0.01,
+            hull: m[3] as f32 * 0.01,
+            id: u16_at(m, 8),
+            loc: u16_at(m, 0xa),
+            ship_type: u16_at(m, 0xc),
+            vel: v(0xe, 0.1),
+            fwd: v(0x14, 1e-4),
+            up: v(0x1a, 1e-4),
+            controller: u32_at(m, 0x20),
+            target: u32_at(m, 0x24),
+            pos: [f32_at(m, 0x28), f32_at(m, 0x2c), f32_at(m, 0x30)],
+        }
+    })
+}
+
+/// A botloc handing the bot to `pid`: the receiving handler makes the bot's
+/// **target** its controller (`0x9d7191`: target == me → I fly it and answer
+/// with a botloc at once; otherwise the bot follows the target's ship, or is
+/// removed if that player isn't in the sector). So both fields name `pid`.
+pub fn botloc_handed_to(last: &[u8], pid: u32) -> Option<Vec<u8>> {
+    let mut m = last.to_vec();
+    (m.len() == BOTLOC_LEN && m[0] == 0x71).then(|| {
+        put_u32(&mut m, 0x20, pid);
+        put_u32(&mut m, 0x24, pid);
+        m
+    })
+}
+
+/// 0x32 missile (40 B, same layout both ways; C→S on space from the
+/// launcher, S→C handler `0x9d4686`): `[32][u8 id @1][u8 type @2][? @3]
+/// [u16 target bot id @4, 0xfe = not a bot][u16 @6 ?][i16×3 velocity ×10 @8]
+/// [i16×3 fwd ×10⁴ @0xe][u32 target pid @0x14][u32 owner pid @0x18]
+/// [f32×3 pos @0x1c]`. Type 0xfa removes the missile (the position is where
+/// it ended). A receiver whose pid is the target (and @4 = 0xfe) hears the
+/// lock warning; a target pid ≥ 0x8000 names a slot or object instead.
+/// [static + capture jgcap2, 2026-11-20]
+pub const MISSILE_LEN: usize = 40;
+pub const MISSILE_GONE: u8 = 0xfa;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MissileMsg {
+    pub id: u8,
+    pub ty: u8,
+    pub target_bot: u16,
+    pub vel: Vec3,
+    pub fwd: Vec3,
+    pub target: u32,
+    pub owner: u32,
+    pub pos: Vec3,
+}
+
+pub fn parse_missile(m: &[u8]) -> Option<MissileMsg> {
+    (m.len() == MISSILE_LEN && m[0] == 0x32).then(|| {
+        let v = |o: usize, k: f32| [i16_at(m, o) as f32 * k, i16_at(m, o + 2) as f32 * k, i16_at(m, o + 4) as f32 * k];
+        MissileMsg {
+            id: m[1],
+            ty: m[2],
+            target_bot: u16_at(m, 4),
+            vel: v(8, 0.1),
+            fwd: v(0xe, 1e-4),
+            target: u32_at(m, 0x14),
+            owner: u32_at(m, 0x18),
+            pos: [f32_at(m, 0x1c), f32_at(m, 0x20), f32_at(m, 0x24)],
+        }
+    })
+}
+
+pub fn missile(mm: &MissileMsg) -> Vec<u8> {
+    let mut m = vec![0u8; MISSILE_LEN];
+    m[0] = 0x32;
+    m[1] = mm.id;
+    m[2] = mm.ty;
+    put_u16(&mut m, 4, mm.target_bot);
+    for k in 0..3 {
+        put_i16(&mut m, 8 + 2 * k, mm.vel[k] * 10.0);
+        put_i16(&mut m, 0xe + 2 * k, mm.fwd[k] * 10_000.0);
+        put_f32(&mut m, 0x1c + 4 * k, mm.pos[k]);
+    }
+    put_u32(&mut m, 0x14, mm.target);
+    put_u32(&mut m, 0x18, mm.owner);
+    m
+}
+
+/// C→S 0x2C "bxr" hand-off request (12 B, space link; online_bot_ai
+/// `0x436651`): `[2C][?][u16 bot id @2][u16 0 @4][u16 loc @6][u32 me @8]`.
+/// @1 is never written (stack garbage).
+pub const BXR_LEN: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bxr {
+    pub bot: u16,
+    pub loc: u16,
+    pub pid: u32,
+}
+
+pub fn bxr(bot: u16, loc: u16, me: u32) -> Vec<u8> {
+    let mut m = vec![0u8; BXR_LEN];
+    m[0] = 0x2c;
+    put_u16(&mut m, 2, bot);
+    put_u16(&mut m, 6, loc);
+    put_u32(&mut m, 8, me);
+    m
+}
+
+pub fn parse_bxr(m: &[u8]) -> Option<Bxr> {
+    (m.len() == BXR_LEN && m[0] == 0x2c).then(|| Bxr { bot: u16_at(m, 2), loc: u16_at(m, 6), pid: u32_at(m, 8) })
+}
+
+/// C→S 0x16 (6 B, state link) has two senders with one layout,
+/// `[16][u8][u16 id][u16 ?]`:
+/// - the spawn queue bouncing a 0x70 (`0x9cb930`): `[16][ai_type][spawn#]`;
+/// - `remove_bot` (`0x9cb9c0`), when the bot's controller drops it (despawn,
+///   docked, target gone): `[16][slot +1 "dead" byte][bot id]`.
+/// Either way the bot with that id is gone from the sender's client.
+pub const BOT_GONE_LEN: usize = 6;
+
+pub fn bot_gone(first: u8, id: u16) -> Vec<u8> {
+    let mut m = vec![0x16, first, 0, 0, 0, 0];
+    put_u16(&mut m, 2, id);
+    m
+}
+
 /// 0x61 beacon update (4 B): `[61][state][u16 loc]`. Handler `0x9d67d5` accepts
 /// only loc 201..=999 (open-space sectors) and only if contact slot 5 holds the
 /// beacon (model 2). Otherwise it prints "Received invalid beacon packet".
@@ -315,7 +494,7 @@ fn put_vel(b: &mut [u8], o: usize, v: Vec3) {
         b[o + 2 * k..o + 2 * k + 2].copy_from_slice(&q.to_le_bytes());
     }
 }
-fn put_f32(b: &mut [u8], o: usize, v: f32) {
+pub fn put_f32(b: &mut [u8], o: usize, v: f32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
 fn put_vec(b: &mut [u8], o: usize, v: Vec3) {
@@ -333,19 +512,18 @@ fn glow(ship: &ShipView) -> u8 {
     }
 }
 
-/// Shield/armour floats @0x9c/0xa0/0xa4 (also 0x33 @0x2c → same slot field as
-/// @0x9c). A real Thunder (armour 24000) sent 24e6, 24e6, 72e6 [inferred:
-/// current, max, ×3 something]. We scale the same way from the hull.
-fn hull_points(armour: f32) -> (f32, f32, f32) {
-    let max = armour * 1000.0;
-    (max, max, max * 3.0)
-}
-
 /// 0x05 @0x17: the ship tows a cargo pod (`cargo.x`, model 119), drawn and
 /// collided behind it. The client's sender (`0x9cd6cd`) sets it exactly for
 /// the "Cargo Tow" hulls: Pioneer (32), Condor (62) and Thunder (92).
 pub const LOC_CARGO_POD_OFF: usize = 0x17;
 pub const LOC_RANK_OFF: usize = 0x14;
+/// 0x05 shields now, shields full, hull (= ship-type armour × 3000 when
+/// undamaged), fuel (0–100). 0x33 carries current shields too.
+pub const LOC_SHIELDS_OFF: usize = 0x9c;
+pub const LOC_SHIELDS_MAX_OFF: usize = 0xa0;
+pub const LOC_HULL_OFF: usize = 0xa4;
+pub const LOC_FUEL_OFF: usize = 0xac;
+pub const SMALL_LOC_SHIELDS_OFF: usize = 0x2c;
 
 pub fn tows_cargo_pod(ship_type: u16) -> bool {
     matches!(ship_type, 32 | 62 | 92)
@@ -381,10 +559,10 @@ pub fn ship_report(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
     put_f32(&mut m, 0x64, clock);
     put_u32(&mut m, 0x68, ship.mass.round() as u32); // slot mass +0x15c0 (int)
     put_vec(&mut m, 0x90, ship.pos);
-    let (cur, max, x3) = hull_points(ship.armour_max);
-    put_f32(&mut m, 0x9c, cur * ship.armour);
-    put_f32(&mut m, 0xa0, max);
-    put_f32(&mut m, 0xa4, x3);
+    // Shields now/full and hull: the receiving slot's +0x15f8/+0x15fc/+0x1600.
+    put_f32(&mut m, LOC_SHIELDS_OFF, ship.shields);
+    put_f32(&mut m, LOC_SHIELDS_MAX_OFF, ship.shields_max);
+    put_f32(&mut m, LOC_HULL_OFF, ship.hull);
     put_f32(&mut m, 0xa8, ship.thrust); // effective thrust, slot +0x1608
     put_f32(&mut m, 0xac, 100.0);
     m
@@ -401,7 +579,7 @@ pub fn ship_small_loc(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
     put_u32(&mut m, 0x18, pid);
     put_vec(&mut m, 0x1c, ship.pos);
     put_f32(&mut m, 0x28, ship.thrust);
-    put_f32(&mut m, 0x2c, hull_points(ship.armour_max).0 * ship.armour);
+    put_f32(&mut m, SMALL_LOC_SHIELDS_OFF, ship.shields);
     put_f32(&mut m, 0x34, clock);
     m
 }
@@ -413,6 +591,162 @@ pub fn ship_gone(ship: &ShipView, pid: u32, clock: f32) -> Vec<u8> {
     m
 }
 
+// ---- combat ----
+
+/// C→S 0x1D hit report (32 B, space link): one entry of the shooter's hit
+/// queue, flushed by `0x43a3d0` each location tick (message-types "0x1D").
+pub const HIT_LEN: usize = 32;
+/// `kind` byte: what `weapon` indexes.
+pub const HIT_KIND_GUN: u8 = 0;
+pub const HIT_KIND_MISSILE: u8 = 1;
+/// `class` byte.
+pub const HIT_CLASS_SHIP: u8 = 0;
+pub const HIT_CLASS_OBJECT: u8 = 1;
+pub const HIT_CLASS_BEAM: u8 = 2;
+pub const HIT_CLASS_SPECIAL: u8 = 3;
+/// Bot id meaning "not a bot" (also S→C 0x03 @2 "damage is for me").
+pub const NOT_A_BOT: u16 = 0xfe;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hit {
+    pub shooter: u32,
+    pub loc: u16,
+    /// Victim's player id (ship slot +0x15b4); 0x7fff for an object hit.
+    pub victim: u32,
+    /// The victim's bot id, or [`NOT_A_BOT`].
+    pub bot: u16,
+    pub count: u16,
+    pub kind: u8,
+    /// Gun id (kind 0) or missile type (kind 1); 0xfe = unknown missile.
+    pub weapon: u8,
+    /// Damage the shooter already computed (splash, beams); 0 for direct
+    /// gun and missile hits, which the server prices from the tables.
+    pub value: f32,
+    pub class: u8,
+}
+
+pub fn parse_hit(m: &[u8]) -> Option<Hit> {
+    (m.len() >= 0x1d && m[0] == 0x1d).then(|| Hit {
+        shooter: u32_at(m, 4),
+        loc: u16_at(m, 8),
+        victim: u32_at(m, 0xc),
+        bot: u16_at(m, 0x10),
+        count: u16_at(m, 0x12),
+        kind: m[0x14],
+        weapon: m[0x15],
+        value: f32_at(m, 0x18),
+        class: m[0x1c],
+    })
+}
+
+/// Build a 0x1D as the client's flush does (for agents and tests).
+pub fn hit(h: &Hit) -> Vec<u8> {
+    let mut m = vec![0u8; HIT_LEN];
+    m[0] = 0x1d;
+    put_u32(&mut m, 4, h.shooter);
+    put_u16(&mut m, 8, h.loc);
+    put_u32(&mut m, 0xc, h.victim);
+    put_u16(&mut m, 0x10, h.bot);
+    put_u16(&mut m, 0x12, h.count);
+    m[0x14] = h.kind;
+    m[0x15] = h.weapon;
+    put_f32(&mut m, 0x18, h.value);
+    m[0x1c] = h.class;
+    m
+}
+
+/// S→C 0x03 damage (12 B, handler `0x9d1463`): `[03][0][u16 bot id][u32
+/// attacker][f32 damage]`. Bot id [`NOT_A_BOT`] = the receiver's own ship;
+/// otherwise a bot the receiver controls, which also turns on the attacker.
+pub const DAMAGE_LEN: usize = 12;
+
+pub fn damage(bot: u16, attacker: u32, amount: f32) -> Vec<u8> {
+    let mut m = vec![0u8; DAMAGE_LEN];
+    m[0] = 0x03;
+    put_u16(&mut m, 2, bot);
+    put_u32(&mut m, 4, attacker);
+    put_f32(&mut m, 8, amount);
+    m
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Damage {
+    pub bot: u16,
+    pub attacker: u32,
+    pub amount: f32,
+}
+
+pub fn parse_damage(m: &[u8]) -> Option<Damage> {
+    (m.len() >= DAMAGE_LEN && m[0] == 0x03).then(|| Damage {
+        bot: u16_at(m, 2),
+        attacker: u32_at(m, 4),
+        amount: f32_at(m, 8),
+    })
+}
+
+/// C→S 0x44 "who killed me" (16 B, state link, sender `0x9cab20`):
+/// `[44][0][u16 bot id][u32 reporter][i32 killer][i32 extra]`. Own death: bot
+/// id 0xfe, killer = attacker of the last 0x03, extra −2. A bot's death: its
+/// bot id, extra 0. The killer is sign-extended from 16 bits by the client.
+pub const KILL_LEN: usize = 16;
+
+pub fn kill_report(bot: u16, reporter: u32, killer: u32, extra: i32) -> Vec<u8> {
+    let mut m = vec![0u8; KILL_LEN];
+    m[0] = 0x44;
+    put_u16(&mut m, 2, bot);
+    put_u32(&mut m, 4, reporter);
+    put_u32(&mut m, 8, killer as u16 as i16 as i32 as u32);
+    put_u32(&mut m, 0xc, extra as u32);
+    m
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Kill {
+    pub bot: u16,
+    pub reporter: u32,
+    pub killer: u32,
+}
+
+pub fn parse_kill(m: &[u8]) -> Option<Kill> {
+    (m.len() >= 12 && m[0] == 0x44).then(|| Kill { bot: u16_at(m, 2), reporter: u32_at(m, 4), killer: u32_at(m, 8) })
+}
+
+/// C→S 0x0C "impact" (20 B, state link, `0x40ea4c`): sent when a collision
+/// kills the ship, just before `player_death`. `[0C][FE][u16 @2][u32 pid @4]`
+/// then three dwords from the collision code's locals (not identified; sent
+/// as 0). @2 is `0xff2a92` [inferred: the location].
+pub const IMPACT_LEN: usize = 20;
+
+pub fn impact_death(loc: u16, pid: u32) -> Vec<u8> {
+    let mut m = vec![0u8; IMPACT_LEN];
+    m[0] = 0x0c;
+    m[1] = 0xfe;
+    put_u16(&mut m, 2, loc);
+    put_u32(&mut m, 4, pid);
+    m
+}
+
+/// The 0x07 a dying client sends (`player_death` `0x9cf168`): a dock whose
+/// target is 0xfe instead of a station.
+pub const DEATH_DOCK_ARG: u32 = 0xfe;
+
+/// S→C 0xB3 own-ship state (44 B, handler `0x9d94ea`): i32 ammo for gun slots
+/// 0–7 at 4, 8, 0x10, 0x14, 0x1c, 0x20, 0x24, 0x28; f32 hull @0xc; f32 fuel
+/// @0x18. The client takes all of it as authoritative.
+pub const OWN_STATE_LEN: usize = 44;
+pub const OWN_STATE_AMMO_OFFS: [usize; 8] = [4, 8, 0x10, 0x14, 0x1c, 0x20, 0x24, 0x28];
+
+pub fn own_state(ammo: [i32; 8], hull: f32, fuel: f32) -> Vec<u8> {
+    let mut m = vec![0u8; OWN_STATE_LEN];
+    m[0] = 0xb3;
+    for (o, a) in OWN_STATE_AMMO_OFFS.iter().zip(ammo) {
+        put_u32(&mut m, *o, a as u32);
+    }
+    put_f32(&mut m, 0xc, hull);
+    put_f32(&mut m, 0x18, fuel);
+    m
+}
+
 // ---- byte helpers ----
 
 pub fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -420,6 +754,9 @@ pub fn u16_at(b: &[u8], o: usize) -> u16 {
 }
 pub fn u32_at(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+pub fn f32_at(b: &[u8], o: usize) -> f32 {
+    f32::from_bits(u32_at(b, o))
 }
 pub fn put_u16(b: &mut [u8], o: usize, v: u16) {
     b[o..o + 2].copy_from_slice(&v.to_le_bytes());
@@ -481,8 +818,14 @@ pub struct CharSummary {
     pub fittings: [u8; Fittings::LEN],
 }
 
+/// The rejection code (0xc8..=0xd1, not 0xca) if this 0x06 refuses a login.
+pub fn parse_login_rejection(m: &[u8]) -> Option<u8> {
+    let code = *m.get(CHAR_SHIP_OFF)?;
+    (m[0] == 0x06 && (0xc8..=0xd1).contains(&code) && code != 0xca).then_some(code)
+}
+
 pub fn parse_char_record(m: &[u8]) -> Option<CharSummary> {
-    if m.len() < CHAR_LEN || m[0] != 0x06 {
+    if m.len() < CHAR_LEN || m[0] != 0x06 || parse_login_rejection(m).is_some() {
         return None;
     }
     let mut fittings = [0u8; Fittings::LEN];
@@ -700,6 +1043,52 @@ pub const CHAR_FIT_OFF: usize = 0x70;
 pub const CHAR_SHIPNAME_OFF: usize = 0x8f;
 pub const CHAR_ITEMS_OFF: usize = 0x9c;
 
+/// Why a login is refused. The client answers a 0x06 whose byte @0x42 (the
+/// ship type in a real record) is one of these codes with its "Connection
+/// Error!" panel, showing line N of its text table (`sampleslarge.txt`), and
+/// drops its logged-in state (handler `0x9d207f`, panel `0x403010`; notes
+/// message-types "0x06 login rejection"). 0xca is not a rejection code.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LoginRejection {
+    /// 0xc8, line 120: incorrect version of Jumpgate.
+    WrongVersion,
+    /// 0xc9, line 121: "This username is not valid".
+    InvalidUsername,
+    /// 0xcb, line 119: pilot already connected.
+    AlreadyConnected,
+    /// 0xcc (0xcf shows the same line), line 111: account expired.
+    Expired,
+    /// 0xcd, line 118: account not enabled.
+    NotEnabled,
+    /// 0xce, line 117: "Password or username incorrect".
+    BadPassword,
+    /// 0xd1, line 122: temporarily disabled, plus "Remaining time: %.2f
+    /// hours." from the f32 @0x60.
+    Suspended { hours: f32 },
+}
+
+pub const CHAR_REJECT_HOURS_OFF: usize = 0x60;
+
+/// A 0x06 that refuses the login. Only @0x42 (and @0x60 for a suspension) is
+/// read before the handler bails, so the rest is zero.
+pub fn login_rejection(why: LoginRejection) -> Vec<u8> {
+    let mut m = vec![0u8; CHAR_LEN];
+    m[0] = 0x06;
+    m[CHAR_SHIP_OFF] = match why {
+        LoginRejection::WrongVersion => 0xc8,
+        LoginRejection::InvalidUsername => 0xc9,
+        LoginRejection::AlreadyConnected => 0xcb,
+        LoginRejection::Expired => 0xcc,
+        LoginRejection::NotEnabled => 0xcd,
+        LoginRejection::BadPassword => 0xce,
+        LoginRejection::Suspended { hours } => {
+            put_f32(&mut m, CHAR_REJECT_HOURS_OFF, hours);
+            0xd1
+        }
+    };
+    m
+}
+
 /// Build the 0x06 for `c`. Bytes not modelled are taken from `template` (a
 /// captured record) when given, else from constants seen in the captures.
 pub fn char_record(template: Option<&[u8]>, c: &Character, pid: u32, loc: u16) -> Vec<u8> {
@@ -736,6 +1125,77 @@ pub fn char_record(template: Option<&[u8]>, c: &Character, pid: u32, loc: u16) -
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn botloc_round_trips_and_hands_over() {
+        let b = super::BotState {
+            state: 0,
+            shields: 0.5,
+            hull: 0.25,
+            id: 7,
+            loc: 118,
+            ship_type: 233,
+            vel: [10.0, -20.0, 0.5],
+            fwd: [0.0, 0.0, 1.0],
+            up: [0.0, 1.0, 0.0],
+            controller: 1000,
+            target: 1000,
+            pos: [1.0, 2.0, 3.0],
+        };
+        let m = super::botloc(&b);
+        assert_eq!(super::parse_bot_state(&m), Some(b));
+        let p = super::parse_botloc(&m).unwrap();
+        assert_eq!((p.id, p.loc, p.ship_type, p.controller), (7, 118, 233, 1000));
+        let h = super::parse_botloc(&super::botloc_handed_to(&m, 1001).unwrap()).unwrap();
+        assert_eq!((h.controller, h.target), (1001, 1001));
+        assert_eq!(super::parse_bxr(&super::bxr(7, 118, 1001)), Some(super::Bxr { bot: 7, loc: 118, pid: 1001 }));
+        assert_eq!(super::bot_gone(1, 7), vec![0x16, 1, 7, 0, 0, 0]);
+        // The captured C→S 0x32 (jgcap2): Purgatory (7) at conflux #1.
+        let cap: Vec<u8> = "32 01 07 00 01 00 01 01 43 fe 95 fb 8b 01 0c 0d 76 22 0a f3 f9 0e 00 00 f9 0e 00 00 44 42 69 c5 69 b1 c4 45 e5 7b 5d 45"
+            .split(' ')
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        let mm = super::parse_missile(&cap).unwrap();
+        assert_eq!((mm.id, mm.ty, mm.target_bot, mm.owner), (1, 7, 1, 3833));
+        assert!((mm.vel[0] + 44.5).abs() < 1e-3 && (crate::ship::length(mm.fwd) - 1.0).abs() < 1e-3);
+        assert_eq!(super::parse_missile(&super::missile(&mm)).unwrap().pos, mm.pos);
+    }
+
+    #[test]
+    fn combat_messages_round_trip() {
+        let h = Hit {
+            shooter: 3,
+            loc: 118,
+            victim: 4,
+            bot: NOT_A_BOT,
+            count: 2,
+            kind: HIT_KIND_MISSILE,
+            weapon: 5,
+            value: 0.0,
+            class: HIT_CLASS_SHIP,
+        };
+        let m = hit(&h);
+        assert_eq!(m.len(), HIT_LEN);
+        assert_eq!(parse_hit(&m), Some(h));
+        let d = damage(7, 3, 1.5e6);
+        assert_eq!(&d[..4], &[0x03, 0, 7, 0]);
+        assert_eq!(parse_damage(&d), Some(Damage { bot: 7, attacker: 3, amount: 1.5e6 }));
+        // 0x44: reporter @4, killer @8 sign-extended from 16 bits, extra @0xc.
+        let k = kill_report(NOT_A_BOT, 3, 0x1_0005, -2);
+        assert_eq!(k, vec![0x44, 0, 0xfe, 0, 3, 0, 0, 0, 5, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff]);
+        assert_eq!(parse_kill(&k), Some(Kill { bot: NOT_A_BOT, reporter: 3, killer: 5 }));
+        let b3 = own_state([1, 2, 3, 4, 5, 6, 7, 8], 12.0e6, 87.0);
+        assert_eq!((u32_at(&b3, 0x10), u32_at(&b3, 0x28), f32_at(&b3, 0xc), f32_at(&b3, 0x18)), (3, 8, 12.0e6, 87.0));
+    }
+
+    #[test]
+    fn reports_carry_real_shields_and_hull() {
+        let mut v = npc();
+        (v.shields, v.shields_max, v.hull) = (1.0e6, 7.0e6, 9.0e6);
+        let r = ship_report(&v, 1, 0.0);
+        assert_eq!((f32_at(&r, 0x9c), f32_at(&r, 0xa0), f32_at(&r, 0xa4)), (1.0e6, 7.0e6, 9.0e6));
+        assert_eq!(f32_at(&ship_small_loc(&v, 1, 0.0), 0x2c), 1.0e6);
+    }
+
     use super::*;
 
     fn login_bytes(cs: &str, pw: &str) -> Vec<u8> {
@@ -816,8 +1276,9 @@ mod tests {
             fwd: [-0.04, 0.0, 0.9992],
             up: [0.0, 1.0, 0.0],
             thrust: 736000.0,
-            armour: 1.0,
-            armour_max: 62500.0,
+            shields: 62.5e6,
+            shields_max: 62.5e6,
+            hull: 187.5e6,
             rank: 0,
         }
     }
@@ -964,6 +1425,17 @@ mod tests {
         assert_eq!(u32_at(&listing(7, 99, 99).unwrap(), 8), EQUIPMENT_MIN_PRICE);
         assert_eq!(u32_at(&listing(3, 99, 99).unwrap(), 8), 99);
         assert_eq!(u32_at(&listing(0, 99, 5000).unwrap(), 8), 5000);
+    }
+
+    #[test]
+    fn login_rejection_sets_the_code_at_the_ship_type() {
+        let m = login_rejection(LoginRejection::BadPassword);
+        assert_eq!((m.len(), m[0], m[CHAR_SHIP_OFF]), (CHAR_LEN, 0x06, 0xce));
+        let m = login_rejection(LoginRejection::Suspended { hours: 2.5 });
+        assert_eq!(m[CHAR_SHIP_OFF], 0xd1);
+        assert_eq!(parse_login_rejection(&m), Some(0xd1));
+        assert!(parse_char_record(&m).is_none());
+        assert_eq!(f32::from_le_bytes(m[CHAR_REJECT_HOURS_OFF..][..4].try_into().unwrap()), 2.5);
     }
 }
 

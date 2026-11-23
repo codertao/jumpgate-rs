@@ -65,12 +65,14 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
 - [ ] **Don't trust cargo reports.** C→S 0x0F cargo and 0x74 mining amounts are
       client-controlled. Cap them by mining time × laser rate × asteroid
       remaining before crediting anything.
-- [ ] **0xB3 own-ship state is a replayed template: build it.** Today every
-      0x17 gets the captured 0xB3, which resets fuel to 100 every ~13 s and
-      zeroes ammo in every gun slot. Send fuel 100 and full magazines on the
-      first 0x17 after a launch (hull = ship-type armour × 3000 repairs it),
-      then echo the client's 0x05 fuel (@0xac) and hull (@0xa4). See message-types
-      "Consumables and servicing".
+- [x] 0xB3 own-ship state built (2026-11-20): service after launch, then echo
+      the client's hull and fuel.
+- [ ] Ammo tracking: 0xB3 sends full magazines every time (the client doesn't
+      report ammo), so ammo weapons never run dry.
+- [ ] Death: no ship loss, insurance or cargo drop yet; the pilot just wakes up
+      at their last base in the same ship. Classic rules unknown (ask).
+- [ ] Don't trust 0x1D: cap hit counts by the gun's refire rate and check
+      range (shooter's and victim's last reports) before pricing damage.
 - [ ] C→S 0x0E consumables used (decoded): log it and charge from the server's
       own view if prices are wanted. S→C 0xA9 `[a9][0][r][a][h]` refuel/rearm/
       repair is there for station services.
@@ -103,13 +105,20 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
       agents cover it.
 - [ ] Interest management in `feed.rs`: the 190 remote-slot budget (10–199) is
       shared by players, bots and missiles.
-- [ ] `!ai` (dev spawn via 0x70) and the 0x71 botloc relay are in but untested
-      live. Check with two clients that the second sees the bot move (the
-      existing-bot branch of `0x9d6f25` may not take position). Then: credit
-      0x44 kills, and hand off (0x2C → S→C 0x71 with a new controller) when the
-      owner leaves the sector.
-- [ ] Conflux: spawn with S→C 0x70 on sector entry, take C→S 0x44 deaths, then
-      handle 0x71 botloc / 0x2C handoff (currently ignored).
+- [x] Stock bots (2026-11-20): registry (`bots.rs`), 0x2C hand-off → S→C
+      0x71 naming the requester, re-homing when the controller leaves, 0x16
+      removal, `--bots` population rules. Smoke-run with two agents; not yet
+      tried with the real client.
+- [ ] Live check with the real client: the bot appears and moves on a second
+      client (the existing-bot branch of `0x9d6f25` may not take position),
+      and flying closer than an agent takes the bot over (and back).
+- [x] Relay C→S 0x32 missiles to the sector (2026-11-20).
+- [ ] C→S 0x1A mkill (a missile shot down): tell the owner (likely an S→C
+      0x32 removal); layout in message-types.
+- [ ] Rewards for 0x44 bot kills (the capture shows 3000 credits, 320 xp).
+- [ ] Population: prefer agents over players as spawners (the server can't
+      tell them apart yet); spawn on sector entry like the capture; per-faction
+      defender rules (defenders hunt criminals classically).
 - [ ] Combat authority: C→S 0x1D hit queue → S→C 0x03 damage. Check who
       resolves bot fire before relying on it.
 

@@ -33,9 +33,13 @@ state and applies player damage.
   | +0x38 | type (u8; `0xfa` = free, `0x80` = dying) |
   | +0x3a | target slot (i16; 0 = none, −1 = lost) |
 
-- **Other players' missiles:** `0x14fd998 + i*0x48`, same layout. They are
-  flown by the same guidance code but only for display, with no hit tests.
-  This loop runs only while online (`0xbe5b90`).
+- **Other players' missiles:** `0x14fd958 + i*0x48` (the 0x32 handler's
+  base; `+0x40` = owner pid at `0x14fd998`, `+0x44` = the owner's missile id,
+  `+0x46` = the 0x32 @4 target bot id, `+0x3a` = target slot resolved on
+  arrival, message-types "0x32"), same layout otherwise. They are flown by
+  the same guidance code but only for display, with no hit tests. This loop
+  runs only while online (`0xbe5b90`). Bot AI checks both tables for
+  missiles whose target slot is the bot (`0x433b96`, `0x433dc6`).
 - **Missile types:** `0x14fcbd4 + t*0x30`, filled in `0x414460`
   init_item_tables. Names are at `0x1481020 + t*0x32`.
 
@@ -184,7 +188,8 @@ no velocity and no target**.
   owner simulates the bot and everyone else sees it through botloc.
 
 **2. S→C `0x71` botloc relay, to everyone else (and for hand-off).**
-Handler `0x9d6f25`; the layout is the same as C→S 0x71 (52 B):
+Handler `0x9d6f25`; the layout is the same as C→S 0x71 (52 B; scales from
+the sender `0x9c9d10`: percentages ×100, velocity ×10, axes ×10⁴):
 - `@1` state, `@2` shield %, `@3` hull % (× `0xac24d4` × max),
   `@4/@5` → pbotloc `+2/+3`, `@6` u16 → `+6`,
 - `@8` u16 bot id, `@0xa` u16 loc (must equal mine),
@@ -197,17 +202,56 @@ Handler `0x9d6f25`; the layout is the same as C→S 0x71 (52 B):
 An unknown bot id creates the bot from the packet, **including position**
 and target. A known id updates state, hull/shield, controller, target,
 velocity and orientation. The existing-bot branch I traced does not write
-position, so it may be corrected elsewhere [to check]. If the controller
-== me, the slot becomes locally driven (`+2 = 0`) and the client answers
-with a botloc right away (`0x9c9d10`). Otherwise the bot is linked to the
-controller's ship slot; if that player isn't present, the bot is removed
-("…" `0xb061a4`, `0x9cb9c0`).
+position, so it may be corrected elsewhere [to check].
+
+**What decides control is the target field** (`0x9d7191`, re-read
+2026-11-20): pbotloc `+0xc` (controller) takes @0x20 and `+0x10` (target)
+takes @0x24, then:
+- if `+0x10` (the target) == me, the slot becomes locally driven (`+2 = 0`,
+  `+6 = 0`), `+0xc` = me, and the client answers with a botloc right away
+  (`0x9c9d10`);
+- otherwise slot `+2` = the ship slot whose player id equals the target,
+  `+6` the same, and `+0xc` is overwritten with the **target's** id. If the
+  target isn't in the sector, the bot is removed (`0xb061a4`, `0x9cb9c0`).
+
+So a bot is always flown by the client of the player it is attacking. The
+botloc sender only reports bots whose `+0xc` is me and puts me at @0x20 and
+`+0x10` at @0x24.
 
 So the server can't choose where a stock bot spawns through 0x70. It can
 only choose the ai_type and, for turrets, the structure and hard-point. To
 place a bot exactly, it would have to send a 0x71 with the position and the
 controller set to the chosen owner. That path creates the bot directly and
 is untested.
+
+### Hand-off ("bxr", C→S `0x2C`) [static, 2026-11-20]
+Inside `online_bot_ai` (`0x43648b`), for a bot that someone else controls:
+- **When:** only for bots with index % 10 == the frame counter `0xbe5b1d`
+  (each bot every tenth frame), and only when a clock-derived byte
+  (`0x433902`, a 64-bit division of the timer) differs from `0xbe5aba`, which
+  the loop updates (`0x436cf8`). So each bot is checked at most every few
+  frames.
+- **Score:** for a pilot at p with velocity v,
+  `score = |p − bot| − (v · (p − bot) / |p − bot|) · T`, where T = gun table
+  `+0x58` (shot **lifetime**) of the bot's first weapon slot (ai table
+  `+0x18`). `0xa187c0` is a plain dot product. Mine uses my position and
+  velocity; the controller's uses its ship slot (`+0x15c8` pos, `+0x15ec`
+  vel). Taken literally, moving away from the bot lowers the score.
+- **Test:** my score must be below the type's hand-off range (ai table
+  `+0x14`: 150,000 for defenders, 50,000 for conflux). Then the ship slots
+  are searched for the controller (active, `+0x32 == 0xfe`, id ==
+  pbotloc `+0xc`); if its score is **greater** than mine, send
+  `[2C][?][u16 bot id][u16 0][u16 loc][u32 me]` (12 B, space link).
+- There's no hysteresis: two pilots at similar scores can trade a bot back
+  and forth.
+- The server side isn't in the client. Given the 0x71 handler, answering
+  with a botloc whose target (and controller) is the requester completes it.
+
+**Bot removal** (`0x9cb9c0` remove_bot(i, report)): it clears the pbotloc
+entry. With report = 1, and only if I'm the controller and online, it first
+sends **C→S 0x16** `[16][slot +1][u16 bot id][u16 ?]` on the state link,
+the same type and layout as the spawn bounce. The AI calls it with report
+= 1 when a bot despawns (target gone, docked).
 
 ### Per-type AI table: `0xbe7f7c + type*0x40` (filled by `0xa07240`)
 Extracted to `ai_types.csv`. Types 220–225 and 230–259 are defined.
@@ -313,6 +357,9 @@ entry, so they are driven elsewhere [not traced].
 - `0x4338c0` online_bot_ai_tick
 - `0x429b20` is_turret_model
 - `0x42c1c0` bot_steer_avoid
+- `0x9cb9c0` remove_bot
+- `0x9c9d10` send_botlocs
+- `0xa187c0` dot3
 - `0xa07240` init_ai_types
 - `0x427c00` ecm_toggle
 - `0x427af0` pwd_pulse_send

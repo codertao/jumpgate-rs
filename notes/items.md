@@ -20,6 +20,8 @@ re-extracts everything below in about 0.3 s (it needs objdump and checks the SHA
 | `ship_types.csv`, `ai_types.csv` | ship hulls, bot AI (physics.md, ai.md) | 88/36 |
 | `locations.csv` | sectors/stations: name, galaxy XYZ, faction | 173 |
 | `station_points.csv` | per station model: dock tube start/end, launch tubes 0–3 inner/outer ends (model space; physics.md §6, launch.md) | 25 |
+| `collision_volumes.csv` | per model, volume block 0 (whole) and 1–20 (sub-volumes): axis A, axis B, full extents, centre (model space; physics.md §6) | 440 |
+| `models.csv` | model id → render mesh `.x` file, plus the tunnel mesh (model `+0x934`) for stations and the beacon | 239 |
 
 ## Global item ids — `init_item_tables` `0x414460`..`0x424e70`
 
@@ -52,7 +54,7 @@ How the fields were labelled:
 - **Market popup `0x44c7b0`:** which field is printed under which caption.
 - **Power budget `0x4680c0`:** reads the radar power (×0.8 with the matching MODx), ECM
   power and shield/capacitor fields against the powerplant output.
-- **Shield regen `0x433309`:** adds regen × dt × efficiency, capped at capacity.
+- **Shield regen `0x433309`** (remote ships): adds regen × dt, capped at capacity, for the shield whose capacity matches the slot's max. No efficiency factor (corrected 2026-11-20; message-types "Combat"). The own-ship rule wasn't traced.
 - **Radar targeting `0x43de8d`:** compares range.
 - **Gun fire `0x43d96c`:** energy per shot against the capacitor charge at `0x140ac18`.
 
@@ -114,6 +116,49 @@ Ids 101–118 are stations and 201–349 are sectors. 1000–1005 have only a fa
 name or position. Names match `sector_regions.csv` (from `jg_static_dump.py`).
 Ids 1–18 are also partly written (station records without coordinates).
 They are not exported.
+
+## Rank: purchase checks and the XP table  [static, 2026-11-21]
+
+**The client's rank is whatever the server last said.** Global `0xbe5c7c` is
+written only by:
+- S→C 0x06 byte @2 (`0x9d22d6`, also copied to `0xbe5da4` and the 0x05 report's
+  +0x14 via `0xff2a64`);
+- S→C **0x57** `[57][3 pad][u32 rank @4]` (handler `0x9d6789`), accepted only
+  for 1..50 (also → `0xff2a64`, `0xba7978`);
+- `0x47c240`, which forces 50 [not traced; looks like a simulator/dev path].
+
+Nothing derives it from experience. The ship market checks it client-side
+(`0x4791ed`): if the hull's required rank (ship-type table `+0x1a0`, byte;
+`ship_types.csv` column `rank`) is greater than `0xbe5c7c`, it prints
+"Server: Not high enough rank." (the "Server:" prefix notwithstanding, no
+packet is involved), then checks credits (`0xff7cf8`). Rank ≥ requirement passes.
+
+Hull requirements: trainers 0; Premia XL/Albatross/Gust 3; shuttles 6; light
+fighters 9; fast transports 12; scouts 15; medium fighters 18; transports and
+light miners 21; fighters and cargo tows 26; heavy miners 30; heavy fighters 31;
+bombers 32; rangers 34; freighters 38.
+
+**XP table** (`extracts/rank_xp.csv`). Experience (S→C 0x92 and 0x06 @0x5c,
+stored at `0xbe5da8`) is only displayed. A switch on the rank (`0x45d6b8`, jump
+table `0x45dbf4`, ranks 0..50) loads the XP that the *next* rank needs, and the
+mission/experience UI shows `max(0, threshold − xp)`. So the table is the
+client's idea of the rank curve: rank *r* needs the listed experience, and
+rank 50 is the cap. Whether the classic server promoted by exactly these
+numbers is not known, but it is the only curve in the client.
+
+| rank | XP | rank | XP | rank | XP | rank | XP | rank | XP |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 0 | 11 | 140,000 | 22 | 675,000 | 33 | 1,770,000 | 44 | 5,300,000 |
+| 1 | 2,000 | 12 | 169,000 | 23 | 750,000 | 34 | 1,910,000 | 45 | 5,900,000 |
+| 2 | 4,000 | 13 | 202,000 | 24 | 828,000 | 35 | 2,065,000 | 46 | 6,500,000 |
+| 3 | 8,800 | 14 | 240,000 | 25 | 911,000 | 36 | 2,230,000 | 47 | 7,500,000 |
+| 4 | 15,700 | 15 | 280,000 | 26 | 1,000,000 | 37 | 2,400,000 | 48 | 8,500,000 |
+| 5 | 25,000 | 16 | 325,000 | 27 | 1,100,000 | 38 | 2,650,000 | 49 | 9,500,000 |
+| 6 | 37,000 | 17 | 372,000 | 28 | 1,200,000 | 39 | 3,000,000 | 50 | 12,000,000 |
+| 7 | 51,600 | 18 | 424,000 | 29 | 1,300,000 | 40 | 3,300,000 |  |  |
+| 8 | 69,000 | 19 | 480,000 | 30 | 1,407,000 | 41 | 3,700,000 |  |  |
+| 9 | 89,300 | 20 | 540,000 | 31 | 1,520,000 | 42 | 4,200,000 |  |  |
+| 10 | 112,600 | 21 | 605,000 | 32 | 1,640,000 | 43 | 4,700,000 |  |  |
 
 ## Open
 - The meanings of `o01..o03` in the equipment tables and the shield `+8` i16.
