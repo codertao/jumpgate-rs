@@ -67,8 +67,11 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
       remaining before crediting anything.
 - [x] 0xB3 own-ship state built (2026-11-20): service after launch, then echo
       the client's hull and fuel.
-- [ ] Ammo tracking: 0xB3 sends full magazines every time (the client doesn't
-      report ammo), so ammo weapons never run dry.
+- [ ] **Handling ammo.** 0x05 doesn't report ammo and 0xB3 overwrites all
+      8 ammo cells with full magazines every time, so ammo weapons never run
+      dry. The server must track ammo itself: count shots from 0x1D hits and
+      the firing bits, charge for rearming (0xA9 / 0x0E), and send real counts
+      in 0xB3. Agents need the same once they fire ammo weapons.
 - [ ] Death: no ship loss, insurance or cargo drop yet; the pilot just wakes up
       at their last base in the same ship. Classic rules unknown (ask).
 - [ ] Don't trust 0x1D: cap hit counts by the gun's refire rate and check
@@ -76,8 +79,6 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
 - [ ] C→S 0x0E consumables used (decoded): log it and charge from the server's
       own view if prices are wanted. S→C 0xA9 `[a9][0][r][a][h]` refuel/rearm/
       repair is there for station services.
-- [ ] Ammo: 0x05 doesn't report it, so the server must track ammo itself (or
-      fill magazines on launch). 0xB3 always overwrites all 8 ammo cells.
 
 ## Comms
 
@@ -115,12 +116,38 @@ These templates are replayed in every sector today (`game.rs` `reply_tpl`):
 - [x] Relay C→S 0x32 missiles to the sector (2026-11-20).
 - [ ] C→S 0x1A mkill (a missile shot down): tell the owner (likely an S→C
       0x32 removal); layout in message-types.
+- [ ] **Better handling of bot hand-off to prevent ping-pong.** The client's
+      bxr test has no margin, so two pilots at similar distances trade a bot
+      every second (seen in the loopback run). Options: hysteresis or a
+      minimum hold time on the server's side of 0x2C, and the same margin in
+      the agent's own test. Check how the stock client behaves with it first.
+- [ ] Bot retaliation: a shot bot turns on its attacker only on the
+      controller's client (the botloc keeps naming the controller). Decide
+      whether a hit should hand the bot to the attacker (as the classic
+      server may have done) without two clients ending up flying it.
+- [ ] Bot death bookkeeping: the botloc "killed" report and the 0xB0 event
+      are not handled; check what the classic server sent after a 0x44.
 - [ ] Rewards for 0x44 bot kills (the capture shows 3000 credits, 320 xp).
 - [ ] Population: prefer agents over players as spawners (the server can't
       tell them apart yet); spawn on sector entry like the capture; per-faction
       defender rules (defenders hunt criminals classically).
-- [ ] Combat authority: C→S 0x1D hit queue → S→C 0x03 damage. Check who
-      resolves bot fire before relying on it.
+- [x] Combat authority: C→S 0x1D → S→C 0x03 for player shots (2026-11-20);
+      bot fire is resolved on the victim's own client (`0x43a4a0`).
+- [ ] Live test with the real client of the 2026-11-20 work: shields stay
+      down after hits, agents die and relaunch, collisions and station
+      bounces, gate pull, bot hand-off both ways, missile relay and lock
+      warning.
+- [ ] Agent pilots fire back: the firing bitmask in their reports, gun and
+      missile launches (0x32), and their own 0x1D hit reports.
+- [ ] Agent physics still missing: sector currents (data unknown, classic
+      server side), the infested gate 410, repulsors (agents don't read
+      0x78), hazard model 304, kind-7 hull drain; mass from fitted
+      equipment instead of hull + 5000.
+- [ ] Bot physics shortcuts: bots don't collide with ships, and bot shots
+      hit-test as spheres against our largest extent instead of the mesh.
+- [ ] Missile port gaps: Jammer aim offsets, PWD pulses, cluster splits.
+- [ ] Interest management for bots and missiles too: both take remote
+      slots, and the 50-entry pbotloc cap is per client.
 
 ## Transport / RakNet
 

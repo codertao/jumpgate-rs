@@ -18,8 +18,7 @@
 //!   controller's (`0x43648b`) and sends C→S 0x2C "bxr" when it is closer.
 //!
 //! Approximations (docs/agents.md "Stock bots"): bots don't collide with
-//! ships, missile dodging waits for missiles, turrets aren't placed on player
-//! structures, and shots are spheres against our hull's largest extent.
+//! ships, turrets aren't placed on player structures, and shots are spheres against our hull's largest extent.
 
 use crate::collide::{self, Surroundings};
 use crate::missiles::Missiles;
